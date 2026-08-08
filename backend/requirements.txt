@@ -1,0 +1,7 @@
+psycopg2-binary
+python-dotenv
+supabase
+fastapi
+uvicorn[standard]
+anthropic
+python-multipart
