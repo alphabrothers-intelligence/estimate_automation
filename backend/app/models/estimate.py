@@ -15,6 +15,11 @@ class EntitySelectionIn(BaseModel):
 class EstimateSetCreate(BaseModel):
     project_name: str = Field(min_length=1)
     recipient_name: str = Field(min_length=1)  # 견적서 수신자(고객사명) — 실제 발급 시 "OOO 귀하"에 들어감
+    # ABBG 양식 전용 칸(cell_map.header_fields의 client_contact/client_phone/client_email) —
+    # 다른 법인 양식엔 대응 칸이 없어 그냥 무시된다(pdf_service._collect_header_updates).
+    recipient_contact: Optional[str] = None
+    recipient_phone: Optional[str] = None
+    recipient_email: Optional[str] = None
     total_amount: float = Field(gt=0)
     vat_included: bool
     entities: List[EntitySelectionIn] = Field(min_length=1)
@@ -44,7 +49,8 @@ class EntityQuoteOut(BaseModel):
     entity_id: str
     entity_name: str
     is_primary: bool
-    task_type: str
+    task_type: str  # 표시용 라벨 ("+"로 합쳐진 과업종류들, 예: "마케팅+시장검증")
+    task_types: List[str] = Field(default_factory=list)
     total_amount: float = 0
     line_items: List[Dict[str, Any]] = Field(default_factory=list)
     is_catalog_borrowed: bool = False
@@ -93,6 +99,18 @@ class LineItemIn(BaseModel):
     category: str = Field(min_length=1)
     name: str = Field(min_length=1)
     amount: int = Field(ge=0)
+    # 2026-08-09 직접편집 범위 확장 — 단가/작업일/투입인력/비고도 화면에서 직접 고칠 수 있다.
+    # 프론트엔드가 셋 중 하나를 고치면 나머지로 amount를 다시 계산해서 보내므로(또는 반대로
+    # amount를 고치면 단가를 역산), 여기서 받은 값을 그대로 저장하고 PDF 발급 시에도 카탈로그
+    # 재계산 없이 그대로 쓴다(pdf_service._compute_item_pricing 참고).
+    unit_price: Optional[float] = None
+    work_days: Optional[float] = None
+    quantity: Optional[float] = None
+    note: Optional[str] = None
+    # 과업종류를 교차 선택한 견적서(마케팅+시장검증)에서 이 항목이 어느 과업종류 카탈로그
+    # 소속인지 — PDF 발급 시 work_days/quantity를 어느 법인 카탈로그에서 찾을지 결정한다
+    # (pdf_service._compute_item_pricing). 프론트엔드가 기존 값을 그대로 되돌려 보낸다.
+    task_type: Optional[str] = None
 
 
 class LineItemsUpdate(BaseModel):

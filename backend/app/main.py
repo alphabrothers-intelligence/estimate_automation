@@ -1,9 +1,20 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.routers import catalog, estimates, templates
+from app.services import pdf_service
 
-app = FastAPI(title="견적서 자동화 API")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    pdf_service.start_lo_listener()
+    yield
+    pdf_service.stop_lo_listener()
+
+
+app = FastAPI(title="견적서 자동화 API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

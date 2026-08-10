@@ -42,7 +42,7 @@ def _build_prompt_block(groups: List[ModuleGroup]) -> str:
         lines.append(header)
         for option in group.options:
             default_tag = " (기본값)" if option.is_default else ""
-            items = ", ".join(option.item_names)
+            items = ", ".join(name for group_item in option.item_groups for name in group_item.item_names)
             lines.append(f'- option_key="{option.option_key}"{default_tag}: {option.label} → {items}')
     return "\n".join(lines)
 

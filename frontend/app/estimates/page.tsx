@@ -1,17 +1,21 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
-import { ApiError, fetchEstimateSets, type EstimateSetSummary } from "@/lib/api";
+import { ApiError, deleteEstimateSet, fetchEstimateSets, type EstimateSetSummary } from "@/lib/api";
 
 function formatDate(value: string) {
   return new Intl.DateTimeFormat("ko-KR", { year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(value));
 }
 
 export default function EstimatesPage() {
+  const router = useRouter();
   const [items, setItems] = useState<EstimateSetSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [deleting, setDeleting] = useState(false);
 
   useEffect(() => {
     fetchEstimateSets()
@@ -19,6 +23,34 @@ export default function EstimatesPage() {
       .catch((e) => setError(e instanceof ApiError ? e.message : "견적서 목록을 불러오지 못했습니다."))
       .finally(() => setLoading(false));
   }, []);
+
+  function toggleOne(id: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleAll() {
+    setSelected((prev) => (prev.size === items.length ? new Set() : new Set(items.map((i) => i.id))));
+  }
+
+  async function handleDeleteSelected() {
+    if (selected.size === 0) return;
+    if (!confirm(`선택한 견적서 ${selected.size}건을 삭제할까요? 되돌릴 수 없습니다.`)) return;
+    setDeleting(true);
+    try {
+      await Promise.all([...selected].map((id) => deleteEstimateSet(id)));
+      setItems((prev) => prev.filter((item) => !selected.has(item.id)));
+      setSelected(new Set());
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "견적서 삭제에 실패했습니다.");
+    } finally {
+      setDeleting(false);
+    }
+  }
 
   return (
     <main className="px-5 py-8 sm:px-8 lg:px-12 lg:py-10">
@@ -29,9 +61,20 @@ export default function EstimatesPage() {
             <h1 className="mt-1 text-3xl font-bold tracking-tight text-slate-900">생성한 견적서</h1>
             <p className="mt-2 text-sm text-slate-500">사업 건별 본견적과 비교견적을 한곳에서 확인합니다.</p>
           </div>
-          <Link href="/" className="rounded-lg bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700">
-            + 새 견적서 작성
-          </Link>
+          <div className="flex items-center gap-2">
+            {selected.size > 0 && (
+              <button
+                onClick={handleDeleteSelected}
+                disabled={deleting}
+                className="rounded-lg border border-red-200 bg-red-50 px-4 py-2.5 text-sm font-semibold text-red-700 hover:bg-red-100 disabled:opacity-50"
+              >
+                {deleting ? "삭제 중…" : `선택 삭제 (${selected.size})`}
+              </button>
+            )}
+            <Link href="/" className="rounded-lg bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700">
+              + 새 견적서 작성
+            </Link>
+          </div>
         </div>
 
         <section className="mt-8 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
@@ -50,12 +93,35 @@ export default function EstimatesPage() {
             <div className="overflow-x-auto">
               <table className="w-full min-w-[760px] text-sm">
                 <thead className="border-b border-slate-200 bg-slate-50 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">
-                  <tr><th className="px-6 py-3.5">사업명</th><th className="px-4 py-3.5">과업</th><th className="px-4 py-3.5">발행 법인</th><th className="px-4 py-3.5 text-right">총액</th><th className="px-6 py-3.5 text-right">생성일</th></tr>
+                  <tr>
+                    <th className="w-10 px-6 py-3.5">
+                      <input
+                        type="checkbox"
+                        checked={selected.size === items.length && items.length > 0}
+                        onChange={toggleAll}
+                        className="h-4 w-4 rounded border-slate-300"
+                        aria-label="전체 선택"
+                      />
+                    </th>
+                    <th className="px-4 py-3.5">사업명</th><th className="px-4 py-3.5">과업</th><th className="px-4 py-3.5">발행 법인</th><th className="px-4 py-3.5 text-right">총액</th><th className="px-6 py-3.5 text-right">생성일</th></tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
                   {items.map((item) => (
-                    <tr key={item.id} className="hover:bg-slate-50/70">
-                      <td className="px-6 py-4 font-semibold text-slate-800">{item.project_name}</td>
+                    <tr
+                      key={item.id}
+                      onClick={() => router.push(`/estimates/${item.id}`)}
+                      className="cursor-pointer hover:bg-slate-50/70"
+                    >
+                      <td className="px-6 py-4" onClick={(e) => e.stopPropagation()}>
+                        <input
+                          type="checkbox"
+                          checked={selected.has(item.id)}
+                          onChange={() => toggleOne(item.id)}
+                          className="h-4 w-4 rounded border-slate-300"
+                          aria-label={`${item.project_name} 선택`}
+                        />
+                      </td>
+                      <td className="px-4 py-4 font-semibold text-slate-800">{item.project_name}</td>
                       <td className="px-4 py-4"><span className="rounded-full bg-indigo-50 px-2.5 py-1 text-xs font-medium text-indigo-700">{item.task_type}</span></td>
                       <td className="px-4 py-4 text-slate-500">{item.entity_names.join(" · ")} <span className="text-slate-300">({item.quote_count})</span></td>
                       <td className="px-4 py-4 text-right font-medium text-slate-700">{item.total_amount.toLocaleString()}원</td>

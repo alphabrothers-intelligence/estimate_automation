@@ -61,7 +61,7 @@ def edit_entity_quote(entity_quote_id: str, edit_request_text: str) -> EditResul
     quote_res = (
         supabase.table("entity_quotes")
         .select(
-            "id, entity_id, is_primary, task_type, line_items, estimate_set_id, selected_modules, "
+            "id, entity_id, is_primary, task_type, task_types, line_items, estimate_set_id, selected_modules, "
             "is_catalog_borrowed, catalog_source_entity_name, service_name, entity_templates(name)"
         )
         .eq("id", entity_quote_id)
@@ -70,6 +70,7 @@ def edit_entity_quote(entity_quote_id: str, edit_request_text: str) -> EditResul
     if not quote_res.data:
         raise HTTPException(status_code=404, detail="견적서를 찾을 수 없습니다.")
     quote = quote_res.data[0]
+    task_types = quote["task_types"]
 
     set_res = (
         supabase.table("estimate_sets").select("vat_included").eq("id", quote["estimate_set_id"]).execute()
@@ -84,27 +85,31 @@ def edit_entity_quote(entity_quote_id: str, edit_request_text: str) -> EditResul
     else:
         grand_total = supply_amount + round(supply_amount * 0.1)
 
+    # Claude 응답(AllocatedItem)엔 category/name/amount뿐이라 task_type이 빠진다 — 기존
+    # line_items에서 (category, name)으로 다시 찾아 붙인다(항목명을 새로 지어낸 경우는 첫
+    # 번째 과업종류로 대체, 과업종류가 하나뿐이면 항상 이 경로).
+    task_type_by_key = {(i["category"], i["name"]): i.get("task_type") for i in quote["line_items"]}
+    updated_items = [
+        {**i.model_dump(), "task_type": task_type_by_key.get((i.category, i.name)) or task_types[0]}
+        for i in result.items
+    ]
+
+    entity_name = quote["entity_templates"]["name"]
     # 채팅 수정 후에도 미리보기에서 단가/작업일/수량이 계속 보이도록, 생성 때와 같은 로직으로
     # 다시 계산해 저장한다(2026-07-10) — 그렇지 않으면 수정할 때마다 이 컬럼들이 빈 값("—")으로
     # 바뀌어 버린다.
-    catalog_entity_id = quote["entity_id"]
-    if quote["is_catalog_borrowed"] and quote["catalog_source_entity_name"]:
-        src = (
-            supabase.table("entity_templates")
-            .select("id")
-            .eq("name", quote["catalog_source_entity_name"])
-            .execute()
-        )
-        if src.data:
-            catalog_entity_id = src.data[0]["id"]
+    catalog_entity_id_by_task_type = {
+        task_type: pdf_service.resolve_catalog_entity_id(supabase, quote["entity_id"], entity_name, task_type)
+        for task_type in task_types
+    }
 
     new_line_items = pdf_service.compute_line_item_pricing(
         supabase,
         quote["entity_id"],
-        quote["task_type"],
+        task_types,
         quote.get("selected_modules"),
-        catalog_entity_id,
-        [i.model_dump() for i in result.items],
+        catalog_entity_id_by_task_type,
+        updated_items,
     )
     supabase.table("entity_quotes").update(
         {"total_amount": grand_total, "line_items": new_line_items}
@@ -116,16 +121,17 @@ def edit_entity_quote(entity_quote_id: str, edit_request_text: str) -> EditResul
     entity_quote_out = EntityQuoteOut(
         id=quote["id"],
         entity_id=quote["entity_id"],
-        entity_name=quote["entity_templates"]["name"],
+        entity_name=entity_name,
         is_primary=quote["is_primary"],
         task_type=quote["task_type"],
+        task_types=task_types,
         total_amount=grand_total,
         line_items=new_line_items,
         is_catalog_borrowed=quote["is_catalog_borrowed"],
         catalog_source_entity_name=quote["catalog_source_entity_name"],
         service_name=quote["service_name"],
         **pdf_service.get_column_display(
-            supabase, quote["entity_id"], quote["task_type"], quote.get("selected_modules")
+            supabase, quote["entity_id"], task_types, quote.get("selected_modules")
         ),
     )
 

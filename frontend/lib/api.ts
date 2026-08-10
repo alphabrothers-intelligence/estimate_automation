@@ -13,6 +13,9 @@ export type LineItem = {
   work_days?: number;
   quantity?: number;
   note?: string;
+  // 과업종류를 교차 선택한 견적서에서 이 항목이 어느 과업종류 소속인지 — 직접편집 저장 시
+  // 그대로 되돌려 보내야 발급 시 단가 계산이 올바른 법인 카탈로그를 참조한다.
+  task_type?: string;
 };
 
 export type EntityQuote = {
@@ -21,6 +24,7 @@ export type EntityQuote = {
   entity_name: string;
   is_primary: boolean;
   task_type: string;
+  task_types: string[];
   total_amount: number;
   line_items: LineItem[];
   is_catalog_borrowed: boolean;
@@ -32,18 +36,24 @@ export type EntityQuote = {
   detail_column_order: string[];
 };
 
+export type ModuleItemGroup = {
+  module_name: string;
+  item_names: string[];
+};
+
 export type ModuleOption = {
   option_key: string;
   label: string;
   module_names: string[];
   item_count: number;
   is_default: boolean;
-  item_names: string[];
+  item_groups: ModuleItemGroup[];
 };
 
 export type ModuleGroup = {
   kind: "variant" | "additive";
   options: ModuleOption[];
+  label?: string | null;
 };
 
 export type EntityModuleOptions = {
@@ -115,6 +125,14 @@ export async function fetchEstimateSets(): Promise<EstimateSetSummary[]> {
   return handle<EstimateSetSummary[]>(res);
 }
 
+export async function deleteEstimateSet(id: string): Promise<void> {
+  const res = await fetch(`${API_BASE_URL}/api/estimate-sets/${id}`, { method: "DELETE" });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new ApiError(body?.detail ?? `요청 실패 (${res.status})`);
+  }
+}
+
 export async function fetchTemplates(): Promise<QuoteTemplateSummary[]> {
   const res = await fetch(`${API_BASE_URL}/api/templates`, { cache: "no-store" });
   return handle<QuoteTemplateSummary[]>(res);
@@ -151,6 +169,9 @@ export type EntitySelectionInput = {
 export type CreateEstimateSetInput = {
   project_name: string;
   recipient_name: string;
+  recipient_contact?: string;
+  recipient_phone?: string;
+  recipient_email?: string;
   total_amount: number;
   vat_included: boolean;
   entities: EntitySelectionInput[];
@@ -165,6 +186,11 @@ export async function createEstimateSet(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
   });
+  return handle<EstimateSet>(res);
+}
+
+export async function fetchEstimateSet(id: string): Promise<EstimateSet> {
+  const res = await fetch(`${API_BASE_URL}/api/estimate-sets/${id}`, { cache: "no-store" });
   return handle<EstimateSet>(res);
 }
 
@@ -209,9 +235,7 @@ export async function updateLineItems(
   const res = await fetch(`${API_BASE_URL}/api/entity-quotes/${entityQuoteId}/line-items`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      items: items.map(({ category, name, amount }) => ({ category, name, amount })),
-    }),
+    body: JSON.stringify({ items }),
   });
   return handle<EntityQuote>(res);
 }

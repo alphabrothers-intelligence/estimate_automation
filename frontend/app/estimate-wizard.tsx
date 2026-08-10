@@ -7,6 +7,7 @@ import {
   editEntityQuote,
   fetchCatalogModuleOptions,
   fetchEntities,
+  fetchEstimateSet,
   fetchModuleOptions,
   generateEstimateSet,
   getEntityQuotePdfUrl,
@@ -38,7 +39,8 @@ const MAX_COMPARISON = 3;
 const TESTIFY_NAME = "테스티파이"; // '용역명' 필드는 테스티파이 템플릿에만 있음 (4.2)
 
 // 2026-08 마법사 개편: 기업을 먼저 고르고 과업(마케팅/시장검증)을 나중에, 기업별로 교차
-// 선택한다. 두 과업종류만 이 마법사에서 다룬다 — "광고대행"/"고객검증"은 이번 개편 범위 밖.
+// 선택한다. 두 과업종류만 이 마법사에서 다룬다 — "고객검증"은 이번 개편 범위 밖.
+// ("광고대행"은 별도 과업종류가 아니라 마케팅 안의 대안 상품(alt_group)이라 여기 포함됨 — v0.6)
 const FIXED_TASK_TYPES = ["마케팅", "시장검증"] as const;
 type FixedTaskType = (typeof FIXED_TASK_TYPES)[number];
 
@@ -60,6 +62,110 @@ type ChatMessage = {
   scope?: string;
 };
 
+// 단계 제목 앞의 번호를 원 배지로 보여준다 — 실제 서비스 마법사 화면의 흔한 패턴.
+function StepHeader({ n, title, hint }: { n: number; title: string; hint?: string }) {
+  return (
+    <legend className="flex flex-wrap items-center gap-2.5 text-base font-semibold text-gray-900">
+      <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-indigo-600 text-xs font-bold text-white">
+        {n}
+      </span>
+      {title}
+      {hint && <span className="text-sm font-normal text-gray-400">{hint}</span>}
+    </legend>
+  );
+}
+
+// 토글 스위치(마케팅/시장검증 포함 여부)와 라디오/체크박스 카드(variant·additive 모듈 선택) 전부
+// 네이티브 input 그대로 두면 못생겨 보인다는 피드백(2026-08-09)에 따라 만든 커스텀 표시자.
+// 접근성을 위해 실제 input은 남기고 화면에서만 숨긴다(sr-only).
+function ToggleSwitch({ checked, onLabel }: { checked: boolean; onLabel: string }) {
+  return (
+    <span className="flex items-center gap-2.5">
+      <span
+        className={
+          "relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors " +
+          (checked ? "bg-indigo-600" : "bg-gray-300")
+        }
+      >
+        <span
+          className={
+            "inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform " +
+            (checked ? "translate-x-6" : "translate-x-1")
+          }
+        />
+      </span>
+      <span className="text-sm font-semibold text-gray-900">{onLabel}</span>
+    </span>
+  );
+}
+
+function OptionIndicator({ checked, shape }: { checked: boolean; shape: "circle" | "check" }) {
+  if (shape === "circle") {
+    return (
+      <span
+        className={
+          "mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border-2 transition-colors " +
+          (checked ? "border-indigo-600" : "border-gray-300")
+        }
+      >
+        {checked && <span className="h-1.5 w-1.5 rounded-full bg-indigo-600" />}
+      </span>
+    );
+  }
+  return (
+    <span
+      className={
+        "mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border-2 transition-colors " +
+        (checked ? "border-indigo-600 bg-indigo-600" : "border-gray-300 bg-white")
+      }
+    >
+      {checked && (
+        <svg viewBox="0 0 12 12" fill="none" className="h-2.5 w-2.5">
+          <path d="M2 6l2.5 2.5L10 3" stroke="white" strokeWidth={1.75} strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      )}
+    </span>
+  );
+}
+
+// 클릭 가능한 카드 하나 전체가 라디오/체크박스 역할을 한다 — 작은 원형 버튼만 누를 수 있던
+// 기존 방식보다 클릭 영역이 넓고, 선택 상태가 카드 배경・테두리 색으로 바로 보인다.
+function OptionRow({
+  shape,
+  checked,
+  name,
+  onChange,
+  children,
+}: {
+  shape: "circle" | "check";
+  checked: boolean;
+  name?: string;
+  onChange: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <label
+      className={
+        "flex cursor-pointer items-start gap-2.5 rounded-lg border px-3 py-2.5 transition-colors " +
+        (checked ? "border-indigo-300 bg-indigo-50/70" : "border-gray-200 bg-white hover:border-gray-300")
+      }
+    >
+      <input
+        type={shape === "circle" ? "radio" : "checkbox"}
+        name={name}
+        checked={checked}
+        onChange={onChange}
+        className="sr-only"
+      />
+      <OptionIndicator checked={checked} shape={shape} />
+      <div className="min-w-0 flex-1 text-sm text-gray-800">{children}</div>
+    </label>
+  );
+}
+
+// 예전엔 "용역명 입력 필요" 배지를 먼저 보여주고 클릭해야 입력창이 나왔는데, 그 문구를
+// 입력칸 자체의 placeholder로 옮겨서 클릭 한 번 없이 바로 타이핑해 채울 수 있게 한다
+// (2026-08-09 사용자 피드백). InlineEditCell과 같은 blur/Enter 저장 패턴을 그대로 따른다.
 function ServiceNameField({
   quote,
   onSave,
@@ -67,18 +173,17 @@ function ServiceNameField({
   quote: EntityQuote;
   onSave: (value: string) => Promise<void>;
 }) {
-  const [editing, setEditing] = useState(false);
   const [value, setValue] = useState(quote.service_name ?? "");
   const [saving, setSaving] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   async function handleSave() {
-    if (!value.trim() || saving) return;
+    const trimmed = value.trim();
+    if (!trimmed || trimmed === quote.service_name || saving) return;
     setSaving(true);
     setErrorMsg(null);
     try {
-      await onSave(value.trim());
-      setEditing(false);
+      await onSave(trimmed);
     } catch (e) {
       setErrorMsg(e instanceof ApiError ? e.message : "저장에 실패했습니다.");
     } finally {
@@ -86,50 +191,24 @@ function ServiceNameField({
     }
   }
 
-  if (editing) {
-    return (
-      <div className="mt-2 flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
-        <input
-          type="text"
-          autoFocus
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && handleSave()}
-          placeholder="예: 정량, 정성 데이터 기반 시장 검증 용역"
-          className="flex-1 rounded-md border border-gray-300 px-2 py-1 text-sm focus:border-indigo-500 focus:outline-none"
-        />
-        <button
-          type="button"
-          disabled={saving || !value.trim()}
-          onClick={handleSave}
-          className="shrink-0 rounded-md bg-gray-900 px-2 py-1 text-sm font-medium text-white hover:bg-gray-700 disabled:cursor-not-allowed disabled:bg-gray-300"
-        >
-          {saving ? "…" : "저장"}
-        </button>
-        {errorMsg && <p className="text-sm text-red-600">{errorMsg}</p>}
-      </div>
-    );
-  }
-
   return (
-    <button
-      type="button"
-      onClick={(e) => {
-        e.stopPropagation();
-        setEditing(true);
-      }}
-      className="mt-2 block text-left text-sm"
-    >
-      {quote.service_name ? (
-        <span className="text-gray-500">
-          용역명: <span className="text-gray-700">{quote.service_name}</span>
-        </span>
-      ) : (
-        <span className="rounded-full bg-amber-100 px-2 py-0.5 font-medium text-amber-700">
-          용역명 입력 필요 (발급 전 작성)
-        </span>
-      )}
-    </button>
+    <div className="mt-2 flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
+      <input
+        type="text"
+        value={value}
+        disabled={saving}
+        onChange={(e) => setValue(e.target.value)}
+        onBlur={handleSave}
+        onKeyDown={(e) => e.key === "Enter" && handleSave()}
+        placeholder="용역명을 입력하세요 (예: 정량, 정성 데이터 기반 시장 검증 용역) — 발급 전 필수"
+        className={
+          "flex-1 rounded-md border px-2 py-1 text-sm focus:border-indigo-500 focus:outline-none " +
+          (quote.service_name ? "border-gray-300" : "border-amber-300 bg-amber-50")
+        }
+      />
+      {saving && <span className="shrink-0 text-xs text-gray-400">저장 중…</span>}
+      {errorMsg && <p className="text-sm text-red-600">{errorMsg}</p>}
+    </div>
   );
 }
 
@@ -151,34 +230,41 @@ function ModuleOptionRow({
   const [expanded, setExpanded] = useState(false);
 
   return (
-    <div>
-      <div className="flex items-center gap-2 text-sm text-gray-700">
-        <input
-          type={inputType}
-          name={name}
-          checked={checked}
-          onChange={onChange}
-          className={
-            inputType === "radio"
-              ? "h-4 w-4 border-gray-300 text-indigo-600 focus:ring-indigo-500"
-              : "h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
-          }
-        />
-        <span>{label}</span>
+    <OptionRow shape={inputType === "radio" ? "circle" : "check"} checked={checked} name={name} onChange={onChange}>
+      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+        <span className="font-medium text-gray-900">{label}</span>
         <button
           type="button"
-          onClick={() => setExpanded((v) => !v)}
-          className="text-xs text-indigo-600 hover:underline"
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setExpanded((v) => !v);
+          }}
+          className="shrink-0 text-xs font-medium text-indigo-600 hover:underline"
         >
           {expanded ? "항목 접기" : `${option.item_count}개 항목 보기`}
         </button>
       </div>
       {expanded && (
-        <p className="ml-6 mt-1 text-xs leading-relaxed text-gray-500">
-          {option.item_names.join(" · ")}
-        </p>
+        <div className="mt-1.5 space-y-2 border-t border-indigo-100 pt-1.5">
+          {option.item_groups.map((group) => (
+            <div key={group.module_name}>
+              {option.item_groups.length > 1 && (
+                <p className="text-xs font-semibold text-gray-700">{group.module_name}</p>
+              )}
+              <ul className="space-y-1">
+                {group.item_names.map((name, i) => (
+                  <li key={i} className="flex gap-1.5 text-xs leading-relaxed text-gray-500">
+                    <span className="text-gray-400">•</span>
+                    {name}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </div>
       )}
-    </div>
+    </OptionRow>
   );
 }
 
@@ -204,20 +290,30 @@ function TaskModulePicker({
   const hasModules = options?.has_modules ?? false;
 
   return (
-    <div className="rounded-lg border border-gray-200 p-3">
-      <label className="flex items-center gap-2 text-sm font-medium text-gray-800">
+    <div
+      className={
+        "rounded-xl border p-4 transition-colors " +
+        (included ? "border-indigo-200 bg-indigo-50/40" : "border-gray-200 bg-white")
+      }
+    >
+      <label className="flex cursor-pointer items-center justify-between">
+        <ToggleSwitch checked={included} onLabel={`${taskType} 포함`} />
         <input
           type="checkbox"
           checked={included}
           onChange={(e) => onToggleIncluded(e.target.checked)}
-          className="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+          className="sr-only"
         />
-        {taskType} 포함
       </label>
       {included && hasModules && (
-        <div className="mt-2 space-y-1.5 pl-6">
+        <div className="mt-3 space-y-3 border-t border-indigo-100 pt-3">
           {(options?.groups ?? []).map((group, gi) => (
-            <div key={gi} className="space-y-1">
+            <div key={gi} className="space-y-1.5">
+              {(group.label || group.kind === "additive") && (
+                <p className="text-xs font-semibold text-gray-400">
+                  {group.label ?? "추가 옵션"}
+                </p>
+              )}
               {group.options.map((o) => {
                 const isChecked = o.module_names.every((m) => moduleNames.includes(m));
                 return (
@@ -246,7 +342,9 @@ function TaskModulePicker({
 // 고쳤을 때 원본 line_items 배열의 어느 자리를 바꿔야 하는지 알 수 있다.
 type IndexedLineItem = LineItem & { _index: number };
 type LineItemGroup = { category: string; amount: number; items: IndexedLineItem[] };
-type LineItemPatch = Partial<Pick<LineItem, "category" | "name" | "amount">>;
+type LineItemPatch = Partial<
+  Pick<LineItem, "category" | "name" | "amount" | "unit_price" | "work_days" | "quantity" | "note">
+>;
 
 function groupLineItems(items: LineItem[]): LineItemGroup[] {
   const groups: LineItemGroup[] = [];
@@ -263,8 +361,8 @@ function groupLineItems(items: LineItem[]): LineItemGroup[] {
 }
 
 // 클릭하면 입력창이 되는 셀 — Enter/포커스 아웃으로 저장, Esc로 취소(ServiceNameField와 같은
-// 인라인 편집 패턴). PDF/xlsx 발급은 실제로는 항목명・카테고리・금액만 반영하므로(단가/작업일/
-// 수량은 발급 시 카탈로그에서 다시 계산됨) 편집 대상도 이 두 값으로만 한정한다.
+// 인라인 편집 패턴). 항목명・카테고리・금액뿐 아니라 단가/작업일/투입인력/비고도 이 컴포넌트로
+// 편집한다(2026-08-09 편집 범위 확장 — LineItemTable.handleEditItem 참고).
 function InlineEditCell({
   value,
   display,
@@ -371,12 +469,34 @@ function renderDetailValue(item: LineItem, key: string): string {
   return "—";
 }
 
-function ItemDetailCells({ item, order }: { item: LineItem; order: string[] }) {
+function renderDetailEditValue(item: LineItem, key: string): string {
+  const raw = key === "unit_price" ? item.unit_price : key === "work_days" ? item.work_days : item.quantity;
+  return raw != null ? String(raw) : "0";
+}
+
+// 단가/작업일/투입인력은 서로 맞물려 있다 — 실제 발급되는 PDF의 공급가액 칸이 원본 수식
+// (단가×작업일×투입인력)으로 계산되므로, 셋 중 하나를 편집키로 저장하면(LineItemTable.
+// handleEditItem) 화면과 실제 발급본이 어긋난다. 그래서 각 칸을 patch key로 구분해 보낸다.
+function ItemDetailCells({
+  item,
+  order,
+  onEditItem,
+}: {
+  item: LineItem;
+  order: string[];
+  onEditItem: (patch: LineItemPatch) => Promise<void>;
+}) {
   return (
     <>
       {order.map((key) => (
         <td key={key} className="py-2 pr-3 text-right text-sm text-gray-600">
-          {renderDetailValue(item, key)}
+          <InlineEditCell
+            value={renderDetailEditValue(item, key)}
+            display={renderDetailValue(item, key)}
+            align="right"
+            inputType="number"
+            onSave={(v) => onEditItem({ [key]: Number(v) } as LineItemPatch)}
+          />
         </td>
       ))}
     </>
@@ -408,7 +528,7 @@ function CategoryRows({
             onSave={(v) => onEditItem(item._index, { category: v, name: v })}
           />
         </td>
-        <ItemDetailCells item={item} order={order} />
+        <ItemDetailCells item={item} order={order} onEditItem={(patch) => onEditItem(item._index, patch)} />
         <td className="px-3 py-2.5 text-right font-semibold text-gray-900">
           <InlineEditCell
             value={String(item.amount)}
@@ -418,7 +538,15 @@ function CategoryRows({
             onSave={(v) => onEditItem(item._index, { amount: Number(v) })}
           />
         </td>
-        {hasNote && <td className="px-3 py-2.5 text-sm text-gray-400">{item.note ?? ""}</td>}
+        {hasNote && (
+          <td className="px-3 py-2.5 text-sm text-gray-600">
+            <InlineEditCell
+              value={item.note ?? ""}
+              display={item.note ?? ""}
+              onSave={(v) => onEditItem(item._index, { note: v })}
+            />
+          </td>
+        )}
       </tr>
     );
   }
@@ -458,7 +586,7 @@ function CategoryRows({
                 onSave={(v) => onEditItem(item._index, { name: v })}
               />
             </td>
-            <ItemDetailCells item={item} order={order} />
+            <ItemDetailCells item={item} order={order} onEditItem={(patch) => onEditItem(item._index, patch)} />
             <td className="py-2 pr-3 text-right text-sm text-gray-700">
               <InlineEditCell
                 value={String(item.amount)}
@@ -468,7 +596,15 @@ function CategoryRows({
                 onSave={(v) => onEditItem(item._index, { amount: Number(v) })}
               />
             </td>
-            {hasNote && <td className="py-2 pr-3 text-sm text-gray-400">{item.note ?? ""}</td>}
+            {hasNote && (
+              <td className="py-2 pr-3 text-sm text-gray-600">
+                <InlineEditCell
+                  value={item.note ?? ""}
+                  display={item.note ?? ""}
+                  onSave={(v) => onEditItem(item._index, { note: v })}
+                />
+              </td>
+            )}
           </tr>
         ))}
     </>
@@ -511,7 +647,17 @@ function LineItemTable({
   const { supplyAmount, vatAmount, grandTotal } = computeVatBreakdown(totalAmount, vatIncluded);
 
   async function handleEditItem(index: number, patch: LineItemPatch) {
-    const next = items.map((item, i) => (i === index ? { ...item, ...patch } : item));
+    const merged: LineItem = { ...items[index], ...patch };
+    // 실제 발급 PDF의 공급가액 칸은 원본 수식(단가×작업일×투입인력)으로 재계산되므로, 화면에서
+    // 어느 값을 고치든 세 값의 곱과 공급가액이 항상 일치하도록 나머지를 다시 계산해서 보낸다
+    // (2026-08-09 — 단가/작업일/투입인력 직접편집 추가, pdf_service._compute_item_pricing과 짝).
+    if ("amount" in patch) {
+      const divisor = (merged.work_days ?? 1) * (merged.quantity ?? 1);
+      merged.unit_price = divisor ? merged.amount / divisor : merged.amount;
+    } else if ("unit_price" in patch || "work_days" in patch || "quantity" in patch) {
+      merged.amount = Math.round((merged.unit_price ?? 0) * (merged.work_days ?? 1) * (merged.quantity ?? 1));
+    }
+    const next = items.map((item, i) => (i === index ? merged : item));
     await onSaveLineItems(next);
   }
 
@@ -647,91 +793,120 @@ function QuoteCard({
   onSaveLineItems: (items: LineItem[]) => Promise<void>;
 }) {
   return (
-    <div className="rounded-2xl border-2 border-indigo-600 bg-white p-6 shadow-md">
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <div className="flex flex-wrap items-center gap-2">
-            <span
-              className={
-                quote.is_primary
-                  ? "rounded-full bg-indigo-600 px-3 py-1 text-sm font-semibold text-white"
-                  : "rounded-full bg-gray-200 px-3 py-1 text-sm font-medium text-gray-700"
-              }
-            >
-              {quote.is_primary ? "본견적" : "비교견적"}
-            </span>
-            {quote.is_catalog_borrowed && (
+    // 내용(왼쪽, 편집)과 뷰어(오른쪽, 실제 양식)를 나란히 둔다 — 이전엔 편집 표 밑에 800px
+    // iframe이 이어져서 미리보기를 보려면 한참 스크롤해야 했고, 수정할 때마다 표와 미리보기를
+    // 번갈아 스크롤해야 했다. 뷰어는 sticky라 편집 중에도 계속 눈에 보인다.
+    <div className="grid grid-cols-1 gap-6 xl:grid-cols-[3fr_2fr] xl:items-start">
+      <div className="rounded-2xl border-2 border-indigo-600 bg-white p-6 shadow-md">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="flex flex-wrap items-center gap-2">
               <span
-                className="rounded-full bg-amber-100 px-3 py-1 text-sm font-medium text-amber-700"
-                title={`${quote.entity_name}의 실제 카탈로그가 없어 ${quote.catalog_source_entity_name}의 항목 구성을 차용했습니다.`}
+                className={
+                  quote.is_primary
+                    ? "rounded-full bg-indigo-600 px-3 py-1 text-sm font-semibold text-white"
+                    : "rounded-full bg-gray-200 px-3 py-1 text-sm font-medium text-gray-700"
+                }
               >
-                {quote.catalog_source_entity_name} 차용
+                {quote.is_primary ? "본견적" : "비교견적"}
               </span>
+              {quote.is_catalog_borrowed && (
+                <span
+                  className="rounded-full bg-amber-100 px-3 py-1 text-sm font-medium text-amber-700"
+                  title={`${quote.entity_name}의 실제 카탈로그가 없어 ${quote.catalog_source_entity_name}의 항목 구성을 차용했습니다.`}
+                >
+                  {quote.catalog_source_entity_name} 차용
+                </span>
+              )}
+            </div>
+            <p className="mt-2 text-2xl font-bold text-gray-900">{quote.entity_name}</p>
+            {quote.entity_name === TESTIFY_NAME && (
+              <ServiceNameField quote={quote} onSave={onSaveServiceName} />
             )}
           </div>
-          <p className="mt-2 text-2xl font-bold text-gray-900">{quote.entity_name}</p>
-          {quote.entity_name === TESTIFY_NAME && (
-            <ServiceNameField quote={quote} onSave={onSaveServiceName} />
-          )}
+          <div className="text-right">
+            <p className="whitespace-nowrap text-3xl font-bold text-indigo-700">
+              {quote.total_amount.toLocaleString()}
+              <span className="ml-0.5 text-base font-medium text-gray-400">원</span>
+            </p>
+          </div>
         </div>
-        <div className="text-right">
-          <p className="whitespace-nowrap text-3xl font-bold text-indigo-700">
-            {quote.total_amount.toLocaleString()}
-            <span className="ml-0.5 text-base font-medium text-gray-400">원</span>
-          </p>
-        </div>
+
+        {quote.line_items.length > 0 ? (
+          <div className="mt-4">
+            <LineItemTable
+              items={quote.line_items}
+              columnLabels={quote.column_labels}
+              detailColumnOrder={quote.detail_column_order}
+              totalAmount={quote.total_amount}
+              vatIncluded={vatIncluded}
+              onSaveLineItems={onSaveLineItems}
+            />
+          </div>
+        ) : (
+          <p className="mt-4 text-sm text-gray-400">아직 항목이 생성되지 않았습니다.</p>
+        )}
+
+        {quote.line_items.length > 0 && (
+          <div className="mt-5 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={onOpenChat}
+              className="rounded-full bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-500"
+            >
+              채팅으로 수정
+            </button>
+            <a
+              href={getEntityQuotePdfUrl(quote.id)}
+              className="rounded-full border border-indigo-300 px-4 py-2 text-sm font-semibold text-indigo-700 hover:border-indigo-400"
+            >
+              PDF 다운로드
+            </a>
+            <a
+              href={getEntityQuoteXlsxUrl(quote.id)}
+              className="rounded-full border border-indigo-300 px-4 py-2 text-sm font-semibold text-indigo-700 hover:border-indigo-400"
+            >
+              엑셀 다운로드
+            </a>
+          </div>
+        )}
       </div>
 
-      {quote.line_items.length > 0 ? (
-        <div className="mt-4">
-          <LineItemTable
-            items={quote.line_items}
-            columnLabels={quote.column_labels}
-            detailColumnOrder={quote.detail_column_order}
-            totalAmount={quote.total_amount}
-            vatIncluded={vatIncluded}
-            onSaveLineItems={onSaveLineItems}
-          />
-        </div>
-      ) : (
-        <p className="mt-4 text-sm text-gray-400">아직 항목이 생성되지 않았습니다.</p>
-      )}
-
       {quote.line_items.length > 0 && (
-        <div className="mt-5 flex flex-wrap gap-2">
-          <button
-            type="button"
-            onClick={onOpenChat}
-            className="rounded-full bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-500"
-          >
-            채팅으로 수정
-          </button>
-          <a
-            href={getEntityQuotePdfUrl(quote.id)}
-            className="rounded-full border border-indigo-300 px-4 py-2 text-sm font-semibold text-indigo-700 hover:border-indigo-400"
-          >
-            PDF 다운로드
-          </a>
-          <a
-            href={getEntityQuoteXlsxUrl(quote.id)}
-            className="rounded-full border border-indigo-300 px-4 py-2 text-sm font-semibold text-indigo-700 hover:border-indigo-400"
-          >
-            엑셀 다운로드
-          </a>
+        <div className="xl:sticky xl:top-6">
+          <QuotePreviewPane quote={quote} />
         </div>
       )}
+    </div>
+  );
+}
 
-      {quote.line_items.length > 0 && (
-        <div className="mt-4">
-          <p className="mb-1.5 text-xs font-semibold text-gray-400">실제 양식 미리보기</p>
-          <iframe
-            key={hashKey({ items: quote.line_items, total: quote.total_amount, service: quote.service_name })}
-            src={getEntityQuotePdfUrl(quote.id, { inline: true })}
-            title={`${quote.entity_name} 견적서 미리보기`}
-            className="h-[800px] w-full rounded-lg border border-gray-200"
-          />
-        </div>
-      )}
+function QuotePreviewPane({ quote }: { quote: EntityQuote }) {
+  const previewKey = hashKey({ items: quote.line_items, total: quote.total_amount, service: quote.service_name });
+  const [loadedKey, setLoadedKey] = useState<string | null>(null);
+  const loading = loadedKey !== previewKey;
+
+  return (
+    <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
+      <div className="mb-2 flex items-center justify-between">
+        <p className="text-xs font-semibold text-gray-400">실제 양식 미리보기</p>
+        {loading && <p className="text-xs text-indigo-500">최신 수정 내용 반영 중…</p>}
+      </div>
+      <div className="relative aspect-[1/1.4142] max-h-[calc(100vh-8rem)] w-full overflow-hidden rounded-lg border border-gray-200">
+        {loading && (
+          <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-gray-50">
+            <div className="h-6 w-6 animate-spin rounded-full border-2 border-indigo-200 border-t-indigo-600" />
+            <p className="text-xs text-gray-400">실제 양식을 불러오는 중…</p>
+          </div>
+        )}
+        <iframe
+          key={previewKey}
+          src={`${getEntityQuotePdfUrl(quote.id, { inline: true })}#view=FitH`}
+          title={`${quote.entity_name} 견적서 미리보기`}
+          className="h-full w-full"
+          onLoad={() => setLoadedKey(previewKey)}
+        />
+      </div>
     </div>
   );
 }
@@ -889,7 +1064,35 @@ function emptyTasks(): EntitySelection["tasks"] {
   return { 마케팅: { included: false, moduleNames: [] }, 시장검증: { included: false, moduleNames: [] } };
 }
 
-export default function EstimateWizard() {
+// 기준 기업이 고른 variant 옵션의 라벨(예: "온라인 광고 / SEO 마케팅 / ...")을 찾는다 — 다른
+// 기업에 같은 선택을 옮길 때 module_name이 아니라 라벨로 매칭해야, 법인마다 실제 module_name이
+// 달라도(예: 미러링 카탈로그) 같은 개념의 옵션을 찾을 수 있다.
+function selectedVariantLabels(taskType: FixedTaskType, moduleNames: string[], options: CatalogModuleOptions | undefined): string[] {
+  const labels: string[] = [];
+  for (const group of options?.groups ?? []) {
+    if (group.kind !== "variant") continue;
+    const match = group.options.find((o) => o.module_names.every((m) => moduleNames.includes(m)));
+    if (match) labels.push(match.label);
+  }
+  return labels;
+}
+
+// 기준 기업의 variant 라벨을 대상 기업의 카탈로그에서 같은 라벨로 찾아 적용하고, 없으면(카탈로그
+// 구성이 달라 매칭이 안 되면) 그 기업 자신의 기본값으로 대체한다.
+function moduleNamesMatchingLabels(referenceLabels: string[], options: CatalogModuleOptions | undefined): string[] {
+  const names: string[] = [];
+  let labelIndex = 0;
+  for (const group of options?.groups ?? []) {
+    if (group.kind !== "variant") continue;
+    const wanted = referenceLabels[labelIndex++];
+    const match = wanted ? group.options.find((o) => o.label === wanted) : undefined;
+    const chosen = match ?? group.options.find((o) => o.is_default) ?? group.options[0];
+    if (chosen) names.push(...chosen.module_names);
+  }
+  return names;
+}
+
+export default function EstimateWizard({ initialEstimateSetId }: { initialEstimateSetId?: string } = {}) {
   const [entities, setEntities] = useState<EntityOption[]>([]);
   const [entitiesLoading, setEntitiesLoading] = useState(true);
   // 과업종류별로 취급하지 않는 법인(예: 썬데이워커/ABBG × 시장검증)을 숨기기 위한 정보.
@@ -904,6 +1107,9 @@ export default function EstimateWizard() {
 
   const [projectName, setProjectName] = useState("");
   const [recipientName, setRecipientName] = useState("");
+  const [recipientContact, setRecipientContact] = useState("");
+  const [recipientPhone, setRecipientPhone] = useState("");
+  const [recipientEmail, setRecipientEmail] = useState("");
   const [totalAmount, setTotalAmount] = useState("");
   const [vatIncluded, setVatIncluded] = useState(true);
   const [serviceName, setServiceName] = useState("");
@@ -920,8 +1126,22 @@ export default function EstimateWizard() {
   const [moduleOptions, setModuleOptions] = useState<EntityModuleOptions[]>([]);
   const [moduleSelections, setModuleSelections] = useState<Record<string, string[]>>({});
 
+  // 견적서 목록에서 기존 세트를 클릭해 들어온 경우, 새로 만드는 대신 그 결과 화면을 바로 불러온다.
+  const [initialLoading, setInitialLoading] = useState(!!initialEstimateSetId);
+  useEffect(() => {
+    if (!initialEstimateSetId) return;
+    fetchEstimateSet(initialEstimateSetId)
+      .then(setResult)
+      .catch((e) => setError(e instanceof ApiError ? e.message : "견적서를 불러오지 못했습니다."))
+      .finally(() => setInitialLoading(false));
+  }, [initialEstimateSetId]);
+
   const primaryEntityId = entitySelections.find((s) => s.role === "primary")?.entityId ?? "";
   const primaryIsTestify = entities.find((e) => e.id === primaryEntityId)?.name === TESTIFY_NAME;
+  // 과업 선택은 이 "기준 기업" 하나만 고르면 나머지 기업에 자동으로 같은 과업이 적용된다
+  // (2026-08-09 사용자 요청 — 기업마다 따로 고르지 않는다). 본견적이 있으면 본견적이 기준,
+  // 없으면(비교견적끼리만 선택된 경우) 가장 먼저 선택한 기업이 기준이 된다.
+  const referenceEntityId = primaryEntityId || entitySelections[0]?.entityId || "";
   const resultId = result?.id;
   const resultHasItems = result?.entity_quotes.some((q) => q.line_items.length > 0) ?? false;
 
@@ -966,6 +1186,27 @@ export default function EstimateWizard() {
       })
       .catch((e) => setError(e instanceof ApiError ? e.message : "모듈 옵션을 불러오지 못했습니다."));
   }, [entitySelections, moduleOptionsCache]);
+
+  // 기준 기업(본견적, 없으면 첫 선택 기업)의 과업 선택을 나머지 기업에 그대로 적용한 결과를
+  // "계산"한다 — state에 동기화해 저장하지 않고 필요할 때(제출 시점 등)마다 유도한다. 그 기업이
+  // 취급하지 않는 과업종류(excludedByTask)는 강제로 제외하고, variant 옵션은 라벨이 일치하는
+  // 것을 찾아 적용하되 없으면 그 기업 자신의 기본값을 쓴다.
+  function effectiveTasks(s: EntitySelection): EntitySelection["tasks"] {
+    if (s.entityId === referenceEntityId) return s.tasks;
+    const reference = entitySelections.find((r) => r.entityId === referenceEntityId);
+    if (!reference) return s.tasks;
+    const nextTasks = emptyTasks();
+    for (const taskType of FIXED_TASK_TYPES) {
+      const refTask = reference.tasks[taskType];
+      if (!refTask.included || excludedByTask[taskType].has(s.entityId)) continue;
+      const refOptions = moduleOptionsCache[`${referenceEntityId}:${taskType}`];
+      const targetOptions = moduleOptionsCache[`${s.entityId}:${taskType}`];
+      const referenceLabels = selectedVariantLabels(taskType, refTask.moduleNames, refOptions);
+      const moduleNames = moduleNamesMatchingLabels(referenceLabels, targetOptions);
+      nextTasks[taskType] = { included: true, moduleNames };
+    }
+    return nextTasks;
+  }
 
   useEffect(() => {
     if (!ENABLE_MODULE_SELECTION_UI) return;
@@ -1082,7 +1323,9 @@ export default function EstimateWizard() {
     );
   }
 
-  const allEntitiesHaveTask = entitySelections.every((s) => FIXED_TASK_TYPES.some((t) => s.tasks[t].included));
+  const allEntitiesHaveTask = entitySelections.every((s) =>
+    FIXED_TASK_TYPES.some((t) => effectiveTasks(s)[t].included)
+  );
 
   const canSubmit =
     entitySelections.length > 0 &&
@@ -1101,23 +1344,29 @@ export default function EstimateWizard() {
       const created = await createEstimateSet({
         project_name: projectName,
         recipient_name: recipientName,
+        recipient_contact: recipientContact || undefined,
+        recipient_phone: recipientPhone || undefined,
+        recipient_email: recipientEmail || undefined,
         total_amount: Number(totalAmount),
         vat_included: vatIncluded,
         entities: entitySelections.map((s) => ({
           entity_id: s.entityId,
           is_primary: s.role === "primary",
-          task_types: FIXED_TASK_TYPES.filter((t) => s.tasks[t].included),
+          task_types: FIXED_TASK_TYPES.filter((t) => effectiveTasks(s)[t].included),
         })),
         service_name: primaryIsTestify ? serviceName : undefined,
       });
       setResult(created);
 
-      // 생성된 entity_quote(기업×과업종류별 row)마다, 그 기업이 그 과업종류에서 고른 모듈을 매칭한다.
-      const bySelection = new Map(entitySelections.map((s) => [s.entityId, s]));
+      // 생성된 entity_quote(기업별 row, 교차 선택한 과업종류를 모두 포함)마다, 그 기업이 각
+      // 과업종류에서 고른 모듈을 모두 모아 매칭한다(모듈명이 과업종류 간에 겹치지 않아 합쳐도 안전).
+      const bySelection = new Map(entitySelections.map((s) => [s.entityId, effectiveTasks(s)]));
       const selections: Record<string, string[]> = {};
       for (const quote of created.entity_quotes) {
-        const selection = bySelection.get(quote.entity_id);
-        selections[quote.id] = selection?.tasks[quote.task_type as FixedTaskType]?.moduleNames ?? [];
+        const tasks = bySelection.get(quote.entity_id);
+        selections[quote.id] = quote.task_types.flatMap(
+          (t) => tasks?.[t as FixedTaskType]?.moduleNames ?? []
+        );
       }
       setModuleSelections(selections);
       const generated = await generateEstimateSet(created.id, selections);
@@ -1198,6 +1447,10 @@ export default function EstimateWizard() {
       ...prev,
       [quoteId]: [...(prev[quoteId] ?? []), { role: "assistant", text: summary, scope: editResult.scope }],
     }));
+  }
+
+  if (initialLoading) {
+    return <p className="p-8 text-center text-base text-gray-400">불러오는 중…</p>;
   }
 
   if (result) {
@@ -1374,6 +1627,9 @@ export default function EstimateWizard() {
                     >
                       {q.entity_name}
                       <span className="ml-1.5 text-xs opacity-70">{q.is_primary ? "본견적" : "비교견적"}</span>
+                      {q.total_amount > 0 && (
+                        <span className="ml-1.5 text-xs opacity-70">· {q.total_amount.toLocaleString()}원</span>
+                      )}
                     </button>
                   );
                 })}
@@ -1406,12 +1662,26 @@ export default function EstimateWizard() {
     );
   }
 
+  const referenceSelection = entitySelections.find((s) => s.entityId === referenceEntityId);
+  const otherSelections = entitySelections.filter((s) => s.entityId !== referenceEntityId);
+  // 기준 기업이 실제로 켠 과업종류가 있고, 그 전부를 어떤 기업이 취급하지 않을 때만 경고한다 —
+  // 아직 아무 과업도 안 켰을 때 every()가 공허하게 참이 되어 전부 "제외"로 오판하던 버그가
+  // 있었다(2026-08-09, 스크린샷으로 재현 확인).
+  const referenceIncludedTaskTypes = referenceSelection
+    ? FIXED_TASK_TYPES.filter((t) => referenceSelection.tasks[t].included)
+    : [];
+  const strandedSelections =
+    otherSelections.length > 0 && referenceIncludedTaskTypes.length > 0
+      ? otherSelections.filter((s) => referenceIncludedTaskTypes.every((t) => excludedByTask[t].has(s.entityId)))
+      : [];
+  const entityLabel = (id: string) => entities.find((e) => e.id === id)?.name ?? id;
+
   return (
-    <div className="space-y-8 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm sm:p-8">
+    <div className="space-y-10 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm sm:p-8">
       <div>
         <h2 className="text-2xl font-bold text-gray-900">견적서 생성</h2>
         <p className="mt-2 text-base text-gray-500">
-          기업을 먼저 선택하면, 본견적/비교견적 역할과 과업(마케팅·시장검증)을 기업별로 자유롭게 조합할 수 있습니다.
+          기업을 선택하고 본견적/비교견적 역할을 정하면, 과업은 한 번만 골라도 모든 기업에 동일하게 적용됩니다.
         </p>
       </div>
 
@@ -1421,9 +1691,7 @@ export default function EstimateWizard() {
 
       {/* Step 1: 기업 선택 */}
       <fieldset>
-        <legend className="text-base font-semibold text-gray-900">
-          1. 기업 선택 <span className="font-normal text-gray-400">(다중 선택, 최소 1곳)</span>
-        </legend>
+        <StepHeader n={1} title="기업 선택" hint="다중 선택, 최소 1곳" />
         {entitiesLoading ? (
           <p className="mt-3 text-base text-gray-400">불러오는 중…</p>
         ) : (
@@ -1436,12 +1704,17 @@ export default function EstimateWizard() {
                   type="button"
                   onClick={() => toggleEntity(e.id)}
                   className={
-                    "rounded-full border px-4 py-2 text-base " +
+                    "inline-flex items-center gap-1.5 rounded-full border px-4 py-2 text-base font-medium transition-colors " +
                     (selected
                       ? "border-indigo-600 bg-indigo-600 text-white"
-                      : "border-gray-300 text-gray-700 hover:border-gray-400")
+                      : "border-gray-300 text-gray-700 hover:border-gray-400 hover:bg-gray-50")
                   }
                 >
+                  {selected && (
+                    <svg viewBox="0 0 12 12" fill="none" className="h-3 w-3">
+                      <path d="M2 6l2.5 2.5L10 3" stroke="currentColor" strokeWidth={1.75} strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                  )}
                   {e.name}
                 </button>
               );
@@ -1453,78 +1726,74 @@ export default function EstimateWizard() {
       {/* Step 2: 본견적/비교견적 지정 */}
       {entitySelections.length > 0 && (
         <fieldset>
-          <legend className="text-base font-semibold text-gray-900">
-            2. 본견적/비교견적 지정 <span className="font-normal text-gray-400">(본견적 최대 1곳, 비교견적 최대 {MAX_COMPARISON}곳)</span>
-          </legend>
-          <div className="mt-3 space-y-2">
-            {entitySelections.map((s) => {
-              const entityName = entities.find((e) => e.id === s.entityId)?.name ?? s.entityId;
-              return (
-                <div
-                  key={s.entityId}
-                  className="flex flex-wrap items-center gap-4 rounded-lg border border-gray-200 px-4 py-2.5"
-                >
-                  <span className="min-w-24 text-base font-medium text-gray-900">{entityName}</span>
-                  <label className="flex items-center gap-1.5 text-sm text-gray-700">
-                    <input
-                      type="radio"
-                      name={`role-${s.entityId}`}
-                      checked={s.role === "primary"}
-                      onChange={() => setRole(s.entityId, "primary")}
-                      className="h-4 w-4 text-indigo-600 focus:ring-indigo-500"
-                    />
-                    본견적
-                  </label>
-                  <label className="flex items-center gap-1.5 text-sm text-gray-700">
-                    <input
-                      type="radio"
-                      name={`role-${s.entityId}`}
-                      checked={s.role === "comparison"}
-                      onChange={() => setRole(s.entityId, "comparison")}
-                      className="h-4 w-4 text-indigo-600 focus:ring-indigo-500"
-                    />
-                    비교견적 <span className="text-gray-400">(+10%)</span>
-                  </label>
+          <StepHeader n={2} title="본견적/비교견적 지정" hint={`본견적 최대 1곳, 비교견적 최대 ${MAX_COMPARISON}곳`} />
+          <div className="mt-3 divide-y divide-gray-100 overflow-hidden rounded-xl border border-gray-200">
+            {entitySelections.map((s) => (
+              <div key={s.entityId} className="flex flex-wrap items-center justify-between gap-3 bg-white px-4 py-3">
+                <span className="text-base font-semibold text-gray-900">{entityLabel(s.entityId)}</span>
+                <div className="inline-flex rounded-full border border-gray-200 bg-gray-50 p-0.5">
+                  {(["primary", "comparison"] as const).map((role) => (
+                    <button
+                      key={role}
+                      type="button"
+                      onClick={() => setRole(s.entityId, role)}
+                      className={
+                        "rounded-full px-3.5 py-1.5 text-sm font-medium transition-colors " +
+                        (s.role === role ? "bg-indigo-600 text-white shadow-sm" : "text-gray-600 hover:text-gray-900")
+                      }
+                    >
+                      {role === "primary" ? "본견적" : "비교견적 +10%"}
+                    </button>
+                  ))}
                 </div>
-              );
-            })}
+              </div>
+            ))}
           </div>
         </fieldset>
       )}
 
-      {/* Step 3: 과업 선택 (기업별 마케팅/시장검증 교차 선택) */}
-      {entitySelections.length > 0 && (
+      {/* Step 3: 과업 선택 — 기준 기업(본견적, 없으면 첫 선택 기업) 하나만 고르면 나머지 기업에
+          자동으로 동일하게 적용된다(2026-08-09 사용자 요청 — 기업마다 따로 고르지 않는다). */}
+      {entitySelections.length > 0 && referenceSelection && (
         <fieldset>
-          <legend className="text-base font-semibold text-gray-900">
-            3. 과업 선택 <span className="font-normal text-gray-400">(기업마다 마케팅·시장검증 교차 선택 가능)</span>
-          </legend>
-          <div className="mt-3 space-y-4">
-            {entitySelections.map((s) => {
-              const entityName = entities.find((e) => e.id === s.entityId)?.name ?? s.entityId;
-              const availableTaskTypes = FIXED_TASK_TYPES.filter((t) => !excludedByTask[t].has(s.entityId));
-              return (
-                <div key={s.entityId} className="rounded-xl border border-gray-200 p-4">
-                  <p className="text-sm font-semibold text-gray-900">{entityName}</p>
-                  <div className="mt-2 grid grid-cols-1 gap-3 sm:grid-cols-2">
-                    {availableTaskTypes.map((taskType) => (
-                      <TaskModulePicker
-                        key={taskType}
-                        entityId={s.entityId}
-                        taskType={taskType}
-                        included={s.tasks[taskType].included}
-                        moduleNames={s.tasks[taskType].moduleNames}
-                        options={moduleOptionsCache[`${s.entityId}:${taskType}`]}
-                        onToggleIncluded={(included) => toggleTaskIncluded(s.entityId, taskType, included)}
-                        onSetVariant={(group, option) => setVariantModule(s.entityId, taskType, group, option)}
-                        onToggleAdditive={(option, checked) =>
-                          toggleAdditiveModule(s.entityId, taskType, option, checked)
-                        }
-                      />
-                    ))}
-                  </div>
-                </div>
-              );
-            })}
+          <StepHeader n={3} title="과업 선택" hint="한 번만 고르면 모든 기업에 동일하게 적용됩니다" />
+          <div className="mt-3 space-y-3">
+            <div className="rounded-xl border border-gray-200 p-4">
+              <p className="text-sm font-semibold text-gray-900">
+                {entityLabel(referenceEntityId)}
+                <span className="ml-1.5 font-normal text-gray-400">
+                  ({referenceSelection.role === "primary" ? "본견적" : "비교견적"} 기준)
+                </span>
+              </p>
+              <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                {FIXED_TASK_TYPES.filter((t) => !excludedByTask[t].has(referenceEntityId)).map((taskType) => (
+                  <TaskModulePicker
+                    key={taskType}
+                    entityId={referenceEntityId}
+                    taskType={taskType}
+                    included={referenceSelection.tasks[taskType].included}
+                    moduleNames={referenceSelection.tasks[taskType].moduleNames}
+                    options={moduleOptionsCache[`${referenceEntityId}:${taskType}`]}
+                    onToggleIncluded={(included) => toggleTaskIncluded(referenceEntityId, taskType, included)}
+                    onSetVariant={(group, option) => setVariantModule(referenceEntityId, taskType, group, option)}
+                    onToggleAdditive={(option, checked) =>
+                      toggleAdditiveModule(referenceEntityId, taskType, option, checked)
+                    }
+                  />
+                ))}
+              </div>
+            </div>
+            {otherSelections.length > 0 && (
+              <p className="px-1 text-sm text-gray-400">
+                {otherSelections.map((s) => entityLabel(s.entityId)).join(", ")}에도 동일하게 적용됩니다.
+              </p>
+            )}
+            {strandedSelections.length > 0 && (
+              <p className="rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-700">
+                {strandedSelections.map((s) => entityLabel(s.entityId)).join(", ")}은(는) 선택한 과업을 취급하지 않아
+                제외됩니다 — 발급하려면 기업 선택을 다시 확인해주세요.
+              </p>
+            )}
           </div>
         </fieldset>
       )}
@@ -1532,7 +1801,7 @@ export default function EstimateWizard() {
       {/* Step 4: 사업명 + 총액 */}
       {entitySelections.length > 0 && (
         <fieldset className="space-y-4">
-          <legend className="text-base font-semibold text-gray-900">4. 사업 정보</legend>
+          <StepHeader n={4} title="사업 정보" />
           <div>
             <label className="block text-sm text-gray-500">사업명</label>
             <input
@@ -1555,6 +1824,46 @@ export default function EstimateWizard() {
               className="mt-1.5 w-full rounded-md border border-gray-300 px-4 py-3 text-base focus:border-indigo-500 focus:outline-none"
             />
           </div>
+          {entitySelections.some((s) => entities.find((e) => e.id === s.entityId)?.name === "ABBG") && (
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+              <div>
+                <label className="block text-sm text-gray-500">
+                  수령인 <span className="text-gray-400">(ABBG 양식 전용)</span>
+                </label>
+                <input
+                  type="text"
+                  value={recipientContact}
+                  onChange={(e) => setRecipientContact(e.target.value)}
+                  placeholder="예: 김담당"
+                  className="mt-1.5 w-full rounded-md border border-gray-300 px-4 py-3 text-base focus:border-indigo-500 focus:outline-none"
+                />
+              </div>
+              <div>
+                <label className="block text-sm text-gray-500">
+                  연락처 <span className="text-gray-400">(ABBG 양식 전용)</span>
+                </label>
+                <input
+                  type="text"
+                  value={recipientPhone}
+                  onChange={(e) => setRecipientPhone(e.target.value)}
+                  placeholder="예: 010-1234-5678"
+                  className="mt-1.5 w-full rounded-md border border-gray-300 px-4 py-3 text-base focus:border-indigo-500 focus:outline-none"
+                />
+              </div>
+              <div>
+                <label className="block text-sm text-gray-500">
+                  이메일 <span className="text-gray-400">(ABBG 양식 전용)</span>
+                </label>
+                <input
+                  type="text"
+                  value={recipientEmail}
+                  onChange={(e) => setRecipientEmail(e.target.value)}
+                  placeholder="예: example@company.com"
+                  className="mt-1.5 w-full rounded-md border border-gray-300 px-4 py-3 text-base focus:border-indigo-500 focus:outline-none"
+                />
+              </div>
+            </div>
+          )}
           <div className="flex items-end gap-4">
             <div className="flex-1">
               <label className="block text-sm text-gray-500">총액 (원)</label>

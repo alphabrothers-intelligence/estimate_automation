@@ -15,6 +15,7 @@ import io
 import re
 import subprocess
 import tempfile
+import threading
 import zipfile
 from datetime import date
 from pathlib import Path
@@ -24,9 +25,15 @@ from xml.sax.saxutils import escape
 from fastapi import HTTPException
 
 from app.config import get_supabase
-from app.services import template_storage
+from app.services import catalog_service, template_storage
 
 CellUpdates = Dict[str, Any]  # 셀 좌표("H16") -> 값(str|int|float|None). None이면 값을 비운다.
+
+# 미사용 항목 행의 공급가액 등은 원본에 수식(예: =E16*F16*G16)으로 들어있어, 그냥 None을 넣으면
+# _patch_sheet_xml이 "수식 셀은 캐시만 지우고 수식은 보존"하는 규칙 때문에 단가/수량 칸이
+# 비어도 수식이 0으로 재계산되어 "0"이 그대로 찍힌다(2026-08-09 재현·확인). 이 값은 그 규칙을
+# 무시하고 수식이 있든 없든 셀을 완전히 비우라는 표시다.
+_FORCE_EMPTY = object()
 
 
 def _cell_pattern(coord: str) -> re.Pattern:
@@ -63,7 +70,9 @@ def _patch_sheet_xml(xml_text: str, updates: CellUpdates) -> str:
         if not m:
             raise HTTPException(status_code=500, detail=f"셀 매핑 오류: 시트에서 {coord} 셀을 찾지 못했습니다.")
         attrs, inner = m.group(1), (m.group(3) or "")
-        if _has_formula(inner):
+        if value is _FORCE_EMPTY:
+            replacement = _build_cell_xml(coord, attrs, None)
+        elif _has_formula(inner):
             replacement = _strip_cached_formula_value(coord, attrs, inner)
         else:
             replacement = _build_cell_xml(coord, attrs, value)
@@ -278,8 +287,13 @@ def _colname(n: int) -> str:
 
 
 def _has_working_print_area(workbook_xml: str) -> bool:
+    # localSheetId/name 속성 순서는 파일마다 다르다(대부분의 실제 법인 원본은 name이 먼저 옴,
+    # 예: <definedName name="_xlnm.Print_Area" localSheetId="1">) — 순서를 가정한 패턴은 이미
+    # 정상 동작하는 인쇄영역도 "없다"고 오판해서 _fix_broken_print_area가 훨씬 큰(시트 전체
+    # 사용범위 기준) 중복 인쇄영역을 추가로 만들어버리고, 결과 PDF가 그 큰 범위 기준으로
+    # 축소되어 내용이 페이지 구석에 작게 찍히는 버그로 이어졌다(2026-08-09 재현·확인).
     m = re.search(
-        r'<definedName\b[^>]*localSheetId="0"[^>]*name="_xlnm\.Print_Area"[^>]*>([^<]*)</definedName>',
+        r'<definedName\b(?=[^>]*\blocalSheetId="0")(?=[^>]*\bname="_xlnm\.Print_Area")[^>]*>([^<]*)</definedName>',
         workbook_xml,
     )
     return bool(m and m.group(1).strip() and m.group(1).strip() != "NA()")
@@ -304,7 +318,8 @@ def _fix_broken_print_area(workbook_xml: str, sheet_xml: str, sheet_name: str) -
 
     # 이 시트를 가리키던 기존 Print_Area류 정의(정상/깨짐 상관없이)는 지우고 하나만 새로 넣는다.
     workbook_xml = re.sub(
-        r'<definedName\b[^>]*localSheetId="0"[^>]*name="(?:_xlnm\.Print_Area|Excel_BuiltIn_Print_Area)"'
+        r'<definedName\b(?=[^>]*\blocalSheetId="0")'
+        r'(?=[^>]*\bname="(?:_xlnm\.Print_Area|Excel_BuiltIn_Print_Area)")'
         r'[^>]*>.*?</definedName>',
         "",
         workbook_xml,
@@ -315,12 +330,90 @@ def _fix_broken_print_area(workbook_xml: str, sheet_xml: str, sheet_name: str) -
     return re.sub(r"(</sheets>)", r"\1<definedNames>" + new_defined_name + "</definedNames>", workbook_xml, count=1)
 
 
-def _patch_xlsx(source_bytes: bytes, sheet_name: str, updates: CellUpdates, dest_path: Path) -> None:
+def _hide_rows(sheet_xml: str, row_numbers: set) -> str:
+    """항목이 배정되지 않은 행을 hidden="1"로 표시해 PDF에서 아예 빠지게 한다 — 값만 비우면
+    수식 재계산으로 "0"이 찍히는 문제(위 _FORCE_EMPTY)와 별개로, 빈 줄 자체가 남아 표가
+    쓸데없이 길어지는 문제(2026-08-09 사용자 지적)를 없앤다."""
+    if not row_numbers:
+        return sheet_xml
+
+    def _mark_hidden(m: re.Match) -> str:
+        if int(m.group(1)) not in row_numbers:
+            return m.group(0)
+        tag = m.group(0)
+        # 블렌디드랩처럼 .xls에서 변환된 파일은 hidden="false"를 명시적으로 이미 갖고 있다 —
+        # 존재 여부가 아니라 값만 보고 판단하면(과거 버전의 버그, 2026-08-10 발견) 같은 태그에
+        # hidden 속성이 두 번 들어가는 잘못된 XML이 만들어지고, LibreOffice가 이를 다르게
+        # 해석해 인쇄 레이아웃 전체가 깨진다(표/테두리 소실, 내용이 여러 페이지로 흩어짐).
+        if re.search(r'\bhidden="[^"]*"', tag):
+            return re.sub(r'\bhidden="[^"]*"', 'hidden="1"', tag, count=1)
+        return (tag[:-2] + ' hidden="1"/>') if tag.endswith("/>") else (tag[:-1] + ' hidden="1">')
+
+    return re.sub(r'<row r="(\d+)"[^>]*?(?:/>|>)', _mark_hidden, sheet_xml)
+
+
+def _ensure_wrap_text(sheet_xml: str, styles_xml: str, coords: set) -> tuple[str, str]:
+    """줄바꿈(\\n)이 들어간 값을 쓰는 셀(예: ABBG "상세내용" 칸의 세로형 개조식 목록, PRD 6.2)이
+    원래 wrapText 서식이 없으면(2026-08-10 확인 — ABBG 마스터의 해당 칸이 그랬다) 한 줄로
+    뭉개져 찍힌다. 그 셀의 스타일을 wrapText=1로 복제한 새 스타일로만 바꿔치기한다 — 같은
+    스타일을 공유하는 다른 셀(서식이 원래대로여야 함)에는 영향을 주지 않는다."""
+    if not coords:
+        return sheet_xml, styles_xml
+    m = re.search(r'(<cellXfs count=")(\d+)(">)(.*?)(</cellXfs>)', styles_xml, re.DOTALL)
+    if not m:
+        return sheet_xml, styles_xml
+    count = int(m.group(2))
+    body = m.group(4)
+    xf_entries = re.findall(r'<xf\b[^>]*?(?:/>|>.*?</xf>)', body, re.DOTALL)
+    new_entries: List[str] = []
+    wrap_cache: Dict[int, int] = {}
+
+    for coord in coords:
+        cm = re.search(rf'<c r="{re.escape(coord)}"[^>]*?(?:/>|>)', sheet_xml)
+        if not cm:
+            continue
+        s_match = re.search(r'\ss="(\d+)"', cm.group(0))
+        if not s_match:
+            continue
+        old_idx = int(s_match.group(1))
+        if old_idx >= len(xf_entries) or 'wrapText="1"' in xf_entries[old_idx]:
+            continue
+        if old_idx not in wrap_cache:
+            xf = xf_entries[old_idx]
+            if re.search(r"<alignment\b[^>]*/>", xf):
+                wrapped_xf = re.sub(r"(<alignment\b[^>]*?)/>", r'\1 wrapText="1"/>', xf, count=1)
+            elif xf.endswith("/>"):
+                wrapped_xf = xf[:-2] + '><alignment wrapText="1"/></xf>'
+            else:
+                continue  # 이미 있는 <alignment>...</alignment> 형태는 드물어 다루지 않는다
+            wrap_cache[old_idx] = count + len(new_entries)
+            new_entries.append(wrapped_xf)
+        new_idx = wrap_cache[old_idx]
+        sheet_xml = sheet_xml[: cm.start()] + cm.group(0).replace(f's="{old_idx}"', f's="{new_idx}"', 1) + sheet_xml[cm.end() :]
+
+    if not new_entries:
+        return sheet_xml, styles_xml
+    new_count = count + len(new_entries)
+    styles_xml = (
+        styles_xml[: m.start()]
+        + f'<cellXfs count="{new_count}">'
+        + body
+        + "".join(new_entries)
+        + "</cellXfs>"
+        + styles_xml[m.end() :]
+    )
+    return sheet_xml, styles_xml
+
+
+def _patch_xlsx(
+    source_bytes: bytes, sheet_name: str, updates: CellUpdates, dest_path: Path, hidden_rows: Optional[set] = None
+) -> None:
     with zipfile.ZipFile(io.BytesIO(source_bytes), "r") as zin:
         sheet_path = _sheet_internal_path(zin, sheet_name)
         sheet_xml = zin.read(sheet_path).decode("utf-8")
         patched_sheet_xml = _patch_sheet_xml(sheet_xml, updates)
         patched_sheet_xml = _strip_all_formula_caches(patched_sheet_xml)
+        patched_sheet_xml = _hide_rows(patched_sheet_xml, hidden_rows or set())
         patched_sheet_xml = _force_fit_to_page(patched_sheet_xml)
 
         workbook_xml = zin.read("xl/workbook.xml").decode("utf-8")
@@ -334,7 +427,9 @@ def _patch_xlsx(source_bytes: bytes, sheet_name: str, updates: CellUpdates, dest
         patched_content_types, patched_workbook_rels = _strip_calc_chain(content_types_xml, workbook_rels_xml)
 
         styles_xml = zin.read("xl/styles.xml").decode("utf-8")
-        patched_styles_xml = _patch_font_substitution(styles_xml)
+        styles_xml = _patch_font_substitution(styles_xml)
+        wrap_coords = {coord for coord, value in updates.items() if isinstance(value, str) and "\n" in value}
+        patched_sheet_xml, patched_styles_xml = _ensure_wrap_text(patched_sheet_xml, styles_xml, wrap_coords)
 
         skip_files = {"xl/calcChain.xml"}
         with zipfile.ZipFile(dest_path, "w", zipfile.ZIP_DEFLATED) as zout:
@@ -379,31 +474,44 @@ def _formula_references_column(sheet_xml: str, coord: str, col_letter: str) -> b
     return bool(re.search(rf"\b{re.escape(col_letter)}\d+\b", f_match.group(1)))
 
 
-def _lookup_work_days_quantity(
-    supabase, catalog_entity_id: str, task_type: str, module_name: str, item_name: str
-) -> tuple[float, float]:
+def _fetch_work_days_quantity_map(supabase, catalog_entity_id: str, task_type: str) -> Dict[str, List[dict]]:
+    """item_name -> 그 이름을 가진 카탈로그 행 목록(같은 이름이 여러 모듈에 있을 수 있어 리스트).
+    항목마다 Supabase에 따로 조회하면 왕복이 항목 수만큼 쌓여 눈에 띄게 느려진다(2026-08-09
+    실측 — 12개 항목 순차 조회에 약 2.4초, Claude 호출 1번과 맞먹는 시간) — 견적 1건당
+    (법인×과업종류) 카탈로그를 한 번만 통째로 가져와 메모리에서 찾는다."""
     res = (
         supabase.table("item_catalogs")
-        .select("module_name, work_days, quantity")
+        .select("module_name, item_name, work_days, quantity")
         .eq("entity_id", catalog_entity_id)
         .eq("task_type", task_type)
-        .eq("item_name", item_name)
         .eq("is_current", True)
         .execute()
     )
-    if not res.data:
+    by_name: Dict[str, List[dict]] = {}
+    for row in res.data:
+        by_name.setdefault(row["item_name"], []).append(row)
+    return by_name
+
+
+def _lookup_work_days_quantity(
+    catalog_map: Dict[str, List[dict]], module_name: str, item_name: str
+) -> tuple[float, float]:
+    rows = catalog_map.get(item_name)
+    if not rows:
         return 1.0, 1.0
-    exact = [r for r in res.data if r["module_name"] == module_name]
-    row = exact[0] if exact else res.data[0]
+    exact = [r for r in rows if r["module_name"] == module_name]
+    row = exact[0] if exact else rows[0]
     return float(row["work_days"]), float(row["quantity"])
 
 
-def get_column_display(supabase, entity_id: str, task_type: str, selected_modules: Optional[list]) -> Dict[str, Any]:
+def get_column_display(supabase, entity_id: str, task_types: List[str], selected_modules: Optional[list]) -> Dict[str, Any]:
     """미리보기 UI가 법인마다 다른 실제 원본 양식 그대로 컬럼명·순서를 보여주기 위한 정보를
     반환한다(2026-07-10 — 같은 의미라도 법인마다 명칭이 다름: 예) 작업일/소요일, 수량/작업수량).
-    템플릿을 못 찾는 경우(러프 비교견적 등)는 실패시키지 않고 빈 값으로 대체한다."""
+    템플릿을 못 찾는 경우(러프 비교견적 등)는 실패시키지 않고 빈 값으로 대체한다. 과업종류를
+    교차 선택한 견적서는 실제 배정 시점에야 어느 양식이 쓰일지 확정되므로(용량 초과 시 다음
+    후보로 넘어감, _resolve_host_templates), 여기서는 1순위 후보 기준으로 근사해 보여준다."""
     try:
-        template = _find_quote_template(supabase, entity_id, task_type, selected_modules)
+        template = _resolve_host_templates(supabase, entity_id, task_types, selected_modules)[0]
     except HTTPException:
         return {"column_labels": {}, "detail_column_order": []}
     cell_map = template["cell_map"]
@@ -431,6 +539,59 @@ def _find_quote_template(supabase, entity_id: str, task_type: str, selected_modu
         if row["module_name"] and row["module_name"] in selected_set:
             return row
     return rows[0]
+
+
+def _find_shared_template(supabase, entity_id: str, task_types: List[str]) -> Optional[dict]:
+    """과업종류를 2개 이상 교차 선택했을 때, 과업종류별 전용 블록을 이미 갖춘 시트(예: 알파브라더스
+    "견적서" 시트, 034 마이그레이션)가 있으면 그 시트를 반환한다. 없으면 None(호출부가 과업종류별
+    전용 시트 방식으로 넘어감).
+
+    entity_id의 quote_templates 행 중 어떤 task_type으로 등록돼 있든 상관없이(그 행의 cell_map ·
+    storage_path · sheet_name만 실제로 쓰이므로) item_blocks 개수가 과업종류 수 이상인 행을
+    찾는다 — 개별 모듈 전용 시트(FGI/사용성테스트 등)는 블록이 1개뿐이라 걸러진다(그런 시트에
+    여러 과업종류를 억지로 한 블록에 몰아넣으면 구분(대)/구분(중) 라벨이 나중 그룹 값으로
+    덮어써지는 문제가 있었다, 2026-08-10 발견). 등록된 task_type이 실제 요청한 task_types와
+    겹치는 행을 우선한다."""
+    res = supabase.table("quote_templates").select("*").eq("entity_id", entity_id).execute()
+    candidates = [row for row in res.data if len(row["cell_map"].get("item_blocks", [])) >= len(task_types)]
+    if not candidates:
+        return None
+    matching = [row for row in candidates if row["task_type"] in task_types]
+    return (matching or candidates)[0]
+
+
+def _resolve_host_templates(supabase, entity_id: str, task_types: List[str], selected_modules: Optional[list]) -> List[dict]:
+    """과업종류를 교차 선택한 견적서를 담을 물리 시트 후보 목록을 반환한다.
+
+    ABBG/블렌디드랩/썬데이워커는 마케팅·시장검증이 원래 같은 시트(같은 원본 파일의 "견적서" 등
+    범용 양식)라 후보가 1개로 자연스럽게 좁혀진다. 테스티파이·알파브라더스처럼 과업종류마다
+    전용 시트가 따로 있으면 여러 후보가 남는데, 어느 시트를 써도 되므로 task_types에 준 순서를
+    우선순위로 삼는다(첫 번째로 선택된 과업종류의 양식을 먼저 시도). 항목이 그 시트의 칸 수를
+    넘으면(_assign_groups_to_blocks가 422) 호출부가 다음 후보로 넘어간다.
+
+    과업종류가 2개 이상이면, 그 전부를 한 시트로 감당할 수 있는 공용 시트(_find_shared_template)가
+    있는지 먼저 확인해 최우선 후보로 넣는다 — 알파브라더스가 딱 이 경우다."""
+    candidates: List[dict] = []
+    seen: set = set()
+    if len(task_types) > 1:
+        shared = _find_shared_template(supabase, entity_id, task_types)
+        if shared:
+            candidates.append(shared)
+            seen.add((shared["storage_path"], shared["sheet_name"]))
+    last_error: Optional[HTTPException] = None
+    for task_type in task_types:
+        try:
+            template = _find_quote_template(supabase, entity_id, task_type, selected_modules)
+        except HTTPException as e:
+            last_error = e
+            continue
+        key = (template["storage_path"], template["sheet_name"])
+        if key not in seen:
+            seen.add(key)
+            candidates.append(template)
+    if not candidates:
+        raise last_error or HTTPException(status_code=404, detail="이 법인·과업종류 조합에 대한 견적서 양식을 찾을 수 없습니다.")
+    return candidates
 
 
 def _collect_header_updates(header_fields: Dict[str, str], quote: dict) -> CellUpdates:
@@ -463,6 +624,12 @@ def _collect_header_updates(header_fields: Dict[str, str], quote: dict) -> CellU
             updates[coord] = f"{quote.get('recipient_name') or ''} 귀하"
         elif field in ("client_name", "client_company"):
             updates[coord] = quote.get("recipient_name") or ""
+        elif field == "client_contact":
+            updates[coord] = quote.get("recipient_contact") or ""
+        elif field == "client_phone":
+            updates[coord] = quote.get("recipient_phone") or ""
+        elif field == "client_email":
+            updates[coord] = quote.get("recipient_email") or ""
         elif field == "service_name":
             updates[coord] = quote.get("service_name") or ""
         elif field == "recipient_block":
@@ -490,12 +657,27 @@ def _rollup_to_category_totals(groups: List[Dict[str, Any]]) -> List[Dict[str, A
 
     썬데이워커 마케팅처럼 카탈로그가 테스티파이 것을 그대로 빌려써서 세부 항목이 12개인데
     실제 양식(플랫 블록)은 6줄뿐인 경우처럼, 세부 항목 그대로는 절대 못 담는 조합에 대한
-    최후 수단이다 — 세부 항목 대신 카테고리 소계만이라도 담는다."""
+    최후 수단이다 — 세부 항목 대신 카테고리 소계만이라도 담는다. 접힌 세부 항목명은 "상품구성"
+    컬럼이 있는 양식(알파브라더스·ABBG 등, PRD 6.2 "상품구성에 세부항목을 세로형 개조식(1. 2. 3.)으로
+    나열")을 위해 description으로 합쳐 둔다 — 줄바꿈으로 세로 나열한다(PRD가 명시한 "세로형").
+    컬럼이 없는 양식에서는 그냥 무시된다.
+
+    그룹에 항목이 이미 1개뿐이면 그대로 둔다 — Claude가 항목 생성 시 이미 그 항목 자체의
+    description을 채워둔 경우(2026-08, 마케팅+시장검증 교차선택 등)가 있는데, 여기서 "1. 그
+    항목명" 한 줄로 다시 합치면 원래 있던 더 풍부한 설명을 지워버리게 된다(2026-08-10 발견).
+    "묶을 세부 항목"이 실제로 여러 개일 때만(예: 통합 패키지의 5개 하위 모듈) 합친다."""
     return [
-        {
+        g if len(g["items"]) <= 1 else {
             "category": g["category"],
             "amount": g["amount"],
-            "items": [{"category": g["category"], "name": g["category"], "amount": g["amount"]}],
+            "items": [{
+                "category": g["category"],
+                "name": g["category"],
+                "amount": g["amount"],
+                # 그룹 안 항목은 전부 같은 category(=module_name)라 같은 과업종류에 속한다.
+                "task_type": g["items"][0].get("task_type") if g["items"] else None,
+                "description": "\n".join(f"{i + 1}. {it['name']}" for i, it in enumerate(g["items"])),
+            }],
         }
         for g in groups
     ]
@@ -516,7 +698,34 @@ def _try_assign_flat(groups: List[Dict[str, Any]], flat_blocks: List[dict]) -> O
     return assignments
 
 
-def _assign_groups_to_blocks(groups: List[Dict[str, Any]], blocks: List[dict]) -> List[tuple]:
+def _try_assign_flat_by_task_type(groups: List[Dict[str, Any]], flat_blocks: List[dict]) -> Optional[List[tuple]]:
+    """알파브라더스처럼 블록마다 구분(대)/구분(중)이 있으면(034 마이그레이션), 과업종류 하나당
+    전용 블록 하나씩 배정한다 — 마케팅과 시장검증이 같은 블록에 섞여 구분(대) 라벨을 하나로
+    억지로 합치는 일이 없게 한다. 과업종류가 1개뿐이면 자연히 첫 블록만 쓰이고 나머지 블록은
+    (호출부가) 미사용으로 비워 숨긴다. 블록 수보다 과업종류가 많거나, 이 표시용 라벨 자체가
+    없는 양식(대부분)이면 None을 돌려줘 기존 방식(_try_assign_flat)으로 넘어가게 한다."""
+    if not flat_blocks or not all(b.get("category_large_cell") for b in flat_blocks):
+        return None
+    groups_by_task_type: Dict[Optional[str], List[Dict[str, Any]]] = {}
+    order: List[Optional[str]] = []
+    for g in groups:
+        tt = g["items"][0].get("task_type") if g["items"] else None
+        if tt not in groups_by_task_type:
+            groups_by_task_type[tt] = []
+            order.append(tt)
+        groups_by_task_type[tt].append(g)
+    if len(order) > len(flat_blocks):
+        return None
+    assignments: List[tuple] = []
+    for block, tt in zip(flat_blocks, order):
+        sub = _try_assign_flat(groups_by_task_type[tt], [block])
+        if sub is None:
+            return None
+        assignments.extend(sub)
+    return assignments
+
+
+def _assign_groups_to_blocks(groups: List[Dict[str, Any]], blocks: List[dict], columns: Dict[str, str]) -> List[tuple]:
     """카테고리(그룹)를 양식 블록의 행에 배정한다. 반환값: [(block, group, row_offset), ...]
 
     category_label_cell이 있는 블록은 원본 양식이 카테고리별 전용 영역(헤더+소계)을 갖는다는
@@ -525,11 +734,21 @@ def _assign_groups_to_blocks(groups: List[Dict[str, Any]], blocks: List[dict]) -
     순서대로 나눠 채운다(그룹을 블록 경계에서 쪼개지는 않는다 — 실제 데이터에서 한 카테고리가
     플랫 블록 하나의 남은 자리보다 커서 쪼개야 했던 사례가 없어 그 경우까지는 다루지 않는다).
     세부 항목 그대로 넣으면 자리가 모자랄 땐(예: 썬데이워커) 카테고리 소계 한 줄로 줄여 재시도한다.
+
+    "상품구성"(description) 컬럼이 있는 양식(알파브라더스·ABBG, PRD 6.2)은 처음부터 카테고리(=
+    모듈) 하나당 한 줄만 쓴다 — 상품명=모듈명, 상품구성=세부 항목 세로형 개조식. 자리가 모자랄
+    때만 쓰는 최후 수단이 아니라 이 양식들의 기본 표시 방식이라 여기서 먼저 적용해 둔다.
     """
+    if columns.get("description"):
+        groups = _rollup_to_category_totals(groups)
+
     labeled_blocks = [b for b in blocks if b.get("category_label_cell")]
     flat_blocks = [b for b in blocks if not b.get("category_label_cell")]
 
     if flat_blocks and not labeled_blocks:
+        assignments = _try_assign_flat_by_task_type(groups, flat_blocks)
+        if assignments is not None:
+            return assignments
         assignments = _try_assign_flat(groups, flat_blocks)
         if assignments is not None:
             return assignments
@@ -568,16 +787,19 @@ def _assign_groups_to_blocks(groups: List[Dict[str, Any]], blocks: List[dict]) -
 
 
 def _compute_item_pricing(
-    supabase,
-    catalog_entity_id: str,
-    task_type: str,
+    catalog_map: Dict[str, List[dict]],
     columns: Dict[str, str],
     sheet_xml: str,
     category: str,
     item: dict,
     row: int,
 ) -> tuple:
-    work_days, quantity = _lookup_work_days_quantity(supabase, catalog_entity_id, task_type, category, item["name"])
+    if item.get("unit_price") is not None and item.get("work_days") is not None and item.get("quantity") is not None:
+        # 사용자가 화면에서 직접 입력·수정했거나 생성 시 계산해 저장해둔 값을 그대로 쓴다 —
+        # 발급 시점에 카탈로그 기준으로 다시 역산하면 화면에서 본 값과 실제 PDF가 달라질 수
+        # 있다(2026-08-09, 직접편집 대상을 단가/작업일/투입인력까지 확장하며 추가).
+        return item["unit_price"], item["work_days"], item["quantity"]
+    work_days, quantity = _lookup_work_days_quantity(catalog_map, category, item["name"])
     uses_work_days = "supply_amount" in columns and "work_days" in columns and _formula_references_column(
         sheet_xml, f"{columns['supply_amount']}{row}", columns["work_days"]
     )
@@ -586,15 +808,84 @@ def _compute_item_pricing(
     return unit_price, work_days, quantity
 
 
+def _build_catalog_maps(supabase, catalog_entity_id_by_task_type: Dict[str, str]) -> Dict[str, Dict[str, List[dict]]]:
+    return {
+        task_type: _fetch_work_days_quantity_map(supabase, catalog_entity_id, task_type)
+        for task_type, catalog_entity_id in catalog_entity_id_by_task_type.items()
+    }
+
+
+def _collapse_by_task_type(line_items: List[dict], task_types: List[str]) -> List[dict]:
+    """과업종류를 교차 선택한 견적서가 카테고리 전용 블록 수를 넘으면(예: 테스티파이는 마케팅
+    카테고리 슬롯이 2개뿐인데 마케팅 4개 모듈 + 시장검증 모듈이 겹치는 경우), 과업종류 하나당
+    한 줄(소계)로 접어서 마지막으로 재시도한다 — _rollup_to_category_totals(모듈 하나 안의 세부
+    항목을 접음)의 한 단계 더 큰 버전. 과업종류가 1개뿐이면 기존 동작과 같아야 하므로 호출하지
+    않는다(단일 과업종류에 새로운 축약 동작을 끼워넣지 않으려고)."""
+    by_type: Dict[str, List[dict]] = {}
+    for item in line_items:
+        by_type.setdefault(item.get("task_type") or task_types[0], []).append(item)
+    collapsed = []
+    for task_type in task_types:
+        items = by_type.get(task_type)
+        if not items:
+            continue
+        collapsed.append({
+            "category": task_type,
+            "name": task_type,
+            "amount": sum(i["amount"] for i in items),
+            "task_type": task_type,
+            "description": "\n".join(f"{i + 1}. {it['category']} - {it['name']}" for i, it in enumerate(items)),
+        })
+    return collapsed
+
+
+def _resolve_assignment(
+    supabase, entity_id: str, task_types: List[str], selected_modules: Optional[list], line_items: List[dict]
+) -> tuple[dict, bytes, str, Dict[str, str], list]:
+    """호스트 양식 후보와 항목 배정을 함께 찾는다. 실제 항목 그대로 안 들어가면(카테고리가
+    블록 수를 넘음) 과업종류별 소계로 접어서 한 번 더 시도한다(_collapse_by_task_type, 교차
+    선택한 견적서에서만 의미 있음). 반환: (template, source_bytes, sheet_xml, columns, assignments).
+    전부 실패하면 HTTPException을 그대로 올린다."""
+    candidates = _resolve_host_templates(supabase, entity_id, task_types, selected_modules)
+    variants = [line_items]
+    if len(task_types) > 1:
+        variants.append(_collapse_by_task_type(line_items, task_types))
+
+    last_error: Optional[HTTPException] = None
+    for variant in variants:
+        groups = _group_line_items(variant)
+        for template in candidates:
+            storage_path = template["storage_path"]
+            if not storage_path.lower().endswith(".xlsx"):
+                last_error = HTTPException(
+                    status_code=500,
+                    detail=f"{Path(storage_path).name}은(는) 구형 포맷이라 아직 PDF 발급을 지원하지 않습니다 (.xlsx로 변환 필요).",
+                )
+                continue
+            cell_map = template["cell_map"]
+            columns = cell_map.get("columns", {})
+            try:
+                source_bytes = template_storage.download(storage_path)
+                sheet_xml = _read_sheet_xml(source_bytes, template["sheet_name"])
+                blocks = [b for b in cell_map.get("item_blocks", []) if b.get("role") != "labor_fte"]
+                assignments = _assign_groups_to_blocks(groups, blocks, columns)
+            except HTTPException as e:
+                last_error = e
+                continue
+            return template, source_bytes, sheet_xml, columns, assignments
+    raise last_error or HTTPException(status_code=422, detail="이 견적서를 담을 수 있는 양식을 찾지 못했습니다.")
+
+
 def compute_line_item_pricing(
     supabase,
     entity_id: str,
-    task_type: str,
+    task_types: List[str],
     selected_modules: Optional[list],
-    catalog_entity_id: str,
+    catalog_entity_id_by_task_type: Dict[str, str],
     line_items: List[dict],
 ) -> List[dict]:
-    """line_items(name/amount/category)에 unit_price/work_days/quantity를 채워 반환한다.
+    """line_items(name/amount/category, 각 항목에 task_type 포함)에 unit_price/work_days/quantity를
+    채워 반환한다.
 
     미리보기 UI와 PDF 발급이 이 함수 하나로 계산해 서로 다른 값이 나오지 않게 한다(2026-07-10,
     미리보기 컬럼 확장). 템플릿을 아직 못 찾거나(구형 .xls 등) 항목이 양식 행 수를 넘는 등
@@ -602,26 +893,14 @@ def compute_line_item_pricing(
     단가=배분금액·작업일=수량=1로 대체한다 — 실제 PDF 발급 시의 엄격한 검증(_collect_item_block_updates)과는
     다르다.
     """
-
-    def _fallback() -> List[dict]:
+    try:
+        _template, _source_bytes, sheet_xml, columns, assignments = _resolve_assignment(
+            supabase, entity_id, task_types, selected_modules, line_items
+        )
+    except HTTPException:
         return [{**item, "unit_price": item["amount"], "work_days": 1.0, "quantity": 1.0} for item in line_items]
 
-    try:
-        template = _find_quote_template(supabase, entity_id, task_type, selected_modules)
-        cell_map = template["cell_map"]
-        storage_path = template["storage_path"]
-        if not storage_path.lower().endswith(".xlsx"):
-            return _fallback()
-        source_bytes = template_storage.download(storage_path)
-        sheet_xml = _read_sheet_xml(source_bytes, template["sheet_name"])
-
-        columns = cell_map.get("columns", {})
-        blocks = [b for b in cell_map.get("item_blocks", []) if b.get("role") != "labor_fte"]
-        groups = _group_line_items(line_items)
-        assignments = _assign_groups_to_blocks(groups, blocks)
-    except HTTPException:
-        return _fallback()
-
+    catalog_maps = _build_catalog_maps(supabase, catalog_entity_id_by_task_type)
     enriched: List[dict] = []
     for block, group, row_offset in assignments:
         rows = block["rows"]
@@ -630,8 +909,9 @@ def compute_line_item_pricing(
             if row_index >= len(rows):
                 enriched.append({**item, "unit_price": item["amount"], "work_days": 1.0, "quantity": 1.0})
                 continue
+            catalog_map = catalog_maps.get(item.get("task_type"), {})
             unit_price, work_days, quantity = _compute_item_pricing(
-                supabase, catalog_entity_id, task_type, columns, sheet_xml, group["category"], item, rows[row_index]
+                catalog_map, columns, sheet_xml, group["category"], item, rows[row_index]
             )
             enriched.append({**item, "unit_price": unit_price, "work_days": work_days, "quantity": quantity})
     return enriched
@@ -641,42 +921,65 @@ def _collect_item_block_updates(
     supabase,
     item_blocks: List[dict],
     columns: Dict[str, str],
-    line_items: List[dict],
-    catalog_entity_id: str,
-    task_type: str,
+    assignments: list,
+    catalog_entity_id_by_task_type: Dict[str, str],
     sheet_xml: str,
-) -> CellUpdates:
-    groups = _group_line_items(line_items)
+) -> tuple[CellUpdates, set]:
     blocks = [b for b in item_blocks if b.get("role") != "labor_fte"]
     updates: CellUpdates = {}
+    hidden_rows: set = set()
+    catalog_maps = _build_catalog_maps(supabase, catalog_entity_id_by_task_type)
 
     # "인건비" 전용 블록(role=labor_fte)은 지금 카탈로그 데이터 모델에 없는 항목이라 채우지
     # 않지만, 마스터 원본 파일에는 예전 실제 고객의 인건비 실수치가 그대로 남아있어 그냥 두면
-    # 합계 수식(예: SUM(R13:T22))에 섞여 들어간다. 그래서 이 블록은 항상 빈 값으로 지운다.
+    # 합계 수식(예: SUM(R13:T22))에 섞여 들어간다. 그래서 이 블록은 항상 완전히 비우고 숨긴다.
     for block in item_blocks:
         if block.get("role") != "labor_fte":
             continue
         for row in block["rows"]:
+            hidden_rows.add(row)
             for key, col in columns.items():
                 if key != "note":
-                    updates[f"{col}{row}"] = None
+                    updates[f"{col}{row}"] = _FORCE_EMPTY
 
-    assignments = _assign_groups_to_blocks(groups, blocks)
+    used_rows_by_block: Dict[int, set] = {id(b): set() for b in blocks}
+    for block, group, row_offset in assignments:
+        rows = block["rows"]
+        for i in range(len(group["items"])):
+            row_index = row_offset + i
+            if row_index < len(rows):
+                used_rows_by_block[id(block)].add(rows[row_index])
 
     # 블록은 전부(할당 여부와 무관하게) 한 번씩 전체 행 + 카테고리 라벨/소계 셀을 비운다.
     # 카테고리가 이 견적에서 아예 안 쓰이는 블록도 있을 수 있는데(예: 항목이 1개 카테고리뿐인
     # 견적서 — 2번째 카테고리 블록은 assignments에 안 나타남), 그런 블록을 그냥 두면 마스터
     # 원본에 남아있는 이전 발급 이력이나 "볼드체로 작성" 같은 빈 템플릿의 안내 문구가 그대로
-    # 찍혀 나온다.
+    # 찍혀 나온다. 실제로 항목이 배정되지 않은 행은 값만 비우는 게 아니라 숨긴다(hidden_rows) —
+    # 공급가액 칸이 수식(예: =E16*F16*G16)이라 값만 비우면 0으로 재계산되어 빈 줄에 "0"이 죽
+    # 찍히는 문제가 있었다(2026-08-09 사용자 지적·재현).
     for block in blocks:
+        block_used_rows = used_rows_by_block[id(block)]
         if block.get("category_label_cell"):
-            updates[block["category_label_cell"]] = None
+            updates[block["category_label_cell"]] = _FORCE_EMPTY
+            if not block_used_rows:
+                hidden_rows.add(int(re.match(r"[A-Z]+(\d+)", block["category_label_cell"]).group(1)))
         if block.get("category_subtotal_cell"):
-            updates[block["category_subtotal_cell"]] = None
+            updates[block["category_subtotal_cell"]] = _FORCE_EMPTY
+            if not block_used_rows:
+                hidden_rows.add(int(re.match(r"[A-Z]+(\d+)", block["category_subtotal_cell"]).group(1)))
+        # 알파브라더스처럼 블록마다 구분(대)/구분(중) 라벨 셀이 따로 있으면(034 마이그레이션) 우선
+        # 비워둔다 — 이 셀들은 block["rows"] 첫 행 안에 있어서 블록이 미사용이면 아래 for문이
+        # 그 행을 hidden_rows에 넣어 같이 숨겨진다(따로 hidden_rows.add 할 필요 없음).
+        if block.get("category_large_cell"):
+            updates[block["category_large_cell"]] = _FORCE_EMPTY
+        if block.get("category_mid_cell"):
+            updates[block["category_mid_cell"]] = _FORCE_EMPTY
         for row in block["rows"]:
+            if row not in block_used_rows:
+                hidden_rows.add(row)
             for key, col in columns.items():
                 if key != "note":
-                    updates[f"{col}{row}"] = None  # 우선 비워서 이전 발급 이력의 leftover를 지운다
+                    updates[f"{col}{row}"] = _FORCE_EMPTY  # 우선 비워서 이전 발급 이력의 leftover를 지운다
 
     for block, group, row_offset in assignments:
         rows = block["rows"]
@@ -684,18 +987,29 @@ def _collect_item_block_updates(
             updates[block["category_label_cell"]] = group["category"]
         if block.get("category_subtotal_cell"):
             updates[block["category_subtotal_cell"]] = group["amount"]
+        # 구분(대)/구분(중) — 지금은 둘 다 과업종류명을 그대로 쓴다(예: "마케팅"/"마케팅",
+        # 실제 알파브라더스 원본 샘플의 "시장검증"/"시장검증" 표기와 동일한 방식, PRD 6.2).
+        group_task_type = group["items"][0].get("task_type") if group["items"] else None
+        if group_task_type:
+            if block.get("category_large_cell"):
+                updates[block["category_large_cell"]] = group_task_type
+            if block.get("category_mid_cell"):
+                updates[block["category_mid_cell"]] = group_task_type
 
         for i, item in enumerate(group["items"]):
             row_index = row_offset + i
             if row_index >= len(rows):
                 continue
             row = rows[row_index]
+            catalog_map = catalog_maps.get(item.get("task_type"), {})
             unit_price, work_days, quantity = _compute_item_pricing(
-                supabase, catalog_entity_id, task_type, columns, sheet_xml, group["category"], item, row
+                catalog_map, columns, sheet_xml, group["category"], item, row
             )
 
             if "item_name" in columns:
                 updates[f"{columns['item_name']}{row}"] = item["name"]
+            if "description" in columns and item.get("description"):
+                updates[f"{columns['description']}{row}"] = item["description"]
             if "unit_price" in columns:
                 updates[f"{columns['unit_price']}{row}"] = unit_price
             if "work_days" in columns:
@@ -706,7 +1020,9 @@ def _collect_item_block_updates(
                 updates[f"{columns['supply_amount']}{row}"] = item["amount"]
             if "amount" in columns:  # 블렌디드랩: 부가세 별도 금액 컬럼명이 amount
                 updates[f"{columns['amount']}{row}"] = item["amount"]
-    return updates
+            if "note" in columns and item.get("note"):
+                updates[f"{columns['note']}{row}"] = item["note"]
+    return updates, hidden_rows
 
 
 def _collect_totals_updates(totals: Dict[str, str], grand_total: float, vat_amount: float, supply_amount: float) -> CellUpdates:
@@ -724,6 +1040,16 @@ def _collect_totals_updates(totals: Dict[str, str], grand_total: float, vat_amou
     return updates
 
 
+def resolve_catalog_entity_id(supabase, entity_id: str, entity_name: str, task_type: str) -> str:
+    """이 법인×과업종류가 실제 카탈로그가 없어 다른 법인 것을 차용하는 조합이면(부록 B), 그
+    출처 법인 id를 반환한다 — work_days/quantity를 그 출처 카탈로그에서 찾아야 하기 때문."""
+    _, is_borrowed, source_name = catalog_service._resolve_catalog_rows(entity_id, entity_name, task_type)
+    if not is_borrowed:
+        return entity_id
+    src = supabase.table("entity_templates").select("id").eq("name", source_name).execute()
+    return src.data[0]["id"] if src.data else entity_id
+
+
 def _build_filled_xlsx(entity_quote_id: str, filled_path: Path) -> None:
     """법인 마스터 xlsx의 가변 셀만 채워 filled_path에 저장한다. PDF 발급과 xlsx 다운로드가
     이 함수 하나를 공유해 두 파일의 내용이 항상 일치한다(2026-07-10)."""
@@ -732,8 +1058,9 @@ def _build_filled_xlsx(entity_quote_id: str, filled_path: Path) -> None:
     quote_res = (
         supabase.table("entity_quotes")
         .select(
-            "id, entity_id, task_type, recipient_name, quote_date, service_name, total_amount, "
-            "line_items, is_catalog_borrowed, catalog_source_entity_name, selected_modules, "
+            "id, entity_id, task_types, recipient_name, recipient_contact, recipient_phone, recipient_email, "
+            "quote_date, service_name, total_amount, "
+            "line_items, selected_modules, "
             "estimate_sets(vat_included), entity_templates(name)"
         )
         .eq("id", entity_quote_id)
@@ -757,48 +1084,37 @@ def _build_filled_xlsx(entity_quote_id: str, filled_path: Path) -> None:
         supply_amount = grand_total
         vat_amount = round(supply_amount * 0.1)
 
-    # 카탈로그를 다른 법인에서 차용한 경우, work_days/quantity도 그 출처 법인 카탈로그에서 찾는다.
-    catalog_entity_id = quote["entity_id"]
-    if quote["is_catalog_borrowed"] and quote["catalog_source_entity_name"]:
-        src = (
-            supabase.table("entity_templates")
-            .select("id")
-            .eq("name", quote["catalog_source_entity_name"])
-            .execute()
-        )
-        if src.data:
-            catalog_entity_id = src.data[0]["id"]
+    entity_name = quote["entity_templates"]["name"]
+    task_types = quote["task_types"]
+    catalog_entity_id_by_task_type = {
+        task_type: resolve_catalog_entity_id(supabase, quote["entity_id"], entity_name, task_type)
+        for task_type in task_types
+    }
 
-    template = _find_quote_template(supabase, quote["entity_id"], quote["task_type"], quote["selected_modules"])
+    # 과업종류를 교차 선택한 견적서는 시트 후보·항목 축약 단계가 여러 개일 수 있다 — 1순위가
+    # 칸 수를 넘으면(_assign_groups_to_blocks의 422) 다음 후보/축약 단계로 넘어간다(_resolve_assignment).
+    template, source_bytes, sheet_xml, columns, assignments = _resolve_assignment(
+        supabase, quote["entity_id"], task_types, quote["selected_modules"], quote["line_items"]
+    )
     cell_map = template["cell_map"]
-    storage_path = template["storage_path"]
-    if not storage_path.lower().endswith(".xlsx"):
-        raise HTTPException(
-            status_code=500,
-            detail=f"{Path(storage_path).name}은(는) 구형 포맷이라 아직 PDF 발급을 지원하지 않습니다 (.xlsx로 변환 필요).",
-        )
-    source_bytes = template_storage.download(storage_path)
 
-    sheet_xml = _read_sheet_xml(source_bytes, template["sheet_name"])
+    item_updates, hidden_rows = _collect_item_block_updates(
+        supabase,
+        cell_map.get("item_blocks", []),
+        columns,
+        assignments,
+        catalog_entity_id_by_task_type,
+        sheet_xml,
+    )
 
     updates: CellUpdates = {}
     updates.update(_collect_header_updates(cell_map.get("header_fields", {}), quote))
-    updates.update(
-        _collect_item_block_updates(
-            supabase,
-            cell_map.get("item_blocks", []),
-            cell_map.get("columns", {}),
-            quote["line_items"],
-            catalog_entity_id,
-            quote["task_type"],
-            sheet_xml,
-        )
-    )
+    updates.update(item_updates)
     updates.update(_collect_totals_updates(cell_map.get("totals", {}), grand_total, vat_amount, supply_amount))
     for coord in cell_map.get("always_clear_cells", []):
         updates[coord] = None
 
-    _patch_xlsx(source_bytes, template["sheet_name"], updates, filled_path)
+    _patch_xlsx(source_bytes, template["sheet_name"], updates, filled_path, hidden_rows=hidden_rows)
 
 
 def render_entity_quote_xlsx(entity_quote_id: str) -> bytes:
@@ -809,22 +1125,77 @@ def render_entity_quote_xlsx(entity_quote_id: str) -> bytes:
         return filled_path.read_bytes()
 
 
+# 같은 LibreOffice 프로필 디렉터리(아래 _PROFILE_DIR)를 동시에 여러 요청이 열면 조용히 lock
+# 충돌이 나서 변환이 실패하는 걸 확인했다(2026-08-09 — 화면에 비교견적 카드 여러 개가 동시에
+# PDF 미리보기를 요청할 때 재현. stderr/stdout 없이 그냥 실패). 이 서버 프로세스 안에서는
+# 변환을 한 번에 하나씩만 실행하도록 직렬화하고, 그래도 실패하면(락이 풀리는 타이밍에 다시
+# 겹치는 등) 1회 재시도한다.
+_LIBREOFFICE_LOCK = threading.Lock()
+
+# 요청마다 새 프로필을 쓰면 폰트 캐시가 매번 콜드 스타트라 렌더링이 깨지는 걸 확인했다(같은
+# 파일을 재변환하면 정상으로 돌아옴 — 캐시가 데워진 뒤엔 문제 없음). 그렇다고 이 컴퓨터에서
+# 실행 중일 수 있는 다른 LibreOffice(GUI 앱 등)와 프로필을 공유해 잠금 충돌이 나는 것도 피하고
+# 싶어서, 이 서비스 전용으로 고정된 프로필 디렉터리를 한 번만 만들고 계속 재사용한다. 프로젝트
+# 경로 자체에 공백이 있어 file:// URI가 깨지므로, 공백 없는 시스템 임시 경로에 둔다.
+_PROFILE_DIR = Path(tempfile.gettempdir()) / "estimate_automation_lo_profile"
+
+_lo_listener: Optional[subprocess.Popen] = None
+
+
+def start_lo_listener() -> None:
+    """LibreOffice를 서버 기동 시 미리 백그라운드로 띄워둔다.
+
+    요청마다 soffice 프로세스를 새로 켜면 오피스 코어 콜드 부팅에 2~8초가 걸리는데, 같은
+    UserInstallation 프로필로 상주 인스턴스를 하나 켜두면 이후 --convert-to 요청이 LibreOffice의
+    "같은 프로필=단일 인스턴스" 동작으로 그 인스턴스에 붙어서 처리돼 1초 이내로 줄어드는 걸
+    확인했다(2026-08-10 로컬 벤치마크: 콜드 3.06s → 리스너 사용 시 0.76s).
+    # ponytail: 리스너가 중간에 죽어도 자동 재기동하지 않는다 — 아래 convert_cmd는 리스너 유무와
+    # 무관하게 항상 동작하므로(없으면 콜드 스타트로 그냥 느려질 뿐) 정확성엔 영향 없음. 서버
+    # 재시작 전까지 계속 느려지는 게 체감되면 그때 헬스체크+재기동을 추가한다.
+    """
+    global _lo_listener
+    if _lo_listener is not None and _lo_listener.poll() is None:
+        return
+    try:
+        _lo_listener = subprocess.Popen(
+            [
+                "soffice",
+                f"-env:UserInstallation=file://{_PROFILE_DIR}",
+                "--headless",
+                "--invisible",
+                "--nologo",
+                "--norestore",
+                "--accept=socket,host=127.0.0.1,port=2002;urp;",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        _lo_listener = None
+
+
+def stop_lo_listener() -> None:
+    global _lo_listener
+    if _lo_listener is None:
+        return
+    # soffice 실행 파일은 실제로는 셸 래퍼라 자식으로 진짜 LibreOffice 바이너리(soffice.bin)를
+    # fork/exec하고 래퍼 자신은 곧바로 끝나버린다. 그래서 Popen이 돌려준 pid/pgid로는(래퍼가 이미
+    # 죽고 없어서) 진짜 바이너리를 못 찾는 경우가 있는 걸 확인했다(2026-08-10, os.killpg가
+    # ProcessLookupError). pid 대신 이 서비스 전용 프로필 경로로 명령행을 매칭해 죽이면 래퍼가
+    # 먼저 죽어 있어도 실제 바이너리를 확실히 잡는다.
+    subprocess.run(["pkill", "-f", f"UserInstallation=file://{_PROFILE_DIR}"], capture_output=True)
+    _lo_listener = None
+
+
 def render_entity_quote_pdf(entity_quote_id: str) -> bytes:
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_dir_path = Path(tmp_dir)
         filled_path = tmp_dir_path / "filled.xlsx"
         _build_filled_xlsx(entity_quote_id, filled_path)
 
-        # 요청마다 새 프로필을 쓰면 폰트 캐시가 매번 콜드 스타트라 렌더링이 깨지는 걸 확인했다
-        # (같은 파일을 재변환하면 정상으로 돌아옴 — 캐시가 데워진 뒤엔 문제 없음). 그렇다고 이
-        # 컴퓨터에서 실행 중일 수 있는 다른 LibreOffice(GUI 앱 등)와 프로필을 공유해 잠금 충돌이
-        # 나는 것도 피하고 싶어서, 이 서비스 전용으로 고정된 프로필 디렉터리를 한 번만 만들고
-        # 계속 재사용한다. 프로젝트 경로 자체에 공백이 있어 file:// URI가 깨지므로, 공백 없는
-        # 시스템 임시 경로에 둔다.
-        profile_dir = Path(tempfile.gettempdir()) / "estimate_automation_lo_profile"
         convert_cmd = [
             "soffice",
-            f"-env:UserInstallation=file://{profile_dir}",
+            f"-env:UserInstallation=file://{_PROFILE_DIR}",
             "--headless",
             "--convert-to",
             "pdf",
@@ -832,11 +1203,16 @@ def render_entity_quote_pdf(entity_quote_id: str) -> bytes:
             str(tmp_dir_path),
             str(filled_path),
         ]
-        result = subprocess.run(convert_cmd, capture_output=True, text=True, timeout=60)
         pdf_path = filled_path.with_suffix(".pdf")
-        if result.returncode != 0 or not pdf_path.exists():
-            raise HTTPException(
-                status_code=500,
-                detail=f"PDF 변환에 실패했습니다: {result.stderr or result.stdout}",
-            )
-        return pdf_path.read_bytes()
+        last_error = ""
+        with _LIBREOFFICE_LOCK:
+            for attempt in range(2):
+                result = subprocess.run(convert_cmd, capture_output=True, text=True, timeout=60)
+                if result.returncode == 0 and pdf_path.exists():
+                    return pdf_path.read_bytes()
+                last_error = result.stderr or result.stdout
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"PDF 변환에 실패했습니다: {last_error}",
+        )

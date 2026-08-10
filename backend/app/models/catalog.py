@@ -22,18 +22,24 @@ class CatalogResult(BaseModel):
     source_entity_name: str
 
 
+class ModuleItemGroup(BaseModel):
+    module_name: str
+    item_names: list[str]
+
+
 class ModuleOption(BaseModel):
     option_key: str  # alt_group 값(또는 alt_group이 없으면 module_name) — 선택 시 고유 식별자
     label: str  # 화면 표시용 라벨. module_names가 여럿이면 "A + B" 형태
     module_names: list[str]  # 이 옵션을 선택하면 generate 시 함께 포함되는 실제 module_name들
     item_count: int
     is_default: bool
-    item_names: list[str] = Field(default_factory=list)  # 펼쳐보기 UI용 실제 항목명 목록
+    item_groups: list[ModuleItemGroup] = Field(default_factory=list)  # module_name별로 묶은 항목명(펼쳐보기 UI, 개조식 표시용)
 
 
 class ModuleGroup(BaseModel):
     kind: str  # "variant"(표준형/대안형 중 택1) | "additive"(필수 모듈에 추가로 얹는 옵션)
     options: list[ModuleOption]
+    label: Optional[str] = None  # 화면에 보여줄 그룹 제목. 없으면 프론트가 kind별 기본 제목을 쓴다.
 
 
 class EntityModuleOptions(BaseModel):

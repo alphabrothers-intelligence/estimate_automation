@@ -36,6 +36,11 @@ def get_estimate_set(estimate_set_id: str):
     return estimate_service.get_estimate_set(estimate_set_id)
 
 
+@router.delete("/{estimate_set_id}", status_code=204)
+def delete_estimate_set(estimate_set_id: str):
+    estimate_service.delete_estimate_set(estimate_set_id)
+
+
 @router.get("/{estimate_set_id}/module-options", response_model=List[EntityModuleOptions])
 def get_module_options(estimate_set_id: str):
     return estimate_service.get_module_options_for_set(estimate_set_id)

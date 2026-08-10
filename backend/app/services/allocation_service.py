@@ -148,8 +148,19 @@ def allocate_items(catalog_items: List[CatalogItem], total_amount: int, vat_incl
             )
         items = [item for group_items in results for item in group_items]
 
+    # 카탈로그의 상품구성 설명(예: 알파브라더스 "1. ... / 2. ...")을 배분 결과에 다시 붙인다 —
+    # Claude 응답(AllocatedItem)엔 category/name/amount뿐이라 여기서 원본 카탈로그를 (모듈명,
+    # 항목명)으로 다시 찾아 매칭한다. PDF 렌더링(pdf_service)이 "상품구성" 컬럼이 있는 양식에서
+    # 이 값을 그대로 셀에 채운다.
+    description_by_key = {(i.module_name, i.item_name): i.standard_description for i in catalog_items}
+    line_items = []
+    for item in items:
+        row = item.model_dump()
+        row["description"] = description_by_key.get((item.category, item.name))
+        line_items.append(row)
+
     return {
-        "line_items": [i.model_dump() for i in items],
+        "line_items": line_items,
         "supply_amount": supply_amount,
         "vat_amount": vat_amount,
         "grand_total": supply_amount + vat_amount,

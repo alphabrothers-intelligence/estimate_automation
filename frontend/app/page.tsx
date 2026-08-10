@@ -3,7 +3,7 @@ import EstimateWizard from "./estimate-wizard";
 export default function Home() {
   return (
     <main className="px-5 py-8 sm:px-8 lg:px-12 lg:py-10">
-      <div className="mx-auto w-full max-w-5xl">
+      <div className="mx-auto w-full max-w-7xl">
         <div className="mb-7">
           <p className="text-sm font-semibold text-indigo-600">견적서 작성</p>
           <h1 className="mt-1 text-3xl font-bold tracking-tight text-slate-900">새 견적서 만들기</h1>
