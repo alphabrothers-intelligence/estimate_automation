@@ -969,8 +969,9 @@ function QuoteCard({
 
 function QuotePreviewPane({ quote }: { quote: EntityQuote }) {
   const previewKey = hashKey({ items: quote.line_items, total: quote.total_amount, service: quote.service_name });
-  const [loadedKey, setLoadedKey] = useState<string | null>(null);
-  const loading = loadedKey !== previewKey;
+  const loadedKeysRef = useRef<Set<string>>(new Set());
+  const [, forceRerender] = useState(0);
+  const loading = !loadedKeysRef.current.has(previewKey);
 
   return (
     <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
@@ -990,7 +991,10 @@ function QuotePreviewPane({ quote }: { quote: EntityQuote }) {
           src={`${getEntityQuotePdfUrl(quote.id, { inline: true })}#view=FitH`}
           title={`${quote.entity_name} 견적서 미리보기`}
           className="h-full w-full"
-          onLoad={() => setLoadedKey(previewKey)}
+          onLoad={() => {
+            loadedKeysRef.current.add(previewKey);
+            forceRerender((n) => n + 1);
+          }}
         />
       </div>
     </div>

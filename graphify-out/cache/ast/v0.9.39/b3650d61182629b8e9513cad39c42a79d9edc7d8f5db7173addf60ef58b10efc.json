@@ -1,0 +1,1 @@
+{"nodes": [{"id": "$graphify-root$_backend_migrations_007_seed_entity_templates_sql", "label": "007_seed_entity_templates.sql", "file_type": "code", "source_file": "backend/migrations/007_seed_entity_templates.sql", "source_location": null}], "edges": []}

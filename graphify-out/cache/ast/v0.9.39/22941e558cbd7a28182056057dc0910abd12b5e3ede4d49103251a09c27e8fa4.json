@@ -1,0 +1,1 @@
+{"nodes": [{"id": "$graphify-root$_backend_migrations_021_column_labels_sql", "label": "021_column_labels.sql", "file_type": "code", "source_file": "backend/migrations/021_column_labels.sql", "source_location": null}], "edges": []}

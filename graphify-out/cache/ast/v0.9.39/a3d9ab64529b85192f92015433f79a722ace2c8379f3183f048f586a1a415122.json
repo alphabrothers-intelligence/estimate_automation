@@ -1,0 +1,1 @@
+{"nodes": [{"id": "$graphify-root$_backend_migrations_023_blendedlab_item_block_row_fix_sql", "label": "023_blendedlab_item_block_row_fix.sql", "file_type": "code", "source_file": "backend/migrations/023_blendedlab_item_block_row_fix.sql", "source_location": null}], "edges": []}
