@@ -343,7 +343,10 @@ function TaskModulePicker({
 type IndexedLineItem = LineItem & { _index: number };
 type LineItemGroup = { category: string; amount: number; items: IndexedLineItem[] };
 type LineItemPatch = Partial<
-  Pick<LineItem, "category" | "name" | "amount" | "unit_price" | "work_days" | "quantity" | "note">
+  Pick<
+    LineItem,
+    "category" | "name" | "amount" | "unit_price" | "work_days" | "quantity" | "note" | "description" | "input_mm" | "tax_amount"
+  >
 >;
 
 function groupLineItems(items: LineItem[]): LineItemGroup[] {
@@ -441,7 +444,8 @@ function InlineEditCell({
       }}
       title="클릭해서 수정"
       className={
-        "w-full rounded px-1 py-0.5 hover:bg-indigo-50 " + (align === "right" ? "text-right" : "text-left")
+        "w-full whitespace-pre-line rounded px-1 py-0.5 hover:bg-indigo-50 " +
+        (align === "right" ? "text-right" : "text-left")
       }
     >
       {display}
@@ -462,15 +466,31 @@ const DEFAULT_COLUMN_LABELS: Record<string, string> = {
 };
 const DEFAULT_DETAIL_ORDER = ["work_days", "quantity", "unit_price"];
 
+// 텍스트로 다루는 상세 컬럼(예: 알파브라더스 상품구성) — 나머지는 전부 숫자 컬럼.
+const TEXT_DETAIL_KEYS = new Set(["description"]);
+
 function renderDetailValue(item: LineItem, key: string): string {
   if (key === "unit_price") return item.unit_price != null ? `${item.unit_price.toLocaleString()}원` : "—";
   if (key === "work_days") return item.work_days != null ? `${item.work_days}일` : "—";
   if (key === "quantity") return item.quantity != null ? String(item.quantity) : "—";
+  if (key === "description") return item.description ?? "—";
+  if (key === "input_mm") return item.input_mm != null ? `${item.input_mm}MM` : "—";
+  if (key === "tax_amount") return item.tax_amount != null ? `${item.tax_amount.toLocaleString()}원` : "—";
   return "—";
 }
 
 function renderDetailEditValue(item: LineItem, key: string): string {
-  const raw = key === "unit_price" ? item.unit_price : key === "work_days" ? item.work_days : item.quantity;
+  if (key === "description") return item.description ?? "";
+  const raw =
+    key === "unit_price"
+      ? item.unit_price
+      : key === "work_days"
+        ? item.work_days
+        : key === "input_mm"
+          ? item.input_mm
+          : key === "tax_amount"
+            ? item.tax_amount
+            : item.quantity;
   return raw != null ? String(raw) : "0";
 }
 
@@ -488,17 +508,23 @@ function ItemDetailCells({
 }) {
   return (
     <>
-      {order.map((key) => (
-        <td key={key} className="py-2 pr-3 text-right text-sm text-gray-600">
-          <InlineEditCell
-            value={renderDetailEditValue(item, key)}
-            display={renderDetailValue(item, key)}
-            align="right"
-            inputType="number"
-            onSave={(v) => onEditItem({ [key]: Number(v) } as LineItemPatch)}
-          />
-        </td>
-      ))}
+      {order.map((key) => {
+        const isText = TEXT_DETAIL_KEYS.has(key);
+        return (
+          <td
+            key={key}
+            className={"py-2 pr-3 text-sm text-gray-600 " + (isText ? "text-left" : "text-right")}
+          >
+            <InlineEditCell
+              value={renderDetailEditValue(item, key)}
+              display={renderDetailValue(item, key)}
+              align={isText ? "left" : "right"}
+              inputType={isText ? "text" : "number"}
+              onSave={(v) => onEditItem({ [key]: isText ? v : Number(v) } as LineItemPatch)}
+            />
+          </td>
+        );
+      })}
     </>
   );
 }
@@ -507,20 +533,43 @@ function CategoryRows({
   group,
   order,
   hasNote,
+  showCategorySplit,
+  highlightKeys,
   onEditItem,
 }: {
   group: LineItemGroup;
   order: string[];
   hasNote: boolean;
+  showCategorySplit: boolean;
+  highlightKeys?: Set<string>;
   onEditItem: (index: number, patch: LineItemPatch) => Promise<void>;
 }) {
   const [expanded, setExpanded] = useState(true);
   const isFlat = group.items.length === 1 && group.items[0].name === group.category;
+  // 채팅 수정으로 방금 바뀐 항목에 왼쪽 강조선 + 옅은 배경을 준다 — "어디가 수정되고 있는지
+  // 모르겠다"는 피드백(2026-08-10) 대응. 다음 수정이나 항목 재생성 전까지 유지된다.
+  const isChanged = (item: { category: string; name: string }) =>
+    highlightKeys?.has(`${item.category}::${item.name}`) ?? false;
+  // 알파브라더스 원본 양식은 구분(대)/구분(중) 두 칸에 같은 과업종류명을 그대로 쓴다
+  // (pdf_service._collect_item_block_updates의 group_task_type과 동일한 값).
+  const splitCells = (taskType?: string) =>
+    showCategorySplit && (
+      <>
+        <td className="px-3 py-2.5 text-sm text-gray-600">{taskType ?? "—"}</td>
+        <td className="px-3 py-2.5 text-sm text-gray-600">{taskType ?? "—"}</td>
+      </>
+    );
 
   if (isFlat) {
     const item = group.items[0];
     return (
-      <tr className="border-b border-gray-200 bg-white last:border-b-0">
+      <tr
+        className={
+          "border-b border-gray-200 last:border-b-0 " +
+          (isChanged(item) ? "border-l-4 border-l-amber-400 bg-amber-50" : "bg-white")
+        }
+      >
+        {splitCells(item.task_type)}
         <td className="px-3 py-2.5 text-gray-800">
           <InlineEditCell
             value={group.category}
@@ -554,6 +603,7 @@ function CategoryRows({
   return (
     <>
       <tr className="border-b border-gray-200 bg-white last:border-b-0">
+        {splitCells(group.items[0]?.task_type)}
         <td className="px-3 py-2.5 font-bold text-gray-900">
           <button
             type="button"
@@ -578,7 +628,14 @@ function CategoryRows({
       </tr>
       {expanded &&
         group.items.map((item) => (
-          <tr key={item._index} className="border-b border-gray-200 bg-gray-50 last:border-b-0">
+          <tr
+            key={item._index}
+            className={
+              "border-b border-gray-200 last:border-b-0 " +
+              (isChanged(item) ? "border-l-4 border-l-amber-400 bg-amber-50" : "bg-gray-50")
+            }
+          >
+            {splitCells(item.task_type)}
             <td className="py-2 pl-9 pr-3 text-sm text-gray-700">
               <InlineEditCell
                 value={item.name}
@@ -630,6 +687,8 @@ function LineItemTable({
   detailColumnOrder,
   totalAmount,
   vatIncluded,
+  showCategorySplit = false,
+  highlightKeys,
   onSaveLineItems,
 }: {
   items: LineItem[];
@@ -637,13 +696,15 @@ function LineItemTable({
   detailColumnOrder: string[];
   totalAmount: number;
   vatIncluded: boolean;
+  showCategorySplit?: boolean;
+  highlightKeys?: Set<string>;
   onSaveLineItems: (items: LineItem[]) => Promise<void>;
 }) {
   const groups = groupLineItems(items);
   const order = detailColumnOrder.length > 0 ? detailColumnOrder : DEFAULT_DETAIL_ORDER;
   const labelFor = (key: string) => columnLabels[key] ?? DEFAULT_COLUMN_LABELS[key] ?? key;
   const hasNote = Boolean(columnLabels.note);
-  const labelColSpan = 1 + order.length;
+  const labelColSpan = (showCategorySplit ? 2 : 0) + 1 + order.length;
   const { supplyAmount, vatAmount, grandTotal } = computeVatBreakdown(totalAmount, vatIncluded);
 
   async function handleEditItem(index: number, patch: LineItemPatch) {
@@ -666,11 +727,27 @@ function LineItemTable({
       <table className="w-full min-w-[560px] border-collapse text-base">
         <thead>
           <tr className="border-b border-gray-200 bg-gray-100">
+            {showCategorySplit && (
+              <>
+                <th className="px-3 py-2 text-left text-sm font-semibold text-gray-600">
+                  {columnLabels.category_large ?? "구분(대)"}
+                </th>
+                <th className="px-3 py-2 text-left text-sm font-semibold text-gray-600">
+                  {columnLabels.category_mid ?? "구분(중)"}
+                </th>
+              </>
+            )}
             <th className="px-3 py-2 text-left text-sm font-semibold text-gray-600">
               {labelFor("item_name")}
             </th>
             {order.map((key) => (
-              <th key={key} className="px-3 py-2 text-right text-sm font-semibold text-gray-600">
+              <th
+                key={key}
+                className={
+                  "px-3 py-2 text-sm font-semibold text-gray-600 " +
+                  (TEXT_DETAIL_KEYS.has(key) ? "text-center" : "text-right")
+                }
+              >
                 {labelFor(key)}
               </th>
             ))}
@@ -686,7 +763,15 @@ function LineItemTable({
         </thead>
         <tbody>
           {groups.map((g, gi) => (
-            <CategoryRows key={gi} group={g} order={order} hasNote={hasNote} onEditItem={handleEditItem} />
+            <CategoryRows
+              key={gi}
+              group={g}
+              order={order}
+              hasNote={hasNote}
+              showCategorySplit={showCategorySplit}
+              highlightKeys={highlightKeys}
+              onEditItem={handleEditItem}
+            />
           ))}
         </tbody>
         <tfoot className="border-t-2 border-gray-300 bg-gray-50">
@@ -840,6 +925,7 @@ function QuoteCard({
               detailColumnOrder={quote.detail_column_order}
               totalAmount={quote.total_amount}
               vatIncluded={vatIncluded}
+              showCategorySplit={quote.show_category_split}
               onSaveLineItems={onSaveLineItems}
             />
           </div>
@@ -915,6 +1001,7 @@ function EditChatModal({
   quote,
   messages,
   vatIncluded,
+  highlightKeys,
   onSend,
   onClose,
   onSaveLineItems,
@@ -922,6 +1009,7 @@ function EditChatModal({
   quote: EntityQuote;
   messages: ChatMessage[];
   vatIncluded: boolean;
+  highlightKeys?: Set<string>;
   onSend: (text: string) => Promise<void>;
   onClose: () => void;
   onSaveLineItems: (items: LineItem[]) => Promise<void>;
@@ -933,7 +1021,7 @@ function EditChatModal({
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-  }, [messages]);
+  }, [messages, sending]);
 
   async function handleSend() {
     if (!input.trim() || sending) return;
@@ -981,7 +1069,7 @@ function EditChatModal({
                     (m.role === "user" ? "bg-indigo-600 text-white" : "bg-gray-100 text-gray-800")
                   }
                 >
-                  {m.text}
+                  <p className="whitespace-pre-line">{m.text}</p>
                   {m.scope && m.scope !== "quote_only" && (
                     <p className="mt-1 text-xs font-medium text-amber-600">
                       ⚠ {SCOPE_LABEL[m.scope] ?? m.scope}
@@ -990,6 +1078,15 @@ function EditChatModal({
                 </div>
               </div>
             ))}
+            {sending && (
+              <div className="flex justify-start">
+                <div className="flex items-center gap-1 rounded-2xl bg-gray-100 px-3 py-2.5">
+                  <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-gray-400 [animation-delay:-0.3s]" />
+                  <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-gray-400 [animation-delay:-0.15s]" />
+                  <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-gray-400" />
+                </div>
+              </div>
+            )}
           </div>
           {errorMsg && <p className="px-5 pb-1 text-xs text-red-600">{errorMsg}</p>}
           <div className="flex gap-2 border-t border-gray-100 px-4 py-3">
@@ -1037,6 +1134,8 @@ function EditChatModal({
               detailColumnOrder={quote.detail_column_order}
               totalAmount={quote.total_amount}
               vatIncluded={vatIncluded}
+              showCategorySplit={quote.show_category_split}
+              highlightKeys={highlightKeys}
               onSaveLineItems={onSaveLineItems}
             />
           </div>
@@ -1122,6 +1221,9 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
   const [activeQuoteId, setActiveQuoteId] = useState<string | null>(null);
   const [viewedQuoteId, setViewedQuoteId] = useState<string | null>(null);
   const [chatHistory, setChatHistory] = useState<Record<string, ChatMessage[]>>({});
+  // 채팅 수정 직후 오른쪽 미리보기에서 어느 항목이 바뀌었는지 표시하기 위한 키 집합
+  // ("카테고리::항목명"). 사용자가 "수정되는지도 몰라요"라고 지적한 부분(2026-08-10) 대응.
+  const [lastChangedKeys, setLastChangedKeys] = useState<Record<string, Set<string>>>({});
 
   const [moduleOptions, setModuleOptions] = useState<EntityModuleOptions[]>([]);
   const [moduleSelections, setModuleSelections] = useState<Record<string, string[]>>({});
@@ -1276,22 +1378,12 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
   }
 
   function toggleTaskIncluded(entityId: string, taskType: FixedTaskType, included: boolean) {
+    // 과업을 포함시켜도 세부 항목은 자동 선택하지 않는다 — 사용자가 직접 하나를 골라야
+    // 그 과업이 "선택됨"으로 간주된다(taskSatisfied 참고).
     setEntitySelections((prev) =>
       prev.map((s) => {
         if (s.entityId !== entityId) return s;
-        let moduleNames = s.tasks[taskType].moduleNames;
-        if (included && moduleNames.length === 0) {
-          // 처음 포함시킬 때 variant(라디오) 그룹의 기본값을 자동으로 골라준다 — 라디오는 항상
-          // 하나가 선택돼 있어야 하므로 이렇게 하면 "시장검증 최소 1개" 조건이 자연히 만족된다.
-          const options = moduleOptionsCache[`${entityId}:${taskType}`];
-          for (const group of options?.groups ?? []) {
-            if (group.kind === "variant") {
-              const def = group.options.find((o) => o.is_default) ?? group.options[0];
-              if (def) moduleNames = [...moduleNames, ...def.module_names];
-            }
-          }
-        }
-        return { ...s, tasks: { ...s.tasks, [taskType]: { included, moduleNames } } };
+        return { ...s, tasks: { ...s.tasks, [taskType]: { included, moduleNames: s.tasks[taskType].moduleNames } } };
       })
     );
   }
@@ -1323,8 +1415,16 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
     );
   }
 
+  // "포함" 토글만으로는 부족하다 — 모듈이 있는 과업은 세부 항목을 하나 이상 골라야
+  // 그 과업이 실제로 선택된 것으로 친다(포함만 켜고 아무 항목도 안 고른 상태 방지).
+  function taskSatisfied(entityId: string, taskType: FixedTaskType, task: { included: boolean; moduleNames: string[] }) {
+    if (!task.included) return false;
+    const hasModules = moduleOptionsCache[`${entityId}:${taskType}`]?.has_modules ?? false;
+    return !hasModules || task.moduleNames.length > 0;
+  }
+
   const allEntitiesHaveTask = entitySelections.every((s) =>
-    FIXED_TASK_TYPES.some((t) => effectiveTasks(s)[t].included)
+    FIXED_TASK_TYPES.some((t) => taskSatisfied(s.entityId, t, effectiveTasks(s)[t]))
   );
 
   const canSubmit =
@@ -1440,12 +1540,16 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
 
     const summary =
       editResult.changed_items.length > 0
-        ? editResult.changed_items.map((i) => `${i.name} → ${i.amount.toLocaleString()}원`).join(", ")
+        ? editResult.changed_items.map((i) => `• ${i.name} → ${i.amount.toLocaleString()}원`).join("\n")
         : "요청하신 내용을 반영했습니다.";
 
     setChatHistory((prev) => ({
       ...prev,
       [quoteId]: [...(prev[quoteId] ?? []), { role: "assistant", text: summary, scope: editResult.scope }],
+    }));
+    setLastChangedKeys((prev) => ({
+      ...prev,
+      [quoteId]: new Set(editResult.changed_items.map((i) => `${i.category}::${i.name}`)),
     }));
   }
 
@@ -1653,6 +1757,7 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
             quote={activeQuote}
             messages={chatHistory[activeQuote.id] ?? []}
             vatIncluded={result.vat_included}
+            highlightKeys={lastChangedKeys[activeQuote.id]}
             onSend={(text) => handleSendEdit(activeQuote.id, text)}
             onClose={() => setActiveQuoteId(null)}
             onSaveLineItems={(items) => handleSaveLineItems(activeQuote.id, items)}
@@ -1756,7 +1861,11 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
           자동으로 동일하게 적용된다(2026-08-09 사용자 요청 — 기업마다 따로 고르지 않는다). */}
       {entitySelections.length > 0 && referenceSelection && (
         <fieldset>
-          <StepHeader n={3} title="과업 선택" hint="한 번만 고르면 모든 기업에 동일하게 적용됩니다" />
+          <StepHeader
+            n={3}
+            title="과업 선택"
+            hint="마케팅·시장검증 중 최소 한 곳에서 세부 항목을 하나 이상 골라야 합니다 (둘 다 고를 필요는 없습니다)"
+          />
           <div className="mt-3 space-y-3">
             <div className="rounded-xl border border-gray-200 p-4">
               <p className="text-sm font-semibold text-gray-900">
@@ -1824,11 +1933,13 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
               className="mt-1.5 w-full rounded-md border border-gray-300 px-4 py-3 text-base focus:border-indigo-500 focus:outline-none"
             />
           </div>
-          {entitySelections.some((s) => entities.find((e) => e.id === s.entityId)?.name === "ABBG") && (
+          {entitySelections.some((s) =>
+            ["ABBG", "알파브라더스"].includes(entities.find((e) => e.id === s.entityId)?.name ?? "")
+          ) && (
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
               <div>
                 <label className="block text-sm text-gray-500">
-                  수령인 <span className="text-gray-400">(ABBG 양식 전용)</span>
+                  담당자 <span className="text-gray-400">(ABBG·알파브라더스 양식 전용)</span>
                 </label>
                 <input
                   type="text"
@@ -1840,7 +1951,7 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
               </div>
               <div>
                 <label className="block text-sm text-gray-500">
-                  연락처 <span className="text-gray-400">(ABBG 양식 전용)</span>
+                  연락처 <span className="text-gray-400">(ABBG·알파브라더스 양식 전용)</span>
                 </label>
                 <input
                   type="text"
@@ -1852,7 +1963,7 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
               </div>
               <div>
                 <label className="block text-sm text-gray-500">
-                  이메일 <span className="text-gray-400">(ABBG 양식 전용)</span>
+                  이메일 <span className="text-gray-400">(ABBG·알파브라더스 양식 전용)</span>
                 </label>
                 <input
                   type="text"

@@ -2,7 +2,7 @@
 
 import json
 import re
-from typing import List
+from typing import List, Optional
 
 from fastapi import HTTPException
 from pydantic import BaseModel, ValidationError
@@ -18,10 +18,13 @@ SYSTEM_PROMPT = (
     "제약조건(예: 총액 유지)이 있으면 반드시 지켜야 합니다. "
     "먼저 이 요청이 '이번 견적 건만' 수정하려는 것인지, '앞으로도 계속 적용될 기본값(카탈로그)'을 "
     "바꾸려는 것인지 판별하고 scope 필드로 명시하세요. 판별이 애매하면 scope를 \"ambiguous\"로 "
-    "표시하세요. 반드시 JSON 객체 하나만 응답하세요(설명, 마크다운 코드블록 없이). 출력 형식: "
+    "표시하세요. 수정 요청에 changed_items의 합계가 맞아야 할 구체적인 금액이 명시돼 있으면(예: "
+    "\"광고형 마케팅은 900만원으로 해줘\") 그 정수값을 changed_items_target에 넣으세요(없으면 null). "
+    "반드시 JSON 객체 하나만 응답하세요(설명, 마크다운 코드블록 없이). 출력 형식: "
     '{"scope": "quote_only" | "catalog_update" | "ambiguous", '
     '"items": [{"category": "...", "name": "...", "amount": 정수}], '
-    '"changed_items": [{"category": "...", "name": "...", "amount": 정수}]}'
+    '"changed_items": [{"category": "...", "name": "...", "amount": 정수}], '
+    '"changed_items_target": 정수 | null}'
 )
 
 
@@ -29,6 +32,25 @@ class EditLLMResult(BaseModel):
     scope: str
     items: List[AllocatedItem]
     changed_items: List[AllocatedItem]
+    changed_items_target: Optional[int] = None
+
+
+def _reconcile_changed_items_target(result: EditLLMResult) -> None:
+    """Claude가 준 changed_items 합이 사용자가 명시한 목표 금액과 다르면 마지막 항목에서
+    차액을 흡수한다(allocation_service._reconcile_rounding과 같은 패턴, PRD 7.1-6) — LLM이
+    비율 계산을 하다 목표에 못 미치는 경우가 있어(2026-08-10 확인) 서버에서 정확히 맞춘다."""
+    if result.changed_items_target is None or not result.changed_items:
+        return
+    diff = result.changed_items_target - sum(i.amount for i in result.changed_items)
+    if diff == 0:
+        return
+    last = result.changed_items[-1]
+    fixed = AllocatedItem(category=last.category, name=last.name, amount=last.amount + diff)
+    result.changed_items[-1] = fixed
+    for idx, item in enumerate(result.items):
+        if (item.category, item.name) == (last.category, last.name):
+            result.items[idx] = fixed
+            break
 
 
 def _call_claude_edit(existing_items: list, edit_request_text: str) -> EditLLMResult:
@@ -78,6 +100,7 @@ def edit_entity_quote(entity_quote_id: str, edit_request_text: str) -> EditResul
     vat_included = set_res.data[0]["vat_included"]
 
     result = _call_claude_edit(quote["line_items"], edit_request_text)
+    _reconcile_changed_items_target(result)
 
     supply_amount = sum(i.amount for i in result.items)
     if vat_included:
@@ -85,14 +108,19 @@ def edit_entity_quote(entity_quote_id: str, edit_request_text: str) -> EditResul
     else:
         grand_total = supply_amount + round(supply_amount * 0.1)
 
-    # Claude 응답(AllocatedItem)엔 category/name/amount뿐이라 task_type이 빠진다 — 기존
-    # line_items에서 (category, name)으로 다시 찾아 붙인다(항목명을 새로 지어낸 경우는 첫
-    # 번째 과업종류로 대체, 과업종류가 하나뿐이면 항상 이 경로).
-    task_type_by_key = {(i["category"], i["name"]): i.get("task_type") for i in quote["line_items"]}
-    updated_items = [
-        {**i.model_dump(), "task_type": task_type_by_key.get((i.category, i.name)) or task_types[0]}
-        for i in result.items
-    ]
+    # Claude 응답(AllocatedItem)엔 category/name/amount뿐이라 task_type·description이 빠진다 —
+    # 기존 line_items에서 (category, name)으로 다시 찾아 붙인다(항목명을 새로 지어낸 경우는 첫
+    # 번째 과업종류로 대체, 과업종류가 하나뿐이면 항상 이 경로). description을 안 붙이면 "상품구성"
+    # 컬럼이 있는 양식(알파브라더스 등)에서 채팅 수정할 때마다 그 칸이 비어버린다(2026-08-11 발견).
+    old_item_by_key = {(i["category"], i["name"]): i for i in quote["line_items"]}
+    updated_items = []
+    for i in result.items:
+        old_item = old_item_by_key.get((i.category, i.name))
+        updated_items.append({
+            **i.model_dump(),
+            "task_type": (old_item or {}).get("task_type") or task_types[0],
+            "description": (old_item or {}).get("description"),
+        })
 
     entity_name = quote["entity_templates"]["name"]
     # 채팅 수정 후에도 미리보기에서 단가/작업일/수량이 계속 보이도록, 생성 때와 같은 로직으로

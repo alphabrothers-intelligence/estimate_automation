@@ -15,7 +15,7 @@ class EntitySelectionIn(BaseModel):
 class EstimateSetCreate(BaseModel):
     project_name: str = Field(min_length=1)
     recipient_name: str = Field(min_length=1)  # 견적서 수신자(고객사명) — 실제 발급 시 "OOO 귀하"에 들어감
-    # ABBG 양식 전용 칸(cell_map.header_fields의 client_contact/client_phone/client_email) —
+    # ABBG·알파브라더스 양식 전용 칸(cell_map.header_fields의 client_contact/client_phone/client_email) —
     # 다른 법인 양식엔 대응 칸이 없어 그냥 무시된다(pdf_service._collect_header_updates).
     recipient_contact: Optional[str] = None
     recipient_phone: Optional[str] = None
@@ -60,6 +60,8 @@ class EntityQuoteOut(BaseModel):
     # 미리보기 UI가 이 값 그대로 표시한다(2026-07-10).
     column_labels: Dict[str, str] = Field(default_factory=dict)
     detail_column_order: List[str] = Field(default_factory=list)
+    # 알파브라더스처럼 항목 블록마다 구분(대)/구분(중)이 있는 양식인지 (item.task_type로 채움)
+    show_category_split: bool = False
 
 
 class GenerateRequest(BaseModel):
@@ -111,6 +113,9 @@ class LineItemIn(BaseModel):
     # 소속인지 — PDF 발급 시 work_days/quantity를 어느 법인 카탈로그에서 찾을지 결정한다
     # (pdf_service._compute_item_pricing). 프론트엔드가 기존 값을 그대로 되돌려 보낸다.
     task_type: Optional[str] = None
+    # 알파브라더스·ABBG처럼 "상품구성" 컬럼에 세부 항목을 세로형 개조식으로 나열하는 양식용 —
+    # 이 필드가 없으면 직접편집 저장 시 model_dump()가 통째로 지워버린다(2026-08-11 발견).
+    description: Optional[str] = None
 
 
 class LineItemsUpdate(BaseModel):

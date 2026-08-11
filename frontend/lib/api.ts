@@ -16,6 +16,11 @@ export type LineItem = {
   // 과업종류를 교차 선택한 견적서에서 이 항목이 어느 과업종류 소속인지 — 직접편집 저장 시
   // 그대로 되돌려 보내야 발급 시 단가 계산이 올바른 법인 카탈로그를 참조한다.
   task_type?: string;
+  // 알파브라더스처럼 상품구성을 별도 칸(상품구성/상세내용)에 세로로 나열하는 양식용.
+  description?: string;
+  // 썬데이워커 전용 — 투입 MM(작업일×수량÷20 근사치, PRD 7.4)과 항목별 세액(공급가액×10%).
+  input_mm?: number;
+  tax_amount?: number;
 };
 
 export type EntityQuote = {
@@ -34,6 +39,8 @@ export type EntityQuote = {
   // 백엔드가 각 법인의 실제 템플릿에서 그대로 계산해 내려준다(2026-07-10).
   column_labels: Record<string, string>;
   detail_column_order: string[];
+  // 알파브라더스처럼 항목 블록마다 구분(대)/구분(중)이 있는 양식인지 (item.task_type로 채움)
+  show_category_split: boolean;
 };
 
 export type ModuleItemGroup = {

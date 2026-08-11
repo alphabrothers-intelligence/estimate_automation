@@ -376,12 +376,21 @@ def _ensure_wrap_text(sheet_xml: str, styles_xml: str, coords: set) -> tuple[str
         if not s_match:
             continue
         old_idx = int(s_match.group(1))
-        if old_idx >= len(xf_entries) or 'wrapText="1"' in xf_entries[old_idx]:
+        if old_idx >= len(xf_entries) or re.search(r'wrapText="(1|true)"', xf_entries[old_idx]):
             continue
         if old_idx not in wrap_cache:
             xf = xf_entries[old_idx]
-            if re.search(r"<alignment\b[^>]*/>", xf):
-                wrapped_xf = re.sub(r"(<alignment\b[^>]*?)/>", r'\1 wrapText="1"/>', xf, count=1)
+            align_match = re.search(r"<alignment\b[^>]*/>", xf)
+            if align_match:
+                align_tag = align_match.group(0)
+                # .xls에서 변환된 마스터(블렌디드랩 등)는 wrapText="false"처럼 true/false
+                # 표기를 쓴다 — "1"만 보고 없다고 판단해 속성을 또 붙이면 wrapText가 중복
+                # 지정된 잘못된 XML이 되어 styles.xml 전체가 깨진다(2026-08-10 발견).
+                if "wrapText=" in align_tag:
+                    new_align_tag = re.sub(r'wrapText="[^"]*"', 'wrapText="1"', align_tag)
+                else:
+                    new_align_tag = align_tag[:-2] + ' wrapText="1"/>'
+                wrapped_xf = xf[: align_match.start()] + new_align_tag + xf[align_match.end() :]
             elif xf.endswith("/>"):
                 wrapped_xf = xf[:-2] + '><alignment wrapText="1"/></xf>'
             else:
@@ -515,9 +524,19 @@ def get_column_display(supabase, entity_id: str, task_types: List[str], selected
     except HTTPException:
         return {"column_labels": {}, "detail_column_order": []}
     cell_map = template["cell_map"]
+    order = list(cell_map.get("detail_column_order", []))
+    columns = cell_map.get("columns", {})
+    if "description" in columns and "description" not in order:
+        order = ["description"] + order
+    for extra_key in ("input_mm", "tax_amount"):
+        if extra_key in columns and extra_key not in order:
+            order.append(extra_key)
     return {
         "column_labels": cell_map.get("column_labels", {}),
-        "detail_column_order": cell_map.get("detail_column_order", []),
+        "detail_column_order": order,
+        "show_category_split": any(
+            block.get("category_large_cell") for block in cell_map.get("item_blocks", [])
+        ),
     }
 
 
@@ -804,8 +823,28 @@ def _compute_item_pricing(
         sheet_xml, f"{columns['supply_amount']}{row}", columns["work_days"]
     )
     divisor = quantity * (work_days if uses_work_days else 1)
-    unit_price = round(item["amount"] / divisor) if divisor else item["amount"]
+    # 반올림하면 안 된다 — 이 단가 셀 자체는 그냥 값이어도, 같은 행의 공급가액 셀은 원본에
+    # 수식(=단가*작업일*수량 등)으로 들어있어 우리가 넣은 amount를 무시하고 이 단가로 다시
+    # 계산한다(_patch_sheet_xml이 수식 셀은 캐시만 지우고 값은 안 덮어씀). round()로 단가가
+    # 살짝 어긋나면 그 오차가 공급가액→카테고리 소계→합계까지 그대로 누적돼, 화면(웹) 총액과
+    # 실제 PDF 총액이 달라지는 원인이었다(2026-08-11 확인). 나눗셈이 딱 안 떨어지면 정수가
+    # 아닌 값을 그대로 쓴다 — 셀 서식이 화면에는 반올림해 보여주므로 표시는 그대로다.
+    unit_price = item["amount"] / divisor if divisor else item["amount"]
     return unit_price, work_days, quantity
+
+
+def _derive_extra_columns(columns: Dict[str, str], amount: float, work_days: float, quantity: float) -> Dict[str, float]:
+    """input_mm/tax_amount처럼 카탈로그에 없어 파생식으로 채우는 컬럼들. PDF 발급
+    (_collect_item_block_updates)과 미리보기(compute_line_item_pricing)가 같은 값을 쓰도록 여기
+    한 곳에 모아둔다."""
+    extra: Dict[str, float] = {}
+    if "tax_amount" in columns:
+        extra["tax_amount"] = round(amount * 0.1)
+    if "input_mm" in columns:
+        # ponytail: 실제 "역할별 투입 MM" 데이터가 카탈로그에 없어서 작업일×수량을 20영업일로
+        # 나눈 근사치(PRD 7.4) — 정확한 값이 아니라 사용자가 이후 직접 고치는 걸 전제로 한 임시값.
+        extra["input_mm"] = round(work_days * quantity / 20, 2)
+    return extra
 
 
 def _build_catalog_maps(supabase, catalog_entity_id_by_task_type: Dict[str, str]) -> Dict[str, Dict[str, List[dict]]]:
@@ -913,7 +952,8 @@ def compute_line_item_pricing(
             unit_price, work_days, quantity = _compute_item_pricing(
                 catalog_map, columns, sheet_xml, group["category"], item, rows[row_index]
             )
-            enriched.append({**item, "unit_price": unit_price, "work_days": work_days, "quantity": quantity})
+            extra = _derive_extra_columns(columns, item["amount"], work_days, quantity)
+            enriched.append({**item, "unit_price": unit_price, "work_days": work_days, "quantity": quantity, **extra})
     return enriched
 
 
@@ -1020,6 +1060,10 @@ def _collect_item_block_updates(
                 updates[f"{columns['supply_amount']}{row}"] = item["amount"]
             if "amount" in columns:  # 블렌디드랩: 부가세 별도 금액 컬럼명이 amount
                 updates[f"{columns['amount']}{row}"] = item["amount"]
+            # 썬데이워커 세액(V열)은 항목별 표시 칸일 뿐 합계 수식(V35=R35*0.1)과는 무관해서
+            # 그냥 공급가액의 10%를 직접 써도 총합계엔 영향 없다(2026-08-11 원본 수식 확인).
+            for extra_key, extra_value in _derive_extra_columns(columns, item["amount"], work_days, quantity).items():
+                updates[f"{columns[extra_key]}{row}"] = extra_value
             if "note" in columns and item.get("note"):
                 updates[f"{columns['note']}{row}"] = item["note"]
     return updates, hidden_rows
