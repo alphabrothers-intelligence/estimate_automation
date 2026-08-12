@@ -11,12 +11,15 @@ openpyxl로 통째로 열고 다시 저장하면 이 파일들의 도장 이미�
 고쳐서 나머지 파일(도장 이미지·드로잉·다른 시트)은 원본 바이트 그대로 보존한다.
 """
 
+import hashlib
 import io
+import json
 import re
 import subprocess
 import tempfile
 import threading
 import zipfile
+from collections import Counter
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -414,8 +417,73 @@ def _ensure_wrap_text(sheet_xml: str, styles_xml: str, coords: set) -> tuple[str
     return sheet_xml, styles_xml
 
 
+def _normalize_block_row_heights(sheet_xml: str, item_blocks: List[dict], updates: CellUpdates) -> str:
+    """항목 블록(카테고리 하나) 안의 행 높이를 통일한다 — 원본 마스터에 원인 불명의 들쭉날쭉한
+    ht 값이 그대로 남아있는 경우가 있고(예: 테스티파이, 2026-08-11 사용자 지적), 실제 채워
+    넣는 내용이 줄바꿈(\\n)으로 여러 줄이 되면 그 행만 커지고 나머지는 그대로라 표가 깨져
+    보인다. 블록의 기준 높이(그 블록에서 가장 흔한 ht)를 구하고, 이번에 채우는 내용 중
+    가장 많은 줄수를 요구하는 행 기준으로 필요하면 기준 높이를 올린 뒤, 블록의 모든 행에
+    똑같이 적용한다."""
+    if not item_blocks:
+        return sheet_xml
+
+    row_heights: Dict[int, float] = {}
+    for m in re.finditer(r'<row r="(\d+)"[^>]*\bht="([\d.]+)"', sheet_xml):
+        row_heights[int(m.group(1))] = float(m.group(2))
+
+    lines_by_row: Dict[int, int] = {}
+    for coord, value in updates.items():
+        if not isinstance(value, str) or "\n" not in value:
+            continue
+        m = re.match(r"^[A-Z]+(\d+)$", coord)
+        if not m:
+            continue
+        row = int(m.group(1))
+        lines_by_row[row] = max(lines_by_row.get(row, 1), value.count("\n") + 1)
+
+    target_height_by_row: Dict[int, float] = {}
+    for block in item_blocks:
+        rows = block.get("rows") or []
+        heights = [row_heights[r] for r in rows if r in row_heights]
+        if not heights:
+            continue
+        base_height = Counter(heights).most_common(1)[0][0]
+        max_lines = max((lines_by_row.get(r, 1) for r in rows), default=1)
+        # ponytail: 줄당 높이를 base_height로 근사(폰트 크기·자간 기반 정밀 측정 아님) —
+        # 실제로 줄바꿈 셀이 잘리는 사례가 나오면 폰트 메트릭 기반 계산으로 교체.
+        block_height = base_height * max_lines
+        for row in rows:
+            target_height_by_row[row] = block_height
+
+    if not target_height_by_row:
+        return sheet_xml
+
+    def _apply_height(m: re.Match) -> str:
+        row_num = int(m.group(1))
+        if row_num not in target_height_by_row:
+            return m.group(0)
+        tag = m.group(0)
+        new_height = target_height_by_row[row_num]
+        if re.search(r'\bht="[\d.]+"', tag):
+            tag = re.sub(r'\bht="[\d.]+"', f'ht="{new_height}"', tag, count=1)
+        elif tag.endswith("/>"):
+            tag = tag[:-2] + f' ht="{new_height}"/>'
+        else:
+            tag = tag[:-1] + f' ht="{new_height}">'
+        if "customHeight=" not in tag:
+            tag = tag[:-2] + ' customHeight="1"/>' if tag.endswith("/>") else tag[:-1] + ' customHeight="1">'
+        return tag
+
+    return re.sub(r'<row r="(\d+)"[^>]*?(?:/>|>)', _apply_height, sheet_xml)
+
+
 def _patch_xlsx(
-    source_bytes: bytes, sheet_name: str, updates: CellUpdates, dest_path: Path, hidden_rows: Optional[set] = None
+    source_bytes: bytes,
+    sheet_name: str,
+    updates: CellUpdates,
+    dest_path: Path,
+    hidden_rows: Optional[set] = None,
+    item_blocks: Optional[List[dict]] = None,
 ) -> None:
     with zipfile.ZipFile(io.BytesIO(source_bytes), "r") as zin:
         sheet_path = _sheet_internal_path(zin, sheet_name)
@@ -423,6 +491,7 @@ def _patch_xlsx(
         patched_sheet_xml = _patch_sheet_xml(sheet_xml, updates)
         patched_sheet_xml = _strip_all_formula_caches(patched_sheet_xml)
         patched_sheet_xml = _hide_rows(patched_sheet_xml, hidden_rows or set())
+        patched_sheet_xml = _normalize_block_row_heights(patched_sheet_xml, item_blocks or [], updates)
         patched_sheet_xml = _force_fit_to_page(patched_sheet_xml)
 
         workbook_xml = zin.read("xl/workbook.xml").decode("utf-8")
@@ -1094,13 +1163,10 @@ def resolve_catalog_entity_id(supabase, entity_id: str, entity_name: str, task_t
     return src.data[0]["id"] if src.data else entity_id
 
 
-def _build_filled_xlsx(entity_quote_id: str, filled_path: Path) -> None:
-    """법인 마스터 xlsx의 가변 셀만 채워 filled_path에 저장한다. PDF 발급과 xlsx 다운로드가
-    이 함수 하나를 공유해 두 파일의 내용이 항상 일치한다(2026-07-10)."""
-    supabase = get_supabase()
-
+def _fetch_quote_row(entity_quote_id: str) -> dict:
     quote_res = (
-        supabase.table("entity_quotes")
+        get_supabase()
+        .table("entity_quotes")
         .select(
             "id, entity_id, task_types, recipient_name, recipient_contact, recipient_phone, recipient_email, "
             "quote_date, service_name, total_amount, "
@@ -1112,7 +1178,17 @@ def _build_filled_xlsx(entity_quote_id: str, filled_path: Path) -> None:
     )
     if not quote_res.data:
         raise HTTPException(status_code=404, detail="견적서를 찾을 수 없습니다.")
-    quote = quote_res.data[0]
+    return quote_res.data[0]
+
+
+def _quote_content_hash(quote: dict) -> str:
+    return hashlib.sha256(json.dumps(quote, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _build_filled_xlsx_from_quote(quote: dict, filled_path: Path) -> None:
+    """법인 마스터 xlsx의 가변 셀만 채워 filled_path에 저장한다. PDF 발급과 xlsx 다운로드가
+    이 함수 하나를 공유해 두 파일의 내용이 항상 일치한다(2026-07-10)."""
+    supabase = get_supabase()
 
     if not quote["line_items"]:
         raise HTTPException(status_code=422, detail="항목이 아직 생성되지 않았습니다. 먼저 항목·금액을 생성하세요.")
@@ -1158,14 +1234,22 @@ def _build_filled_xlsx(entity_quote_id: str, filled_path: Path) -> None:
     for coord in cell_map.get("always_clear_cells", []):
         updates[coord] = None
 
-    _patch_xlsx(source_bytes, template["sheet_name"], updates, filled_path, hidden_rows=hidden_rows)
+    _patch_xlsx(
+        source_bytes,
+        template["sheet_name"],
+        updates,
+        filled_path,
+        hidden_rows=hidden_rows,
+        item_blocks=[b for b in cell_map.get("item_blocks", []) if b.get("role") != "labor_fte"],
+    )
 
 
 def render_entity_quote_xlsx(entity_quote_id: str) -> bytes:
     """마스터 xlsx의 가변 셀만 채운 결과를 변환 없이 그대로 xlsx bytes로 반환한다."""
+    quote = _fetch_quote_row(entity_quote_id)
     with tempfile.TemporaryDirectory() as tmp_dir:
         filled_path = Path(tmp_dir) / "filled.xlsx"
-        _build_filled_xlsx(entity_quote_id, filled_path)
+        _build_filled_xlsx_from_quote(quote, filled_path)
         return filled_path.read_bytes()
 
 
@@ -1231,11 +1315,24 @@ def stop_lo_listener() -> None:
     _lo_listener = None
 
 
+# entity_quote_id -> (content_hash, pdf_bytes). 견적 내용(항목·금액·용역명 등)이 바뀌지 않았으면
+# LibreOffice 변환(5~6초)을 매 조회마다 반복할 이유가 없다 — quote row 전체를 해시해 키로 쓰므로
+# 채팅 수정이든 직접편집이든 내용이 실제로 바뀐 시점에만 자동으로 캐시가 무효화된다. 프로세스
+# 재시작 시 비워지는 건 의도된 동작(사용자 1인·단일 프로세스라 별도 저장소 불필요).
+_pdf_cache: Dict[str, tuple[str, bytes]] = {}
+
+
 def render_entity_quote_pdf(entity_quote_id: str) -> bytes:
+    quote = _fetch_quote_row(entity_quote_id)
+    content_hash = _quote_content_hash(quote)
+    cached = _pdf_cache.get(entity_quote_id)
+    if cached and cached[0] == content_hash:
+        return cached[1]
+
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_dir_path = Path(tmp_dir)
         filled_path = tmp_dir_path / "filled.xlsx"
-        _build_filled_xlsx(entity_quote_id, filled_path)
+        _build_filled_xlsx_from_quote(quote, filled_path)
 
         convert_cmd = [
             "soffice",
@@ -1253,7 +1350,9 @@ def render_entity_quote_pdf(entity_quote_id: str) -> bytes:
             for attempt in range(2):
                 result = subprocess.run(convert_cmd, capture_output=True, text=True, timeout=60)
                 if result.returncode == 0 and pdf_path.exists():
-                    return pdf_path.read_bytes()
+                    pdf_bytes = pdf_path.read_bytes()
+                    _pdf_cache[entity_quote_id] = (content_hash, pdf_bytes)
+                    return pdf_bytes
                 last_error = result.stderr or result.stdout
 
         raise HTTPException(

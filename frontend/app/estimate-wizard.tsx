@@ -13,6 +13,8 @@ import {
   getEntityQuotePdfUrl,
   getEntityQuoteXlsxUrl,
   updateLineItems,
+  updateQuoteDate,
+  updateRecipientInfo,
   updateServiceName,
   type CatalogModuleOptions,
   type EntityModuleOptions,
@@ -22,6 +24,7 @@ import {
   type LineItem,
   type ModuleGroup,
   type ModuleOption,
+  type RecipientInfoInput,
 } from "@/lib/api";
 
 // 견적 내용이 바뀔 때만 PDF 미리보기를 다시 불러오게 하는 캐시버스터 키.
@@ -166,20 +169,29 @@ function OptionRow({
 // 예전엔 "용역명 입력 필요" 배지를 먼저 보여주고 클릭해야 입력창이 나왔는데, 그 문구를
 // 입력칸 자체의 placeholder로 옮겨서 클릭 한 번 없이 바로 타이핑해 채울 수 있게 한다
 // (2026-08-09 사용자 피드백). InlineEditCell과 같은 blur/Enter 저장 패턴을 그대로 따른다.
-function ServiceNameField({
-  quote,
+// 용역명뿐 아니라 수신자/담당자/연락처/이메일도 같은 패턴이라(2026-08-12) 공용 컴포넌트로 뺐다 —
+// placeholder만으로는 칸이 비면 무슨 값인지 알 수 없다는 사용자 피드백으로 "라벨 :" 을 항상 보여준다.
+function LabeledInlineField({
+  label,
+  value,
+  placeholder,
+  required = false,
   onSave,
 }: {
-  quote: EntityQuote;
+  label: string;
+  value: string;
+  placeholder: string;
+  required?: boolean;
   onSave: (value: string) => Promise<void>;
 }) {
-  const [value, setValue] = useState(quote.service_name ?? "");
+  const [draft, setDraft] = useState(value);
   const [saving, setSaving] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   async function handleSave() {
-    const trimmed = value.trim();
-    if (!trimmed || trimmed === quote.service_name || saving) return;
+    const trimmed = draft.trim();
+    if (trimmed === value || saving) return;
+    if (required && !trimmed) return;
     setSaving(true);
     setErrorMsg(null);
     try {
@@ -193,18 +205,122 @@ function ServiceNameField({
 
   return (
     <div className="mt-2 flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
+      <span className="shrink-0 text-sm font-medium text-gray-500">{label} :</span>
       <input
         type="text"
-        value={value}
+        value={draft}
         disabled={saving}
-        onChange={(e) => setValue(e.target.value)}
+        onChange={(e) => setDraft(e.target.value)}
         onBlur={handleSave}
         onKeyDown={(e) => e.key === "Enter" && handleSave()}
-        placeholder="용역명을 입력하세요 (예: 정량, 정성 데이터 기반 시장 검증 용역) — 발급 전 필수"
+        placeholder={placeholder}
         className={
           "flex-1 rounded-md border px-2 py-1 text-sm focus:border-indigo-500 focus:outline-none " +
-          (quote.service_name ? "border-gray-300" : "border-amber-300 bg-amber-50")
+          (required && !value ? "border-amber-300 bg-amber-50" : "border-gray-300")
         }
+      />
+      {saving && <span className="shrink-0 text-xs text-gray-400">저장 중…</span>}
+      {errorMsg && <p className="text-sm text-red-600">{errorMsg}</p>}
+    </div>
+  );
+}
+
+function ServiceNameField({
+  quote,
+  onSave,
+}: {
+  quote: EntityQuote;
+  onSave: (value: string) => Promise<void>;
+}) {
+  return (
+    <LabeledInlineField
+      label="용역명"
+      value={quote.service_name ?? ""}
+      placeholder="예: 정량, 정성 데이터 기반 시장 검증 용역 — 발급 전 필수"
+      required
+      onSave={onSave}
+    />
+  );
+}
+
+// 담당자/연락처/이메일 칸은 ABBG·알파브라더스 양식에만 있다(010_seed_quote_templates.sql
+// header_fields의 client_contact/client_phone/client_email). 수신자(고객사명)는 모든 법인
+// 양식에 대응 칸이 있어 공통으로 보여준다.
+const RECIPIENT_CONTACT_ENTITIES = ["ABBG", "알파브라더스"];
+
+function RecipientInfoFields({
+  quote,
+  onSave,
+}: {
+  quote: EntityQuote;
+  onSave: (input: RecipientInfoInput) => Promise<void>;
+}) {
+  return (
+    <>
+      <LabeledInlineField
+        label="수신자"
+        value={quote.recipient_name ?? ""}
+        placeholder="고객사명을 입력하세요 — 발급 전 필수"
+        required
+        onSave={(value) => onSave({ recipient_name: value })}
+      />
+      {RECIPIENT_CONTACT_ENTITIES.includes(quote.entity_name) && (
+        <>
+          <LabeledInlineField
+            label="담당자"
+            value={quote.recipient_contact ?? ""}
+            placeholder="담당자명"
+            onSave={(value) => onSave({ recipient_contact: value })}
+          />
+          <LabeledInlineField
+            label="연락처"
+            value={quote.recipient_phone ?? ""}
+            placeholder="연락처"
+            onSave={(value) => onSave({ recipient_phone: value })}
+          />
+          <LabeledInlineField
+            label="이메일"
+            value={quote.recipient_email ?? ""}
+            placeholder="이메일"
+            onSave={(value) => onSave({ recipient_email: value })}
+          />
+        </>
+      )}
+    </>
+  );
+}
+
+function QuoteDateField({
+  quote,
+  onSave,
+}: {
+  quote: EntityQuote;
+  onSave: (value: string) => Promise<void>;
+}) {
+  const [saving, setSaving] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  async function handleChange(next: string) {
+    if (!next || next === quote.quote_date || saving) return;
+    setSaving(true);
+    setErrorMsg(null);
+    try {
+      await onSave(next);
+    } catch (e) {
+      setErrorMsg(e instanceof ApiError ? e.message : "저장에 실패했습니다.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="mt-2 flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
+      <input
+        type="date"
+        defaultValue={quote.quote_date ?? ""}
+        disabled={saving}
+        onChange={(e) => handleChange(e.target.value)}
+        className="rounded-md border border-gray-300 px-2 py-1 text-sm focus:border-indigo-500 focus:outline-none"
       />
       {saving && <span className="shrink-0 text-xs text-gray-400">저장 중…</span>}
       {errorMsg && <p className="text-sm text-red-600">{errorMsg}</p>}
@@ -706,6 +822,7 @@ function LineItemTable({
   const hasNote = Boolean(columnLabels.note);
   const labelColSpan = (showCategorySplit ? 2 : 0) + 1 + order.length;
   const { supplyAmount, vatAmount, grandTotal } = computeVatBreakdown(totalAmount, vatIncluded);
+  const [keepTotal, setKeepTotal] = useState(false);
 
   async function handleEditItem(index: number, patch: LineItemPatch) {
     const merged: LineItem = { ...items[index], ...patch };
@@ -718,12 +835,53 @@ function LineItemTable({
     } else if ("unit_price" in patch || "work_days" in patch || "quantity" in patch) {
       merged.amount = Math.round((merged.unit_price ?? 0) * (merged.work_days ?? 1) * (merged.quantity ?? 1));
     }
-    const next = items.map((item, i) => (i === index ? merged : item));
+
+    let next = items.map((item, i) => (i === index ? merged : item));
+
+    // 총액 유지 모드: 이 항목의 증감분을 나머지 항목에 (기존 비중대로) 비례 배분해 총액을 그대로 유지한다.
+    if (keepTotal && "amount" in patch && items.length > 1) {
+      const originalTotal = items.reduce((sum, item) => sum + item.amount, 0);
+      const delta = merged.amount - items[index].amount;
+      const othersSum = originalTotal - items[index].amount;
+      if (delta !== 0 && othersSum > 0) {
+        // ponytail: delta가 othersSum보다 크면(다른 항목을 전부 0으로 깎아도 못 흡수) scale을 0에서
+        // 멈춘다 — 이 경우 총액이 정확히 안 맞을 수 있음. 필요해지면 음수 방지 대신 에러로 막을 것.
+        const scale = Math.max(0, (othersSum - delta) / othersSum);
+        next = items.map((item, i) => {
+          if (i === index) return merged;
+          const scaledAmount = Math.round(item.amount * scale);
+          const divisor = (item.work_days ?? 1) * (item.quantity ?? 1);
+          return { ...item, amount: scaledAmount, unit_price: divisor ? scaledAmount / divisor : scaledAmount };
+        });
+        // 반올림 오차는 마지막 "다른" 항목에서 흡수해 총액을 원래 값과 정확히 맞춘다
+        // (allocation_service._reconcile_rounding과 동일 패턴).
+        const roundingDiff = originalTotal - next.reduce((sum, item) => sum + item.amount, 0);
+        if (roundingDiff !== 0) {
+          const lastOtherIndex = index === next.length - 1 ? next.length - 2 : next.length - 1;
+          const item = next[lastOtherIndex];
+          const fixedAmount = item.amount + roundingDiff;
+          const divisor = (item.work_days ?? 1) * (item.quantity ?? 1);
+          next[lastOtherIndex] = { ...item, amount: fixedAmount, unit_price: divisor ? fixedAmount / divisor : fixedAmount };
+        }
+      }
+    }
+
     await onSaveLineItems(next);
   }
 
   return (
-    <div className="overflow-x-auto rounded-lg border border-gray-200 bg-white">
+    <div>
+      <div className="mb-2 flex justify-end">
+        <label className="flex items-center gap-1.5 text-sm text-gray-600">
+          <input
+            type="checkbox"
+            checked={keepTotal}
+            onChange={(e) => setKeepTotal(e.target.checked)}
+          />
+          총액 유지 (금액 수정 시 다른 항목에서 자동 배분)
+        </label>
+      </div>
+      <div className="overflow-x-auto rounded-lg border border-gray-200 bg-white">
       <table className="w-full min-w-[560px] border-collapse text-base">
         <thead>
           <tr className="border-b border-gray-200 bg-gray-100">
@@ -804,6 +962,7 @@ function LineItemTable({
           </tr>
         </tfoot>
       </table>
+      </div>
     </div>
   );
 }
@@ -869,12 +1028,16 @@ function QuoteCard({
   vatIncluded,
   onOpenChat,
   onSaveServiceName,
+  onSaveQuoteDate,
+  onSaveRecipientInfo,
   onSaveLineItems,
 }: {
   quote: EntityQuote;
   vatIncluded: boolean;
   onOpenChat: () => void;
   onSaveServiceName: (value: string) => Promise<void>;
+  onSaveQuoteDate: (value: string) => Promise<void>;
+  onSaveRecipientInfo: (input: RecipientInfoInput) => Promise<void>;
   onSaveLineItems: (items: LineItem[]) => Promise<void>;
 }) {
   return (
@@ -908,6 +1071,8 @@ function QuoteCard({
             {quote.entity_name === TESTIFY_NAME && (
               <ServiceNameField quote={quote} onSave={onSaveServiceName} />
             )}
+            <QuoteDateField quote={quote} onSave={onSaveQuoteDate} />
+            <RecipientInfoFields quote={quote} onSave={onSaveRecipientInfo} />
           </div>
           <div className="text-right">
             <p className="whitespace-nowrap text-3xl font-bold text-indigo-700">
@@ -968,7 +1133,12 @@ function QuoteCard({
 }
 
 function QuotePreviewPane({ quote }: { quote: EntityQuote }) {
-  const previewKey = hashKey({ items: quote.line_items, total: quote.total_amount, service: quote.service_name });
+  const previewKey = hashKey({
+    items: quote.line_items,
+    total: quote.total_amount,
+    service: quote.service_name,
+    date: quote.quote_date,
+  });
   const loadedKeysRef = useRef<Set<string>>(new Set());
   const [, forceRerender] = useState(0);
   const loading = !loadedKeysRef.current.has(previewKey);
@@ -1436,7 +1606,6 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
     entitySelections.filter((s) => s.role === "comparison").length <= MAX_COMPARISON &&
     allEntitiesHaveTask &&
     projectName.trim().length > 0 &&
-    recipientName.trim().length > 0 &&
     Number(totalAmount) > 0 &&
     (!primaryIsTestify || serviceName.trim().length > 0) &&
     !submitting;
@@ -1447,7 +1616,7 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
     try {
       const created = await createEstimateSet({
         project_name: projectName,
-        recipient_name: recipientName,
+        recipient_name: recipientName || undefined,
         recipient_contact: recipientContact || undefined,
         recipient_phone: recipientPhone || undefined,
         recipient_email: recipientEmail || undefined,
@@ -1525,6 +1694,16 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
 
   async function handleSaveServiceName(quoteId: string, value: string) {
     const updated = await updateServiceName(quoteId, value);
+    handleQuoteEdited(updated);
+  }
+
+  async function handleSaveQuoteDate(quoteId: string, value: string) {
+    const updated = await updateQuoteDate(quoteId, value);
+    handleQuoteEdited(updated);
+  }
+
+  async function handleSaveRecipientInfo(quoteId: string, input: RecipientInfoInput) {
+    const updated = await updateRecipientInfo(quoteId, input);
     handleQuoteEdited(updated);
   }
 
@@ -1746,10 +1925,13 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
 
             {viewedQuote && (
               <QuoteCard
+                key={viewedQuote.id}
                 quote={viewedQuote}
                 vatIncluded={result.vat_included}
                 onOpenChat={() => setActiveQuoteId(viewedQuote.id)}
                 onSaveServiceName={(value) => handleSaveServiceName(viewedQuote.id, value)}
+                onSaveQuoteDate={(value) => handleSaveQuoteDate(viewedQuote.id, value)}
+                onSaveRecipientInfo={(input) => handleSaveRecipientInfo(viewedQuote.id, input)}
                 onSaveLineItems={(items) => handleSaveLineItems(viewedQuote.id, items)}
               />
             )}
@@ -1927,7 +2109,8 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
           </div>
           <div>
             <label className="block text-sm text-gray-500">
-              수신자(고객사명) <span className="text-amber-600">(견적서에 &quot;OOO 귀하&quot;로 표시됩니다)</span>
+              수신자(고객사명){" "}
+              <span className="text-gray-400">(선택 — 견적서에 &quot;OOO 귀하&quot;로 표시, 발급 전까지 화면에서 입력 가능)</span>
             </label>
             <input
               type="text"

@@ -12,6 +12,7 @@ from app.models.estimate import EditResult, EntityQuoteOut
 from app.services import pdf_service
 from app.services.allocation_service import AllocatedItem, extract_json
 from app.services.generation_service import _save_version
+from app.services import sync_service
 
 SYSTEM_PROMPT = (
     "아래는 기존 견적 항목이며, 사용자의 수정 요청을 반영해 재배분하세요. "
@@ -84,7 +85,8 @@ def edit_entity_quote(entity_quote_id: str, edit_request_text: str) -> EditResul
         supabase.table("entity_quotes")
         .select(
             "id, entity_id, is_primary, task_type, task_types, line_items, estimate_set_id, selected_modules, "
-            "is_catalog_borrowed, catalog_source_entity_name, service_name, entity_templates(name)"
+            "is_catalog_borrowed, catalog_source_entity_name, service_name, quote_date, "
+            "recipient_name, recipient_contact, recipient_phone, recipient_email, entity_templates(name)"
         )
         .eq("id", entity_quote_id)
         .execute()
@@ -146,6 +148,11 @@ def edit_entity_quote(entity_quote_id: str, edit_request_text: str) -> EditResul
     diff = [i.model_dump() for i in result.changed_items]
     _save_version(entity_quote_id, edit_request_text, diff)
 
+    if quote["is_primary"]:
+        sync_service.sync_comparisons_from_primary(quote["estimate_set_id"], grand_total, vat_included)
+    else:
+        sync_service.update_ratio_from_comparison(entity_quote_id, quote["estimate_set_id"], grand_total)
+
     entity_quote_out = EntityQuoteOut(
         id=quote["id"],
         entity_id=quote["entity_id"],
@@ -158,6 +165,11 @@ def edit_entity_quote(entity_quote_id: str, edit_request_text: str) -> EditResul
         is_catalog_borrowed=quote["is_catalog_borrowed"],
         catalog_source_entity_name=quote["catalog_source_entity_name"],
         service_name=quote["service_name"],
+        quote_date=quote["quote_date"],
+        recipient_name=quote["recipient_name"],
+        recipient_contact=quote["recipient_contact"],
+        recipient_phone=quote["recipient_phone"],
+        recipient_email=quote["recipient_email"],
         **pdf_service.get_column_display(
             supabase, quote["entity_id"], task_types, quote.get("selected_modules")
         ),

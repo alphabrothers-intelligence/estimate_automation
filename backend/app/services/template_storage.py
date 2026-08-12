@@ -1,8 +1,8 @@
 """quote-templates Storage 버킷 접근 헬퍼.
 
 법인 마스터 원본 xlsx/xls의 단일 소스를 로컬 backend/templates/에서 Supabase Storage로
-이관한다(PRD 4.2 "이후 Supabase Storage로 이관" 계획을 실행). template_service(양식
-관리 CRUD)와 pdf_service(견적 발급 시 원본을 읽어 가변 셀만 채움) 양쪽에서 공용으로 쓴다.
+이관한다(PRD 4.2 "이후 Supabase Storage로 이관" 계획을 실행). pdf_service가 견적 발급
+시점에 원본을 읽어 가변 셀만 채우는 데 쓴다.
 """
 
 from typing import Any, Dict

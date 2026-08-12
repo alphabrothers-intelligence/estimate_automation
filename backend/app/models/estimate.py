@@ -1,3 +1,4 @@
+from datetime import date
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -14,7 +15,10 @@ class EntitySelectionIn(BaseModel):
 
 class EstimateSetCreate(BaseModel):
     project_name: str = Field(min_length=1)
-    recipient_name: str = Field(min_length=1)  # 견적서 수신자(고객사명) — 실제 발급 시 "OOO 귀하"에 들어감
+    # 견적서 수신자(고객사명) — 실제 발급 시 "OOO 귀하"에 들어감. 생성 시점엔 선택값이고
+    # 발급 전에만 채우면 된다(발급 시 pdf_service._build_filled_xlsx_from_quote가 검증함,
+    # 2026-08-12 사용자 요청 — 화면에서 나중에 수정 가능).
+    recipient_name: Optional[str] = None
     # ABBG·알파브라더스 양식 전용 칸(cell_map.header_fields의 client_contact/client_phone/client_email) —
     # 다른 법인 양식엔 대응 칸이 없어 그냥 무시된다(pdf_service._collect_header_updates).
     recipient_contact: Optional[str] = None
@@ -56,6 +60,11 @@ class EntityQuoteOut(BaseModel):
     is_catalog_borrowed: bool = False
     catalog_source_entity_name: Optional[str] = None
     service_name: Optional[str] = None
+    quote_date: Optional[str] = None  # ISO date(YYYY-MM-DD) — 견적서 상단 "년/월/일"에 채워지는 값
+    recipient_name: Optional[str] = None
+    recipient_contact: Optional[str] = None
+    recipient_phone: Optional[str] = None
+    recipient_email: Optional[str] = None
     # 법인마다 실제 원본 양식의 컬럼 명칭·순서가 다르다(예: 작업일/소요일, 수량/작업수량) —
     # 미리보기 UI가 이 값 그대로 표시한다(2026-07-10).
     column_labels: Dict[str, str] = Field(default_factory=dict)
@@ -70,6 +79,17 @@ class GenerateRequest(BaseModel):
 
 class ServiceNameUpdate(BaseModel):
     service_name: str = Field(min_length=1)
+
+
+class QuoteDateUpdate(BaseModel):
+    quote_date: date
+
+
+class RecipientInfoUpdate(BaseModel):
+    recipient_name: Optional[str] = None
+    recipient_contact: Optional[str] = None
+    recipient_phone: Optional[str] = None
+    recipient_email: Optional[str] = None
 
 
 class EstimateSetOut(BaseModel):

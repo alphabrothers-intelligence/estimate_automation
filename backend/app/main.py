@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers import catalog, estimates, templates
+from app.routers import catalog, estimates
 from app.services import pdf_service
 
 
@@ -26,7 +26,6 @@ app.add_middleware(
 app.include_router(catalog.router)
 app.include_router(estimates.router)
 app.include_router(estimates.entity_quotes_router)
-app.include_router(templates.router)
 
 
 @app.get("/api/health")

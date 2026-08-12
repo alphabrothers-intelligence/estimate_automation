@@ -35,6 +35,11 @@ export type EntityQuote = {
   is_catalog_borrowed: boolean;
   catalog_source_entity_name: string | null;
   service_name: string | null;
+  quote_date: string | null;
+  recipient_name: string | null;
+  recipient_contact: string | null;
+  recipient_phone: string | null;
+  recipient_email: string | null;
   // 법인마다 실제 원본 양식의 컬럼 명칭·순서가 다르다(예: 작업일/소요일, 수량/작업수량) —
   // 백엔드가 각 법인의 실제 템플릿에서 그대로 계산해 내려준다(2026-07-10).
   column_labels: Record<string, string>;
@@ -91,18 +96,6 @@ export type EstimateSetSummary = {
   entity_names: string[];
 };
 
-export type QuoteTemplateSummary = {
-  entity_id: string;
-  entity_name: string;
-  storage_path: string | null;
-  file_name: string | null;
-  file_size: number | null;
-  updated_at: string | null;
-  is_available: boolean;
-  task_types: string[];
-  sheet_names: string[];
-};
-
 export function getEntityQuotePdfUrl(entityQuoteId: string, options?: { inline?: boolean }): string {
   const suffix = options?.inline ? "?inline=1" : "";
   return `${API_BASE_URL}/api/entity-quotes/${entityQuoteId}/pdf${suffix}`;
@@ -140,26 +133,6 @@ export async function deleteEstimateSet(id: string): Promise<void> {
   }
 }
 
-export async function fetchTemplates(): Promise<QuoteTemplateSummary[]> {
-  const res = await fetch(`${API_BASE_URL}/api/templates`, { cache: "no-store" });
-  return handle<QuoteTemplateSummary[]>(res);
-}
-
-export async function replaceTemplate(entityId: string, file: File): Promise<QuoteTemplateSummary> {
-  const body = new FormData();
-  body.append("file", file);
-  const res = await fetch(`${API_BASE_URL}/api/templates/${entityId}`, { method: "PUT", body });
-  return handle<QuoteTemplateSummary>(res);
-}
-
-export async function deleteTemplate(entityId: string): Promise<void> {
-  const res = await fetch(`${API_BASE_URL}/api/templates/${entityId}`, { method: "DELETE" });
-  if (!res.ok) {
-    const body = await res.json().catch(() => null);
-    throw new ApiError(body?.detail ?? `요청 실패 (${res.status})`);
-  }
-}
-
 export async function fetchEntities(taskType: string): Promise<EntityOption[]> {
   const res = await fetch(
     `${API_BASE_URL}/api/entities?task_type=${encodeURIComponent(taskType)}`
@@ -175,7 +148,7 @@ export type EntitySelectionInput = {
 
 export type CreateEstimateSetInput = {
   project_name: string;
-  recipient_name: string;
+  recipient_name?: string;
   recipient_contact?: string;
   recipient_phone?: string;
   recipient_email?: string;
@@ -255,6 +228,37 @@ export async function updateServiceName(
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ service_name: serviceName }),
+  });
+  return handle<EntityQuote>(res);
+}
+
+export async function updateQuoteDate(
+  entityQuoteId: string,
+  quoteDate: string
+): Promise<EntityQuote> {
+  const res = await fetch(`${API_BASE_URL}/api/entity-quotes/${entityQuoteId}/quote-date`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ quote_date: quoteDate }),
+  });
+  return handle<EntityQuote>(res);
+}
+
+export type RecipientInfoInput = {
+  recipient_name?: string;
+  recipient_contact?: string;
+  recipient_phone?: string;
+  recipient_email?: string;
+};
+
+export async function updateRecipientInfo(
+  entityQuoteId: string,
+  input: RecipientInfoInput
+): Promise<EntityQuote> {
+  const res = await fetch(`${API_BASE_URL}/api/entity-quotes/${entityQuoteId}/recipient-info`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
   });
   return handle<EntityQuote>(res);
 }

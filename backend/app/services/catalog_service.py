@@ -176,14 +176,22 @@ def get_module_options(entity_id: str, entity_name: str, task_type: str) -> Tupl
             _make_option(ag, mods, is_default=alt_group_is_default.get(ag, False))
             for ag, mods in alt_group_modules.items()
         ]
-        if options and not any(o.is_default for o in options):
-            options[0].is_default = True
-        # "광고형"/"네이버쇼핑형"/"카카오톡스토어형"(광고 대행 상품 3종, 027/028 마이그레이션)이
-        # 서로 배타적인 대안이라 variant 그룹이 되는데, 화면에는 아무 제목도 안 붙어 있었다.
-        # 이 3개짜리 조합일 때만 전용 제목을 붙인다 — 다른 법인·과업의 variant 그룹(예: 시장검증
-        # 서베이형/표준형)까지 이 제목으로 덮어쓰면 안 되므로 alt_group 이름 자체로 판별한다.
-        label = "광고·마케팅 대행" if set(alt_group_modules) == _AD_AGENCY_ALT_GROUPS else None
-        groups.append(ModuleGroup(kind="variant", options=options, label=label))
+        if task_type == "시장검증":
+            # 사용자 결정(2026-08-11): 시장검증 세부 항목(통합 패키지/FGI/사용성/기술성/시장성
+            # 테스트)은 서로 배타적인 대안이 아니라 다수 선택 가능해야 한다 — alt_group으로
+            # 나뉜 그룹이라도 variant(택1 라디오) 대신 additive(체크박스)로 노출한다.
+            for o in options:
+                o.is_default = False
+            groups.append(ModuleGroup(kind="additive", options=options))
+        else:
+            if options and not any(o.is_default for o in options):
+                options[0].is_default = True
+            # "광고형"/"네이버쇼핑형"/"카카오톡스토어형"(광고 대행 상품 3종, 027/028 마이그레이션)이
+            # 서로 배타적인 대안이라 variant 그룹이 되는데, 화면에는 아무 제목도 안 붙어 있었다.
+            # 이 3개짜리 조합일 때만 전용 제목을 붙인다 — 다른 법인·과업의 variant 그룹(예: 시장검증
+            # 서베이형/표준형)까지 이 제목으로 덮어쓰면 안 되므로 alt_group 이름 자체로 판별한다.
+            label = "광고·마케팅 대행" if set(alt_group_modules) == _AD_AGENCY_ALT_GROUPS else None
+            groups.append(ModuleGroup(kind="variant", options=options, label=label))
 
     return len(groups) > 0, groups
 

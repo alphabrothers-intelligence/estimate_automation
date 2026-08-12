@@ -122,6 +122,7 @@ def _generate_one_quote(quote: dict, estimate_set: dict, selections: Dict[str, L
             "is_catalog_borrowed": is_catalog_borrowed,
             "catalog_source_entity_name": catalog_source_entity_name,
             "selected_modules": selected_modules,
+            "markup_ratio": None if quote["is_primary"] else (1 + COMPARISON_MARKUP),
         }
     ).eq("id", quote["id"]).execute()
 

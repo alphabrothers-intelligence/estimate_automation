@@ -12,6 +12,8 @@ from app.models.estimate import (
     GenerateRequest,
     EntityQuoteOut,
     LineItemsUpdate,
+    QuoteDateUpdate,
+    RecipientInfoUpdate,
     ServiceNameUpdate,
 )
 from app.services import estimate_service, generation_service, pdf_service
@@ -59,6 +61,16 @@ def edit_entity_quote(entity_quote_id: str, payload: EditRequest):
 @entity_quotes_router.patch("/{entity_quote_id}/service-name", response_model=EntityQuoteOut)
 def update_service_name(entity_quote_id: str, payload: ServiceNameUpdate):
     return estimate_service.update_service_name(entity_quote_id, payload.service_name)
+
+
+@entity_quotes_router.patch("/{entity_quote_id}/quote-date", response_model=EntityQuoteOut)
+def update_quote_date(entity_quote_id: str, payload: QuoteDateUpdate):
+    return estimate_service.update_quote_date(entity_quote_id, payload.quote_date)
+
+
+@entity_quotes_router.patch("/{entity_quote_id}/recipient-info", response_model=EntityQuoteOut)
+def update_recipient_info(entity_quote_id: str, payload: RecipientInfoUpdate):
+    return estimate_service.update_recipient_info(entity_quote_id, payload)
 
 
 @entity_quotes_router.put("/{entity_quote_id}/line-items", response_model=EntityQuoteOut)

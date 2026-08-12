@@ -5,10 +5,11 @@ from fastapi import HTTPException
 
 from app.config import get_supabase
 from app.models.catalog import EntityModuleOptions
-from app.models.estimate import EntityQuoteOut, EstimateSetCreate, EstimateSetOut, EstimateSetSummary, LineItemIn
+from app.models.estimate import EntityQuoteOut, EstimateSetCreate, EstimateSetOut, EstimateSetSummary, LineItemIn, RecipientInfoUpdate
 from app.services import catalog_service, pdf_service
 from app.services.catalog_service import EXCLUDED_ENTITIES_BY_TASK_TYPE
 from app.services.generation_service import _save_version
+from app.services import sync_service
 
 TESTIFY_NAME = "테스티파이"  # service_name(용역명) 필드는 이 법인 템플릿에만 존재 (010_seed_quote_templates.sql)
 
@@ -126,6 +127,11 @@ def create_estimate_set(payload: EstimateSetCreate) -> EstimateSetOut:
             task_type=row["task_type"],
             task_types=row["task_types"],
             service_name=row["service_name"],
+            quote_date=row["quote_date"],
+            recipient_name=row["recipient_name"],
+            recipient_contact=row["recipient_contact"],
+            recipient_phone=row["recipient_phone"],
+            recipient_email=row["recipient_email"],
             **pdf_service.get_column_display(supabase, row["entity_id"], row["task_types"], None),
         )
         for row in quotes_res.data
@@ -153,7 +159,8 @@ def get_estimate_set(estimate_set_id: str) -> EstimateSetOut:
         supabase.table("entity_quotes")
         .select(
             "id, entity_id, is_primary, task_type, task_types, total_amount, line_items, selected_modules, "
-            "is_catalog_borrowed, catalog_source_entity_name, service_name, entity_templates(name)"
+            "is_catalog_borrowed, catalog_source_entity_name, service_name, quote_date, "
+            "recipient_name, recipient_contact, recipient_phone, recipient_email, entity_templates(name)"
         )
         .eq("estimate_set_id", estimate_set_id)
         .execute()
@@ -171,6 +178,11 @@ def get_estimate_set(estimate_set_id: str) -> EstimateSetOut:
             is_catalog_borrowed=row["is_catalog_borrowed"],
             catalog_source_entity_name=row["catalog_source_entity_name"],
             service_name=row["service_name"],
+            quote_date=row["quote_date"],
+            recipient_name=row["recipient_name"],
+            recipient_contact=row["recipient_contact"],
+            recipient_phone=row["recipient_phone"],
+            recipient_email=row["recipient_email"],
             **pdf_service.get_column_display(
                 supabase, row["entity_id"], row["task_types"], row.get("selected_modules")
             ),
@@ -231,7 +243,8 @@ def update_service_name(entity_quote_id: str, service_name: str) -> EntityQuoteO
         supabase.table("entity_quotes")
         .select(
             "id, entity_id, is_primary, task_type, task_types, total_amount, line_items, selected_modules, "
-            "is_catalog_borrowed, catalog_source_entity_name, entity_templates(name)"
+            "is_catalog_borrowed, catalog_source_entity_name, quote_date, "
+            "recipient_name, recipient_contact, recipient_phone, recipient_email, entity_templates(name)"
         )
         .eq("id", entity_quote_id)
         .execute()
@@ -257,6 +270,100 @@ def update_service_name(entity_quote_id: str, service_name: str) -> EntityQuoteO
         is_catalog_borrowed=quote["is_catalog_borrowed"],
         catalog_source_entity_name=quote["catalog_source_entity_name"],
         service_name=service_name,
+        quote_date=quote["quote_date"],
+        recipient_name=quote["recipient_name"],
+        recipient_contact=quote["recipient_contact"],
+        recipient_phone=quote["recipient_phone"],
+        recipient_email=quote["recipient_email"],
+        **pdf_service.get_column_display(
+            supabase, quote["entity_id"], quote["task_types"], quote.get("selected_modules")
+        ),
+    )
+
+
+def update_quote_date(entity_quote_id: str, quote_date: date) -> EntityQuoteOut:
+    """견적서의 '견적일자'(년/월/일)를 직접 수정한다 — 발급 후에도 채팅 없이 바로 고칠 수 있는
+    전용 입력칸이 필요하다는 사용자 요청(2026-08-11)."""
+    supabase = get_supabase()
+    quote_res = (
+        supabase.table("entity_quotes")
+        .select(
+            "id, entity_id, is_primary, task_type, task_types, total_amount, line_items, selected_modules, "
+            "is_catalog_borrowed, catalog_source_entity_name, service_name, "
+            "recipient_name, recipient_contact, recipient_phone, recipient_email, entity_templates(name)"
+        )
+        .eq("id", entity_quote_id)
+        .execute()
+    )
+    if not quote_res.data:
+        raise HTTPException(status_code=404, detail="견적서를 찾을 수 없습니다.")
+    quote = quote_res.data[0]
+
+    quote_date_str = quote_date.isoformat()
+    supabase.table("entity_quotes").update({"quote_date": quote_date_str}).eq("id", entity_quote_id).execute()
+
+    return EntityQuoteOut(
+        id=quote["id"],
+        entity_id=quote["entity_id"],
+        entity_name=quote["entity_templates"]["name"],
+        is_primary=quote["is_primary"],
+        task_type=quote["task_type"],
+        task_types=quote["task_types"],
+        total_amount=float(quote["total_amount"]),
+        line_items=quote["line_items"] or [],
+        is_catalog_borrowed=quote["is_catalog_borrowed"],
+        catalog_source_entity_name=quote["catalog_source_entity_name"],
+        service_name=quote["service_name"],
+        quote_date=quote_date_str,
+        recipient_name=quote["recipient_name"],
+        recipient_contact=quote["recipient_contact"],
+        recipient_phone=quote["recipient_phone"],
+        recipient_email=quote["recipient_email"],
+        **pdf_service.get_column_display(
+            supabase, quote["entity_id"], quote["task_types"], quote.get("selected_modules")
+        ),
+    )
+
+
+def update_recipient_info(entity_quote_id: str, payload: RecipientInfoUpdate) -> EntityQuoteOut:
+    """견적서의 수신자(고객사명)/담당자/연락처/이메일을 발급 후에도 화면에서 바로 고친다
+    (2026-08-12 사용자 요청 — 생성 시점엔 선택값이라 나중에 채우거나 수정할 수 있어야 함)."""
+    supabase = get_supabase()
+    quote_res = (
+        supabase.table("entity_quotes")
+        .select(
+            "id, entity_id, is_primary, task_type, task_types, total_amount, line_items, selected_modules, "
+            "is_catalog_borrowed, catalog_source_entity_name, service_name, quote_date, "
+            "recipient_name, recipient_contact, recipient_phone, recipient_email, entity_templates(name)"
+        )
+        .eq("id", entity_quote_id)
+        .execute()
+    )
+    if not quote_res.data:
+        raise HTTPException(status_code=404, detail="견적서를 찾을 수 없습니다.")
+    quote = quote_res.data[0]
+
+    update_fields = payload.model_dump(exclude_unset=True)
+    supabase.table("entity_quotes").update(update_fields).eq("id", entity_quote_id).execute()
+    quote.update(update_fields)
+
+    return EntityQuoteOut(
+        id=quote["id"],
+        entity_id=quote["entity_id"],
+        entity_name=quote["entity_templates"]["name"],
+        is_primary=quote["is_primary"],
+        task_type=quote["task_type"],
+        task_types=quote["task_types"],
+        total_amount=float(quote["total_amount"]),
+        line_items=quote["line_items"] or [],
+        is_catalog_borrowed=quote["is_catalog_borrowed"],
+        catalog_source_entity_name=quote["catalog_source_entity_name"],
+        service_name=quote["service_name"],
+        quote_date=quote["quote_date"],
+        recipient_name=quote["recipient_name"],
+        recipient_contact=quote["recipient_contact"],
+        recipient_phone=quote["recipient_phone"],
+        recipient_email=quote["recipient_email"],
         **pdf_service.get_column_display(
             supabase, quote["entity_id"], quote["task_types"], quote.get("selected_modules")
         ),
@@ -276,7 +383,8 @@ def update_line_items(entity_quote_id: str, items: List[LineItemIn]) -> EntityQu
         supabase.table("entity_quotes")
         .select(
             "id, entity_id, is_primary, task_type, task_types, selected_modules, estimate_set_id, "
-            "is_catalog_borrowed, catalog_source_entity_name, service_name, entity_templates(name)"
+            "is_catalog_borrowed, catalog_source_entity_name, service_name, quote_date, "
+            "recipient_name, recipient_contact, recipient_phone, recipient_email, entity_templates(name)"
         )
         .eq("id", entity_quote_id)
         .execute()
@@ -299,6 +407,11 @@ def update_line_items(entity_quote_id: str, items: List[LineItemIn]) -> EntityQu
 
     _save_version(entity_quote_id, "직접편집", new_line_items)
 
+    if quote["is_primary"]:
+        sync_service.sync_comparisons_from_primary(quote["estimate_set_id"], grand_total, vat_included)
+    else:
+        sync_service.update_ratio_from_comparison(entity_quote_id, quote["estimate_set_id"], grand_total)
+
     return EntityQuoteOut(
         id=quote["id"],
         entity_id=quote["entity_id"],
@@ -311,6 +424,11 @@ def update_line_items(entity_quote_id: str, items: List[LineItemIn]) -> EntityQu
         is_catalog_borrowed=quote["is_catalog_borrowed"],
         catalog_source_entity_name=quote["catalog_source_entity_name"],
         service_name=quote["service_name"],
+        quote_date=quote["quote_date"],
+        recipient_name=quote["recipient_name"],
+        recipient_contact=quote["recipient_contact"],
+        recipient_phone=quote["recipient_phone"],
+        recipient_email=quote["recipient_email"],
         **pdf_service.get_column_display(
             supabase, quote["entity_id"], quote["task_types"], quote.get("selected_modules")
         ),
