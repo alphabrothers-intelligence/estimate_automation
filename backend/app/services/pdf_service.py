@@ -449,9 +449,13 @@ def _normalize_block_row_heights(sheet_xml: str, item_blocks: List[dict], update
             continue
         base_height = Counter(heights).most_common(1)[0][0]
         max_lines = max((lines_by_row.get(r, 1) for r in rows), default=1)
-        # ponytail: 줄당 높이를 base_height로 근사(폰트 크기·자간 기반 정밀 측정 아님) —
-        # 실제로 줄바꿈 셀이 잘리는 사례가 나오면 폰트 메트릭 기반 계산으로 교체.
-        block_height = base_height * max_lines
+        # base_height를 줄당 높이로 보고 곱하면(예전 방식) 알파브라더스처럼 애초에 여러 줄을
+        # 감안해 크게 잡아둔 마스터(ht=150, 2026-08-13 발견)에서 150*4줄=600처럼 터무니없이
+        # 커져 fit-to-page가 전체를 확 축소해버린다. base_height는 "이미 확보된 여유"로 보고,
+        # 실제 필요한 높이(줄당 16pt 근사치 × 줄수)가 그걸 넘을 때만 키운다.
+        # ponytail: 16pt는 폰트 크기·자간 기반 정밀 측정 아닌 고정 근사치 — 줄바꿈 셀이 잘리는
+        # 사례가 나오면 폰트 메트릭 기반 계산으로 교체.
+        block_height = max(base_height, 16 * max_lines)
         for row in rows:
             target_height_by_row[row] = block_height
 
@@ -828,7 +832,13 @@ def _assign_groups_to_blocks(groups: List[Dict[str, Any]], blocks: List[dict], c
     때만 쓰는 최후 수단이 아니라 이 양식들의 기본 표시 방식이라 여기서 먼저 적용해 둔다.
     """
     if columns.get("description"):
-        groups = _rollup_to_category_totals(groups)
+        # 항목 자체에 이미 개별 description이 있는 그룹(예: 통합 패키지의 5개 하위 모듈,
+        # 마이그레이션 008/032)은 접지 않고 그대로 여러 줄로 배정한다 — 롤업은 항목에
+        # description이 없는 마케팅류 카탈로그(PRD 6.2)에만 적용되는 최후 수단이다.
+        groups = [
+            g if any(it.get("description") for it in g["items"]) else _rollup_to_category_totals([g])[0]
+            for g in groups
+        ]
 
     labeled_blocks = [b for b in blocks if b.get("category_label_cell")]
     flat_blocks = [b for b in blocks if not b.get("category_label_cell")]
