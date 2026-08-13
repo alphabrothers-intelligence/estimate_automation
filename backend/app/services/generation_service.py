@@ -77,12 +77,16 @@ def _generate_one_quote(quote: dict, estimate_set: dict, selections: Dict[str, L
     # 교차 선택한 과업종류마다 카탈로그를 따로 가져와 하나로 합친다 — (module_name, item_name)
     # 조합으로 어느 과업종류 항목인지 기억해 둔다(allocate_items 결과에 나중에 다시 붙이려고,
     # allocation_service.py의 description 재부착 방식과 동일한 패턴).
+    # 과업종류 교차선택 시 "둘 다 고를 필요는 없다"(위저드 3단계 안내문구) — 그래서 개별
+    # 과업종류의 items가 비어 있는 것 자체는 에러가 아니다(이번엔 그 과업종류에서 모듈을
+    # 안 골랐을 뿐). 진짜 에러는 (a) 그 법인×과업종류에 카탈로그 행 자체가 없거나(has_catalog),
+    # (b) 선택된 과업종류 전부 합쳐도 항목이 하나도 없는 경우(둘 다 안 고른 경우)뿐이다.
     catalog_items = []
     task_type_by_key: Dict[tuple, str] = {}
     borrowed: List[tuple] = []
     for task_type in task_types:
         catalog = get_catalog_for_generation(quote["entity_id"], entity_name, task_type, selected_modules)
-        if not catalog.items:
+        if not catalog.has_catalog:
             raise HTTPException(
                 status_code=422,
                 detail=f"{entity_name}의 '{task_type}' 카탈로그를 찾을 수 없습니다 (차용 대상도 없음).",
@@ -92,6 +96,12 @@ def _generate_one_quote(quote: dict, estimate_set: dict, selections: Dict[str, L
         catalog_items += catalog.items
         if catalog.is_borrowed:
             borrowed.append((task_type, catalog.source_entity_name))
+
+    if not catalog_items:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{entity_name}의 {'/'.join(task_types)} 중 선택된 세부 항목이 없습니다 — 최소 한 과업종류에서 항목을 하나 이상 골라주세요.",
+        )
 
     allocation = allocate_items(catalog_items, target_amount, estimate_set["vat_included"])
     is_catalog_borrowed = bool(borrowed)

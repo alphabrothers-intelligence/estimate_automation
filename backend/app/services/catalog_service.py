@@ -77,7 +77,12 @@ def _resolve_catalog_rows(entity_id: str, entity_name: str, task_type: str) -> T
     source_name = entity_name
 
     if not rows:
-        source_name = FALLBACK_SOURCE_BY_TASK_TYPE.get(task_type)
+        # FALLBACK_SOURCE_BY_TASK_TYPE에 없는 과업종류(예: 고객검증)는 차용 대상이 아예 없다 —
+        # 이 경우도 source_name이 entity_name으로 남아 있어야 CatalogResult(source_entity_name:
+        # str, not-null) 생성이 깨지지 않는다(전엔 None이 되어 카탈로그 없음 422 대신 500이 났음).
+        fallback_source = FALLBACK_SOURCE_BY_TASK_TYPE.get(task_type)
+        if fallback_source:
+            source_name = fallback_source
         if source_name and source_name != entity_name:
             supabase = get_supabase()
             source_res = (
@@ -235,4 +240,4 @@ def get_catalog_for_generation(
         )
         for r in filtered_rows
     ]
-    return CatalogResult(items=items, is_borrowed=is_borrowed, source_entity_name=source_name)
+    return CatalogResult(items=items, is_borrowed=is_borrowed, source_entity_name=source_name, has_catalog=bool(rows))

@@ -38,13 +38,11 @@ class EstimateSetCreate(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def primary_and_comparison_limits(self) -> "EstimateSetCreate":
+    def primary_limit(self) -> "EstimateSetCreate":
+        # 비교견적서는 개수 제한 없음(2026-08-12 사용자 결정 — PRD 3.2/4.3의 1~3개 상한 폐기).
         primaries = [e for e in self.entities if e.is_primary]
-        comparisons = [e for e in self.entities if not e.is_primary]
         if len(primaries) > 1:
             raise ValueError("본견적서 법인은 최대 1곳만 선택할 수 있습니다.")
-        if len(comparisons) > 3:
-            raise ValueError("비교견적서 법인은 최대 3곳까지 선택할 수 있습니다.")
         return self
 
 

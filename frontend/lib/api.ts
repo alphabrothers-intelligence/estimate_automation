@@ -107,10 +107,21 @@ export function getEntityQuoteXlsxUrl(entityQuoteId: string): string {
 
 export class ApiError extends Error {}
 
+// FastAPI 검증 에러(422)의 detail은 문자열이 아니라 {msg, loc, ...} 객체 배열로 온다 —
+// 그대로 Error 메시지로 넘기면 "[object Object]"로 깨져서 그 형태도 처리해야 한다.
+function detailToMessage(detail: unknown, status: number): string {
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    const msgs = detail.map((d) => (d && typeof d === "object" && "msg" in d ? String(d.msg) : String(d)));
+    if (msgs.length > 0) return msgs.join(", ");
+  }
+  return `요청 실패 (${status})`;
+}
+
 async function handle<T>(res: Response): Promise<T> {
   if (!res.ok) {
     const body = await res.json().catch(() => null);
-    throw new ApiError(body?.detail ?? `요청 실패 (${res.status})`);
+    throw new ApiError(detailToMessage(body?.detail, res.status));
   }
   return res.json();
 }
@@ -129,7 +140,7 @@ export async function deleteEstimateSet(id: string): Promise<void> {
   const res = await fetch(`${API_BASE_URL}/api/estimate-sets/${id}`, { method: "DELETE" });
   if (!res.ok) {
     const body = await res.json().catch(() => null);
-    throw new ApiError(body?.detail ?? `요청 실패 (${res.status})`);
+    throw new ApiError(detailToMessage(body?.detail, res.status));
   }
 }
 

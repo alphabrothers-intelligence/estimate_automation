@@ -20,6 +20,8 @@ class CatalogResult(BaseModel):
     items: list[CatalogItem]
     is_borrowed: bool
     source_entity_name: str
+    has_catalog: bool = True  # False면 이 법인×과업종류 자체에 카탈로그 행이 없다(차용 대상도 없음) —
+    # items가 비어 있어도 has_catalog=True면 단지 이번에 선택된 모듈이 없을 뿐, 데이터 자체는 존재한다.
 
 
 class ModuleItemGroup(BaseModel):

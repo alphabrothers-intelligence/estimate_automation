@@ -38,7 +38,6 @@ function hashKey(value: unknown): string {
   return hash.toString(36);
 }
 
-const MAX_COMPARISON = 3;
 const TESTIFY_NAME = "테스티파이"; // '용역명' 필드는 테스티파이 템플릿에만 있음 (4.2)
 
 // 2026-08 마법사 개편: 기업을 먼저 고르고 과업(마케팅/시장검증)을 나중에, 기업별로 교차
@@ -175,12 +174,16 @@ function LabeledInlineField({
   label,
   value,
   placeholder,
+  type = "text",
+  autoComplete,
   required = false,
   onSave,
 }: {
   label: string;
   value: string;
   placeholder: string;
+  type?: "text" | "tel" | "email";
+  autoComplete?: string;
   required?: boolean;
   onSave: (value: string) => Promise<void>;
 }) {
@@ -204,10 +207,15 @@ function LabeledInlineField({
   }
 
   return (
-    <div className="mt-2 flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
-      <span className="shrink-0 text-sm font-medium text-gray-500">{label} :</span>
+    <label className="block min-w-0" onClick={(e) => e.stopPropagation()}>
+      <span className="mb-1.5 flex items-center gap-1 text-xs font-semibold text-slate-600">
+        {label}
+        {required && <span className="text-indigo-600">필수</span>}
+      </span>
+      <div className="relative">
       <input
-        type="text"
+        type={type}
+        autoComplete={autoComplete}
         value={draft}
         disabled={saving}
         onChange={(e) => setDraft(e.target.value)}
@@ -215,13 +223,17 @@ function LabeledInlineField({
         onKeyDown={(e) => e.key === "Enter" && handleSave()}
         placeholder={placeholder}
         className={
-          "flex-1 rounded-md border px-2 py-1 text-sm focus:border-indigo-500 focus:outline-none " +
-          (required && !value ? "border-amber-300 bg-amber-50" : "border-gray-300")
+          "h-11 w-full rounded-xl border bg-white px-3.5 pr-16 text-sm text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-indigo-500 focus:ring-4 focus:ring-indigo-100 " +
+          (required && !draft.trim() ? "border-amber-300" : "border-slate-200 hover:border-slate-300")
         }
       />
-      {saving && <span className="shrink-0 text-xs text-gray-400">저장 중…</span>}
-      {errorMsg && <p className="text-sm text-red-600">{errorMsg}</p>}
-    </div>
+      {saving && <span className="absolute right-3 top-3 text-xs text-slate-400">저장 중…</span>}
+      {!saving && value && draft.trim() === value && (
+        <span className="absolute right-3 top-2.5 flex h-6 w-6 items-center justify-center rounded-full bg-emerald-50 text-emerald-600" aria-label="저장됨">✓</span>
+      )}
+      </div>
+      {errorMsg && <span className="mt-1 block text-xs text-red-600">{errorMsg}</span>}
+    </label>
   );
 }
 
@@ -256,7 +268,7 @@ function RecipientInfoFields({
   onSave: (input: RecipientInfoInput) => Promise<void>;
 }) {
   return (
-    <>
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
       <LabeledInlineField
         label="수신자"
         value={quote.recipient_name ?? ""}
@@ -276,17 +288,21 @@ function RecipientInfoFields({
             label="연락처"
             value={quote.recipient_phone ?? ""}
             placeholder="연락처"
+            type="tel"
+            autoComplete="tel"
             onSave={(value) => onSave({ recipient_phone: value })}
           />
           <LabeledInlineField
             label="이메일"
             value={quote.recipient_email ?? ""}
             placeholder="이메일"
+            type="email"
+            autoComplete="email"
             onSave={(value) => onSave({ recipient_email: value })}
           />
         </>
       )}
-    </>
+    </div>
   );
 }
 
@@ -314,17 +330,22 @@ function QuoteDateField({
   }
 
   return (
-    <div className="mt-2 flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
+    <label className="block min-w-0" onClick={(e) => e.stopPropagation()}>
+      <span className="mb-1.5 flex items-center gap-1 text-xs font-semibold text-slate-600">
+        작성일 <span className="text-indigo-600">필수</span>
+      </span>
+      <div className="relative">
       <input
         type="date"
         defaultValue={quote.quote_date ?? ""}
         disabled={saving}
         onChange={(e) => handleChange(e.target.value)}
-        className="rounded-md border border-gray-300 px-2 py-1 text-sm focus:border-indigo-500 focus:outline-none"
+        className="h-11 w-full rounded-xl border border-slate-200 bg-white px-3.5 text-sm text-slate-900 outline-none transition hover:border-slate-300 focus:border-indigo-500 focus:ring-4 focus:ring-indigo-100"
       />
-      {saving && <span className="shrink-0 text-xs text-gray-400">저장 중…</span>}
-      {errorMsg && <p className="text-sm text-red-600">{errorMsg}</p>}
-    </div>
+      {saving && <span className="absolute right-10 top-3 text-xs text-slate-400">저장 중…</span>}
+      </div>
+      {errorMsg && <span className="mt-1 block text-xs text-red-600">{errorMsg}</span>}
+    </label>
   );
 }
 
@@ -1044,19 +1065,20 @@ function QuoteCard({
     // 내용(왼쪽, 편집)과 뷰어(오른쪽, 실제 양식)를 나란히 둔다 — 이전엔 편집 표 밑에 800px
     // iframe이 이어져서 미리보기를 보려면 한참 스크롤해야 했고, 수정할 때마다 표와 미리보기를
     // 번갈아 스크롤해야 했다. 뷰어는 sticky라 편집 중에도 계속 눈에 보인다.
-    <div className="grid grid-cols-1 gap-6 xl:grid-cols-[3fr_2fr] xl:items-start">
-      <div className="rounded-2xl border-2 border-indigo-600 bg-white p-6 shadow-md">
-        <div className="flex items-start justify-between gap-3">
+    <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,3fr)_minmax(360px,2fr)] xl:items-start">
+      <div className="overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-sm">
+        <div className="border-b border-slate-100 px-6 py-5">
+          <div className="flex items-start justify-between gap-4">
           <div>
             <div className="flex flex-wrap items-center gap-2">
               <span
                 className={
                   quote.is_primary
-                    ? "rounded-full bg-indigo-600 px-3 py-1 text-sm font-semibold text-white"
-                    : "rounded-full bg-gray-200 px-3 py-1 text-sm font-medium text-gray-700"
+                    ? "rounded-full bg-indigo-600 px-3 py-1 text-xs font-bold text-white"
+                    : "rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-600"
                 }
               >
-                {quote.is_primary ? "본견적" : "비교견적"}
+                {quote.is_primary ? "본견적서" : "비교견적서"}
               </span>
               {quote.is_catalog_borrowed && (
                 <span
@@ -1067,23 +1089,44 @@ function QuoteCard({
                 </span>
               )}
             </div>
-            <p className="mt-2 text-2xl font-bold text-gray-900">{quote.entity_name}</p>
+            <p className="mt-2 text-2xl font-bold tracking-tight text-slate-950">{quote.entity_name}</p>
+            <p className="mt-1 text-sm text-slate-500">아래 정보를 입력하면 실제 견적서에 바로 반영됩니다.</p>
+          </div>
+          <div className="text-right">
+            <p className="text-xs font-medium text-slate-400">견적 금액</p>
+            <p className="mt-1 whitespace-nowrap text-3xl font-bold tracking-tight text-slate-950">
+              {quote.total_amount.toLocaleString()}
+              <span className="ml-0.5 text-base font-medium text-slate-400">원</span>
+            </p>
+          </div>
+          </div>
+        </div>
+
+        <div className="border-b border-slate-100 bg-slate-50/70 px-6 py-5">
+          <div className="mb-4 flex items-center justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-bold text-slate-900">견적서 발급 정보</h3>
+              <p className="mt-0.5 text-xs text-slate-500">입력 후 다른 곳을 누르면 자동 저장됩니다.</p>
+            </div>
+            <span className="rounded-full bg-white px-2.5 py-1 text-[11px] font-medium text-slate-500 ring-1 ring-slate-200">자동 저장</span>
+          </div>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <QuoteDateField quote={quote} onSave={onSaveQuoteDate} />
             {quote.entity_name === TESTIFY_NAME && (
               <ServiceNameField quote={quote} onSave={onSaveServiceName} />
             )}
-            <QuoteDateField quote={quote} onSave={onSaveQuoteDate} />
-            <RecipientInfoFields quote={quote} onSave={onSaveRecipientInfo} />
           </div>
-          <div className="text-right">
-            <p className="whitespace-nowrap text-3xl font-bold text-indigo-700">
-              {quote.total_amount.toLocaleString()}
-              <span className="ml-0.5 text-base font-medium text-gray-400">원</span>
-            </p>
+          <div className="mt-3">
+            <RecipientInfoFields quote={quote} onSave={onSaveRecipientInfo} />
           </div>
         </div>
 
         {quote.line_items.length > 0 ? (
-          <div className="mt-4">
+          <div className="px-6 py-5">
+            <div className="mb-3 flex items-center justify-between">
+              <h3 className="text-sm font-bold text-slate-900">견적 항목</h3>
+              <span className="text-xs text-slate-400">항목을 눌러 직접 수정할 수 있습니다.</span>
+            </div>
             <LineItemTable
               items={quote.line_items}
               columnLabels={quote.column_labels}
@@ -1095,27 +1138,27 @@ function QuoteCard({
             />
           </div>
         ) : (
-          <p className="mt-4 text-sm text-gray-400">아직 항목이 생성되지 않았습니다.</p>
+          <p className="px-6 py-8 text-sm text-gray-400">아직 항목이 생성되지 않았습니다.</p>
         )}
 
         {quote.line_items.length > 0 && (
-          <div className="mt-5 flex flex-wrap gap-2">
+          <div className="flex flex-wrap gap-2 border-t border-slate-100 px-6 py-5">
             <button
               type="button"
               onClick={onOpenChat}
-              className="rounded-full bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-500"
+              className="rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-indigo-500"
             >
               채팅으로 수정
             </button>
             <a
               href={getEntityQuotePdfUrl(quote.id)}
-              className="rounded-full border border-indigo-300 px-4 py-2 text-sm font-semibold text-indigo-700 hover:border-indigo-400"
+              className="rounded-xl border border-slate-200 px-4 py-2.5 text-sm font-semibold text-slate-700 transition hover:border-slate-300 hover:bg-slate-50"
             >
               PDF 다운로드
             </a>
             <a
               href={getEntityQuoteXlsxUrl(quote.id)}
-              className="rounded-full border border-indigo-300 px-4 py-2 text-sm font-semibold text-indigo-700 hover:border-indigo-400"
+              className="rounded-xl border border-slate-200 px-4 py-2.5 text-sm font-semibold text-slate-700 transition hover:border-slate-300 hover:bg-slate-50"
             >
               엑셀 다운로드
             </a>
@@ -1139,14 +1182,16 @@ function QuotePreviewPane({ quote }: { quote: EntityQuote }) {
     service: quote.service_name,
     date: quote.quote_date,
   });
-  const loadedKeysRef = useRef<Set<string>>(new Set());
-  const [, forceRerender] = useState(0);
-  const loading = !loadedKeysRef.current.has(previewKey);
+  const [loadedKey, setLoadedKey] = useState<string | null>(null);
+  const loading = loadedKey !== previewKey;
 
   return (
-    <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
-      <div className="mb-2 flex items-center justify-between">
-        <p className="text-xs font-semibold text-gray-400">실제 양식 미리보기</p>
+    <div className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div>
+          <p className="text-sm font-bold text-slate-900">{quote.is_primary ? "본견적서" : "비교견적서"} 미리보기</p>
+          <p className="mt-0.5 text-xs text-slate-400">실제 발급되는 양식입니다.</p>
+        </div>
         {loading && <p className="text-xs text-indigo-500">최신 수정 내용 반영 중…</p>}
       </div>
       <div className="relative aspect-[1/1.4142] max-h-[calc(100vh-8rem)] w-full overflow-hidden rounded-lg border border-gray-200">
@@ -1162,8 +1207,7 @@ function QuotePreviewPane({ quote }: { quote: EntityQuote }) {
           title={`${quote.entity_name} 견적서 미리보기`}
           className="h-full w-full"
           onLoad={() => {
-            loadedKeysRef.current.add(previewKey);
-            forceRerender((n) => n + 1);
+            setLoadedKey(previewKey);
           }}
         />
       </div>
@@ -1365,6 +1409,28 @@ function moduleNamesMatchingLabels(referenceLabels: string[], options: CatalogMo
   return names;
 }
 
+// additive(체크박스) 선택도 대상 기업에 그대로 반영한다 — 라벨(상품명)이 같은 항목을 대상
+// 기업 카탈로그에서 찾아 그대로 쓰고, 없으면(그 기업엔 해당 상품이 없음) 그 항목만 건너뛴다.
+// 예전엔 additive 그룹 자체를 건너뛰어서(kind !== "variant" 체크) 기준 기업이 체크박스 상품을
+// 골라도 나머지 기업엔 하나도 전파되지 않았다 — 시장검증은 전부 additive라 이 과업을 고른
+// 비교견적 기업이 전부 "선택한 항목 없음" 상태로 남아 발급이 막히는 원인이었다(2026-08-12).
+function additiveModuleNamesMatchingLabels(
+  refModuleNames: string[],
+  refOptions: CatalogModuleOptions | undefined,
+  targetOptions: CatalogModuleOptions | undefined
+): string[] {
+  const refAdditiveOptions = (refOptions?.groups ?? []).filter((g) => g.kind === "additive").flatMap((g) => g.options);
+  const targetAdditiveOptions = (targetOptions?.groups ?? []).filter((g) => g.kind === "additive").flatMap((g) => g.options);
+  const names: string[] = [];
+  for (const option of refAdditiveOptions) {
+    const checked = option.module_names.every((m) => refModuleNames.includes(m));
+    if (!checked) continue;
+    const match = targetAdditiveOptions.find((o) => o.label === option.label);
+    if (match) names.push(...match.module_names);
+  }
+  return names;
+}
+
 export default function EstimateWizard({ initialEstimateSetId }: { initialEstimateSetId?: string } = {}) {
   const [entities, setEntities] = useState<EntityOption[]>([]);
   const [entitiesLoading, setEntitiesLoading] = useState(true);
@@ -1478,8 +1544,9 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
       const refOptions = moduleOptionsCache[`${referenceEntityId}:${taskType}`];
       const targetOptions = moduleOptionsCache[`${s.entityId}:${taskType}`];
       const referenceLabels = selectedVariantLabels(taskType, refTask.moduleNames, refOptions);
-      const moduleNames = moduleNamesMatchingLabels(referenceLabels, targetOptions);
-      nextTasks[taskType] = { included: true, moduleNames };
+      const variantNames = moduleNamesMatchingLabels(referenceLabels, targetOptions);
+      const additiveNames = additiveModuleNamesMatchingLabels(refTask.moduleNames, refOptions, targetOptions);
+      nextTasks[taskType] = { included: true, moduleNames: [...variantNames, ...additiveNames] };
     }
     return nextTasks;
   }
@@ -1531,6 +1598,7 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
   }
 
   function toggleEntity(entityId: string) {
+    // 비교견적서는 개수 제한 없음(2026-08-12 사용자 결정) — 본견적 1곳만 setRole에서 별도로 막는다.
     setEntitySelections((prev) => {
       if (prev.some((s) => s.entityId === entityId)) return prev.filter((s) => s.entityId !== entityId);
       return [...prev, { entityId, role: "comparison" as const, tasks: emptyTasks() }];
@@ -1539,10 +1607,6 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
 
   function setRole(entityId: string, role: "primary" | "comparison") {
     setEntitySelections((prev) => {
-      if (role === "comparison") {
-        const comparisonCount = prev.filter((s) => s.role === "comparison" && s.entityId !== entityId).length;
-        if (comparisonCount >= MAX_COMPARISON) return prev;
-      }
       return prev.map((s) => {
         if (s.entityId === entityId) return { ...s, role };
         if (role === "primary" && s.role === "primary") return { ...s, role: "comparison" as const };
@@ -1603,7 +1667,6 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
 
   const canSubmit =
     entitySelections.length > 0 &&
-    entitySelections.filter((s) => s.role === "comparison").length <= MAX_COMPARISON &&
     allEntitiesHaveTask &&
     projectName.trim().length > 0 &&
     Number(totalAmount) > 0 &&
@@ -1749,6 +1812,9 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
       result.entity_quotes.find((q) => q.id === viewedQuoteId) ?? primaryQuote ?? comparisonQuotes[0] ?? null;
     const modulesToChoose = moduleOptions.filter((o) => o.has_modules);
     const isAutoGenerating = !ENABLE_MODULE_SELECTION_UI && submitting;
+    const displayQuotes = [...result.entity_quotes].sort(
+      (a, b) => Number(b.is_primary) - Number(a.is_primary)
+    );
 
     return (
       <div className="space-y-6">
@@ -1898,7 +1964,7 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
 
             {result.entity_quotes.length > 1 && (
               <div className="flex flex-wrap gap-2">
-                {result.entity_quotes.map((q) => {
+                {displayQuotes.map((q) => {
                   const selected = (viewedQuote?.id ?? primaryQuote?.id) === q.id;
                   return (
                     <button
@@ -1908,12 +1974,16 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
                       className={
                         "rounded-full border px-4 py-2 text-sm font-medium " +
                         (selected
-                          ? "border-indigo-600 bg-indigo-600 text-white"
-                          : "border-gray-300 text-gray-700 hover:border-gray-400")
+                          ? q.is_primary
+                            ? "border-indigo-600 bg-indigo-600 text-white shadow-sm"
+                            : "border-slate-700 bg-slate-700 text-white shadow-sm"
+                          : q.is_primary
+                            ? "border-indigo-200 bg-indigo-50 text-indigo-700 hover:border-indigo-300"
+                            : "border-gray-300 bg-white text-gray-700 hover:border-gray-400")
                       }
                     >
                       {q.entity_name}
-                      <span className="ml-1.5 text-xs opacity-70">{q.is_primary ? "본견적" : "비교견적"}</span>
+                      <span className="ml-1.5 text-xs opacity-70">{q.is_primary ? "본견적서" : "비교견적서"}</span>
                       {q.total_amount > 0 && (
                         <span className="ml-1.5 text-xs opacity-70">· {q.total_amount.toLocaleString()}원</span>
                       )}
@@ -1982,7 +2052,7 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
 
       {/* Step 1: 기업 선택 */}
       <fieldset>
-        <StepHeader n={1} title="기업 선택" hint="다중 선택, 최소 1곳" />
+        <StepHeader n={1} title="기업 선택" hint="다중 선택 (본견적 1곳 + 비교견적 무제한)" />
         {entitiesLoading ? (
           <p className="mt-3 text-base text-gray-400">불러오는 중…</p>
         ) : (
@@ -2017,7 +2087,7 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
       {/* Step 2: 본견적/비교견적 지정 */}
       {entitySelections.length > 0 && (
         <fieldset>
-          <StepHeader n={2} title="본견적/비교견적 지정" hint={`본견적 최대 1곳, 비교견적 최대 ${MAX_COMPARISON}곳`} />
+          <StepHeader n={2} title="본견적/비교견적 지정" hint="본견적 최대 1곳, 비교견적 무제한" />
           <div className="mt-3 divide-y divide-gray-100 overflow-hidden rounded-xl border border-gray-200">
             {entitySelections.map((s) => (
               <div key={s.entityId} className="flex flex-wrap items-center justify-between gap-3 bg-white px-4 py-3">
@@ -2089,6 +2159,11 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
                 제외됩니다 — 발급하려면 기업 선택을 다시 확인해주세요.
               </p>
             )}
+            {!allEntitiesHaveTask && (
+              <p className="rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-700">
+                마케팅 또는 시장검증 중 한 곳에서 세부 항목을 하나 이상 골라야 견적서를 만들 수 있습니다.
+              </p>
+            )}
           </div>
         </fieldset>
       )}
@@ -2098,7 +2173,9 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
         <fieldset className="space-y-4">
           <StepHeader n={4} title="사업 정보" />
           <div>
-            <label className="block text-sm text-gray-500">사업명</label>
+            <label className="block text-sm text-gray-500">
+              사업명 <span className="text-red-500">*</span>
+            </label>
             <input
               type="text"
               value={projectName}
@@ -2164,7 +2241,9 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
           )}
           <div className="flex items-end gap-4">
             <div className="flex-1">
-              <label className="block text-sm text-gray-500">총액 (원)</label>
+              <label className="block text-sm text-gray-500">
+                총액 (원) <span className="text-red-500">*</span>
+              </label>
               <input
                 type="text"
                 inputMode="numeric"
