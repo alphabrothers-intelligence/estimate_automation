@@ -11,6 +11,10 @@ class EntitySelectionIn(BaseModel):
     # (2026-08 마법사 개편: 기업 하나가 마케팅+시장검증을 교차 선택하면 그 기업 명의
     # 견적서가 2건 나옴 — 법인마다 원본 양식이 과업종류별로 통째로 다르기 때문).
     task_types: List[str] = Field(min_length=1)
+    # 비교견적 마크업 배율(예: 0.10 = 본견적 총액의 +10%) — is_primary=True면 무시된다.
+    # None이면 generation_service의 기본값(+10%)을 쓴다(2026-08-14 사용자 요청 — 고정 +10%
+    # 대신 기업마다 다르게 조절 가능해야 함).
+    markup_ratio: Optional[float] = Field(default=None, ge=0)
 
 
 class EstimateSetCreate(BaseModel):
@@ -138,9 +142,19 @@ class LineItemIn(BaseModel):
 
 class LineItemsUpdate(BaseModel):
     items: List[LineItemIn] = Field(min_length=1)
+    # 채팅 수정 미리보기를 "수정 반영하기"로 커밋할 때 채팅 원문을 넘겨 버전 이력에 남긴다
+    # (2026-08-14). 없으면 직접편집으로 간주.
+    edit_request_text: Optional[str] = None
 
 
 class EditResult(BaseModel):
     scope: str  # "quote_only" | "catalog_update" | "ambiguous"
     entity_quote: EntityQuoteOut
     changed_items: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class QuoteVersionOut(BaseModel):
+    version_no: int
+    edit_request_text: Optional[str] = None
+    edited_at: str
+    line_items: List[Dict[str, Any]] = Field(default_factory=list)

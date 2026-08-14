@@ -11,7 +11,7 @@ from app.services import module_selection_service, pdf_service
 from app.services.allocation_service import allocate_items
 from app.services.catalog_service import get_catalog_for_generation, get_module_options
 
-COMPARISON_MARKUP = 0.10  # PRD 4.3 — 비교견적서 기본 마크업 +10% (팀장 피드백 시 +15%까지, PM override 가능)
+DEFAULT_COMPARISON_MARKUP = 0.10  # PRD 4.3 — 비교견적서 기본 마크업 +10%, EntitySelectionIn.markup_ratio로 기업별 override 가능(2026-08-14)
 
 
 def _save_version(entity_quote_id: str, edit_request_text: str, diff: list) -> None:
@@ -47,8 +47,11 @@ def _generate_one_quote(quote: dict, estimate_set: dict, selections: Dict[str, L
     supabase = get_supabase()
     entity_name = quote["entity_templates"]["name"]
     task_types = quote["task_types"]
+    # entity_quotes.markup_ratio에 사용자가 지정한 배율(예: 1.10 = +10%)이 이미 저장돼 있으면
+    # 그걸 쓰고, 없으면 기본값(+10%)을 쓴다(create_estimate_set이 선택 시점에 채워 둠).
+    markup_ratio = quote.get("markup_ratio") or (1 + DEFAULT_COMPARISON_MARKUP)
     target_amount = round(
-        estimate_set["total_amount"] if quote["is_primary"] else estimate_set["total_amount"] * (1 + COMPARISON_MARKUP)
+        estimate_set["total_amount"] if quote["is_primary"] else estimate_set["total_amount"] * markup_ratio
     )
 
     # 2026-08-10 사용자 결정: 본견적서 없이 비교견적서만 발행하는 세트도 정식 카탈로그 세부항목을
@@ -132,11 +135,15 @@ def _generate_one_quote(quote: dict, estimate_set: dict, selections: Dict[str, L
             "is_catalog_borrowed": is_catalog_borrowed,
             "catalog_source_entity_name": catalog_source_entity_name,
             "selected_modules": selected_modules,
-            "markup_ratio": None if quote["is_primary"] else (1 + COMPARISON_MARKUP),
+            "markup_ratio": None if quote["is_primary"] else markup_ratio,
         }
     ).eq("id", quote["id"]).execute()
 
-    label = "본견적 최초 생성" if quote["is_primary"] else f"비교견적 최초 생성 (마크업 +{int(COMPARISON_MARKUP * 100)}%)"
+    label = (
+        "본견적 최초 생성"
+        if quote["is_primary"]
+        else f"비교견적 최초 생성 (마크업 +{round((markup_ratio - 1) * 100)}%)"
+    )
     _save_version(quote["id"], label, enriched_line_items)
 
 
@@ -153,7 +160,7 @@ def generate_estimate_set(
 
     quotes_res = (
         supabase.table("entity_quotes")
-        .select("id, entity_id, is_primary, task_type, task_types, service_name, entity_templates(name)")
+        .select("id, entity_id, is_primary, task_type, task_types, service_name, markup_ratio, entity_templates(name)")
         .eq("estimate_set_id", estimate_set_id)
         .execute()
     )

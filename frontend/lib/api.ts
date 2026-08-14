@@ -155,6 +155,8 @@ export type EntitySelectionInput = {
   entity_id: string;
   is_primary: boolean;
   task_types: string[];
+  // 비교견적 마크업 배율(예: 0.10 = +10%) — primary는 무시된다. 없으면 백엔드 기본값(+10%)을 쓴다.
+  markup_ratio?: number;
 };
 
 export type CreateEstimateSetInput = {
@@ -221,14 +223,27 @@ export async function generateEstimateSet(
 
 export async function updateLineItems(
   entityQuoteId: string,
-  items: LineItem[]
+  items: LineItem[],
+  editRequestText?: string
 ): Promise<EntityQuote> {
   const res = await fetch(`${API_BASE_URL}/api/entity-quotes/${entityQuoteId}/line-items`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ items }),
+    body: JSON.stringify({ items, edit_request_text: editRequestText ?? null }),
   });
   return handle<EntityQuote>(res);
+}
+
+export type QuoteVersion = {
+  version_no: number;
+  edit_request_text: string | null;
+  edited_at: string;
+  line_items: LineItem[];
+};
+
+export async function fetchQuoteVersions(entityQuoteId: string): Promise<QuoteVersion[]> {
+  const res = await fetch(`${API_BASE_URL}/api/entity-quotes/${entityQuoteId}/versions`, { cache: "no-store" });
+  return handle<QuoteVersion[]>(res);
 }
 
 export async function updateServiceName(

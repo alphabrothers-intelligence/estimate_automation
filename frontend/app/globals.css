@@ -1,18 +1,36 @@
 @import "tailwindcss";
 
 :root {
-  --background: #f8fafc;
-  --foreground: #171717;
+  --background: #f5f5f7;
+  --foreground: #1d1d1f;
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: Arial, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+  /* 기존 인디고 유틸리티를 Apple 계열의 차분한 시스템 블루로 통일한다. */
+  --color-indigo-50: #f2f7ff;
+  --color-indigo-100: #e5f0ff;
+  --color-indigo-200: #c9e0ff;
+  --color-indigo-300: #9ac7ff;
+  --color-indigo-400: #5aa5ff;
+  --color-indigo-500: #1683ff;
+  --color-indigo-600: #0071e3;
+  --color-indigo-700: #0066cc;
+  --color-indigo-800: #0055b3;
+  --color-indigo-900: #003f86;
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+}
+
+button,
+a,
+input,
+textarea {
+  -webkit-tap-highlight-color: transparent;
 }

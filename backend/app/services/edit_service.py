@@ -11,8 +11,24 @@ from app.config import CLAUDE_MODEL, get_anthropic, get_supabase
 from app.models.estimate import EditResult, EntityQuoteOut
 from app.services import pdf_service
 from app.services.allocation_service import AllocatedItem, extract_json
-from app.services.generation_service import _save_version
-from app.services import sync_service
+
+
+def reconcile_amount(
+    work_days: Optional[float],
+    quantity: Optional[float],
+    unit_price: Optional[float],
+    amount: float,
+    edited: bool,
+) -> tuple:
+    """공급가액은 항상 단가×수량이고 작업일은 가격에 영향 없는 정보성 필드다(2026-08-14 결정).
+    edited=True(단가/작업일/수량 중 하나라도 사용자가 고침)면 amount를 단가×수량으로 재계산하고,
+    아니면 quantity만으로 unit_price를 역산한다(둘 다 아니면 원래 amount/unit_price를 그대로 둔다)."""
+    if edited:
+        if quantity is not None and unit_price is not None:
+            amount = round(unit_price * quantity)
+    elif quantity is not None:
+        unit_price = amount / quantity if quantity else amount
+    return amount, unit_price
 
 SYSTEM_PROMPT = (
     "아래는 기존 견적 항목이며, 사용자의 수정 요청을 반영해 재배분하세요. "
@@ -21,10 +37,17 @@ SYSTEM_PROMPT = (
     "바꾸려는 것인지 판별하고 scope 필드로 명시하세요. 판별이 애매하면 scope를 \"ambiguous\"로 "
     "표시하세요. 수정 요청에 changed_items의 합계가 맞아야 할 구체적인 금액이 명시돼 있으면(예: "
     "\"광고형 마케팅은 900만원으로 해줘\") 그 정수값을 changed_items_target에 넣으세요(없으면 null). "
+    "항목마다 work_days(작업일)/quantity(수량)/unit_price(단가) 필드도 넣을 수 있습니다 — 사용자가 "
+    "그 항목의 작업일·수량·단가를 명시적으로 지정하거나 바꿔달라고 한 경우에만 그 필드를 채우고, "
+    "언급하지 않은 항목·필드는 반드시 null로 두세요(임의로 값을 지어내면 안 됩니다). "
+    "이 세 필드 중 하나라도 채우면 amount는 무시되고 단가×작업일×수량으로 다시 계산되니, amount는 "
+    "평소처럼(총액 배분 결과) 채우면 됩니다. "
     "반드시 JSON 객체 하나만 응답하세요(설명, 마크다운 코드블록 없이). 출력 형식: "
     '{"scope": "quote_only" | "catalog_update" | "ambiguous", '
-    '"items": [{"category": "...", "name": "...", "amount": 정수}], '
-    '"changed_items": [{"category": "...", "name": "...", "amount": 정수}], '
+    '"items": [{"category": "...", "name": "...", "amount": 정수, '
+    '"work_days": 숫자 | null, "quantity": 숫자 | null, "unit_price": 숫자 | null}], '
+    '"changed_items": [{"category": "...", "name": "...", "amount": 정수, '
+    '"work_days": 숫자 | null, "quantity": 숫자 | null, "unit_price": 숫자 | null}], '
     '"changed_items_target": 정수 | null}'
 )
 
@@ -46,7 +69,7 @@ def _reconcile_changed_items_target(result: EditLLMResult) -> None:
     if diff == 0:
         return
     last = result.changed_items[-1]
-    fixed = AllocatedItem(category=last.category, name=last.name, amount=last.amount + diff)
+    fixed = last.model_copy(update={"amount": last.amount + diff})
     result.changed_items[-1] = fixed
     for idx, item in enumerate(result.items):
         if (item.category, item.name) == (last.category, last.name):
@@ -104,25 +127,47 @@ def edit_entity_quote(entity_quote_id: str, edit_request_text: str) -> EditResul
     result = _call_claude_edit(quote["line_items"], edit_request_text)
     _reconcile_changed_items_target(result)
 
-    supply_amount = sum(i.amount for i in result.items)
+    # Claude 응답(AllocatedItem)엔 category/name/amount(+옵션 work_days/quantity/unit_price)뿐이라
+    # task_type·description이 빠진다 — 기존 line_items에서 (category, name)으로 다시 찾아 붙인다.
+    # 항목명을 Claude가 바꾼 경우(rename) 이름으로는 못 찾으므로, 같은 위치(index)의 기존 항목으로
+    # 대체 매칭한다(2026-08-14 — 이름 변경 시 상품구성/과업종류가 유실되는 버그 수정. items 배열은
+    # 재배분이지 항목 추가/삭제가 아니므로 순서가 그대로 유지된다는 전제). description을 안 붙이면
+    # "상품구성" 컬럼이 있는 양식(알파브라더스 등)에서 채팅 수정할 때마다 그 칸이 비어버린다
+    # (2026-08-11 발견).
+    old_item_by_key = {(i["category"], i["name"]): i for i in quote["line_items"]}
+    old_items = quote["line_items"]
+    updated_items = []
+    for idx, i in enumerate(result.items):
+        old_item = old_item_by_key.get((i.category, i.name))
+        if old_item is None and idx < len(old_items):
+            old_item = old_items[idx]
+
+        # 프론트엔드 직접편집(estimate-wizard.tsx handleEditItem)과 같은 규칙 — 공급가액은 항상
+        # 단가×수량이고 작업일은 가격에 영향 없는 정보성 필드다(2026-08-14 사용자 결정 — 원본
+        # xlsx 중 일부 시트엔 단가×작업일×수량 수식이 박혀있지만, 그건 pdf_service가 발급 시점에
+        # 역산으로 흡수하는 별개 문제다. 여기(화면/채팅 편집)의 amount는 항상 단가×수량이어야 한다).
+        work_days = i.work_days if i.work_days is not None else (old_item or {}).get("work_days")
+        quantity = i.quantity if i.quantity is not None else (old_item or {}).get("quantity")
+        unit_price = i.unit_price if i.unit_price is not None else (old_item or {}).get("unit_price")
+        edited = i.work_days is not None or i.quantity is not None or i.unit_price is not None
+        amount, unit_price = reconcile_amount(work_days, quantity, unit_price, i.amount, edited)
+
+        updated_items.append({
+            "category": i.category,
+            "name": i.name,
+            "amount": amount,
+            "work_days": work_days,
+            "quantity": quantity,
+            "unit_price": unit_price,
+            "task_type": (old_item or {}).get("task_type") or task_types[0],
+            "description": (old_item or {}).get("description"),
+        })
+
+    supply_amount = sum(i["amount"] for i in updated_items)
     if vat_included:
         grand_total = round(supply_amount * 1.1)
     else:
         grand_total = supply_amount + round(supply_amount * 0.1)
-
-    # Claude 응답(AllocatedItem)엔 category/name/amount뿐이라 task_type·description이 빠진다 —
-    # 기존 line_items에서 (category, name)으로 다시 찾아 붙인다(항목명을 새로 지어낸 경우는 첫
-    # 번째 과업종류로 대체, 과업종류가 하나뿐이면 항상 이 경로). description을 안 붙이면 "상품구성"
-    # 컬럼이 있는 양식(알파브라더스 등)에서 채팅 수정할 때마다 그 칸이 비어버린다(2026-08-11 발견).
-    old_item_by_key = {(i["category"], i["name"]): i for i in quote["line_items"]}
-    updated_items = []
-    for i in result.items:
-        old_item = old_item_by_key.get((i.category, i.name))
-        updated_items.append({
-            **i.model_dump(),
-            "task_type": (old_item or {}).get("task_type") or task_types[0],
-            "description": (old_item or {}).get("description"),
-        })
 
     entity_name = quote["entity_templates"]["name"]
     # 채팅 수정 후에도 미리보기에서 단가/작업일/수량이 계속 보이도록, 생성 때와 같은 로직으로
@@ -141,18 +186,20 @@ def edit_entity_quote(entity_quote_id: str, edit_request_text: str) -> EditResul
         catalog_entity_id_by_task_type,
         updated_items,
     )
-    supabase.table("entity_quotes").update(
-        {"total_amount": grand_total, "line_items": new_line_items}
-    ).eq("id", entity_quote_id).execute()
 
-    diff = [i.model_dump() for i in result.changed_items]
-    _save_version(entity_quote_id, edit_request_text, diff)
+    # changed_items(변경 요약, 채팅창에 그대로 표시됨)의 amount는 work_days/quantity/unit_price
+    # 재계산 전 Claude 원본값이라 최종 amount와 다를 수 있다 — new_line_items(재계산 완료)에서
+    # 같은 항목을 다시 찾아 최종 금액으로 맞춘다(2026-08-14).
+    new_item_by_key = {(i["category"], i["name"]): i for i in new_line_items}
+    diff = [
+        new_item_by_key.get((i.category, i.name), i.model_dump())
+        for i in result.changed_items
+    ]
 
-    if quote["is_primary"]:
-        sync_service.sync_comparisons_from_primary(quote["estimate_set_id"], grand_total, vat_included)
-    else:
-        sync_service.update_ratio_from_comparison(entity_quote_id, quote["estimate_set_id"], grand_total)
-
+    # 미리보기 전용 — DB에는 아무것도 쓰지 않는다(2026-08-14). 사용자가 화면에서 확인 후
+    # "수정 반영하기"를 눌러야 estimate_service.update_line_items로 실제 저장·버전기록·비교견적
+    # 동기화가 일어난다 — 직접편집과 완전히 같은 커밋 경로를 공유해 채팅 수정도 되돌리기/
+    # 원본복원 대상이 되게 한다.
     entity_quote_out = EntityQuoteOut(
         id=quote["id"],
         entity_id=quote["entity_id"],

@@ -5,7 +5,7 @@ from fastapi import HTTPException
 
 from app.config import get_supabase
 from app.models.catalog import EntityModuleOptions
-from app.models.estimate import EntityQuoteOut, EstimateSetCreate, EstimateSetOut, EstimateSetSummary, LineItemIn, RecipientInfoUpdate
+from app.models.estimate import EntityQuoteOut, EstimateSetCreate, EstimateSetOut, EstimateSetSummary, LineItemIn, QuoteVersionOut, RecipientInfoUpdate
 from app.services import catalog_service, pdf_service
 from app.services.catalog_service import EXCLUDED_ENTITIES_BY_TASK_TYPE
 from app.services.generation_service import _save_version
@@ -111,6 +111,12 @@ def create_estimate_set(payload: EstimateSetCreate) -> EstimateSetOut:
             "quote_date": today,
             "total_amount": payload.total_amount if selection.is_primary else 0,
             "line_items": [],
+            # 사용자가 지정한 비교견적 마크업 배율(본견적 대비, 예: 1.10 = +10%) — None이면
+            # generation_service가 기본값(+10%)을 적용해 생성 시점에 다시 채운다.
+            "markup_ratio": (
+                None if selection.is_primary or selection.markup_ratio is None
+                else round(1 + selection.markup_ratio, 4)
+            ),
             # 비교견적으로 테스티파이가 포함된 경우엔 여기서 받지 않고 나중에(발급 전) 채운다.
             "service_name": payload.service_name if selection.is_primary and primary_entity_name == TESTIFY_NAME else None,
         }
@@ -370,13 +376,12 @@ def update_recipient_info(entity_quote_id: str, payload: RecipientInfoUpdate) ->
     )
 
 
-def update_line_items(entity_quote_id: str, items: List[LineItemIn]) -> EntityQuoteOut:
+def update_line_items(entity_quote_id: str, items: List[LineItemIn], edit_request_text: str = "직접편집") -> EntityQuoteOut:
     """화면에서 항목명・금액・단가・작업일・투입인력・비고를 직접 클릭해 고친 뒤 저장한다
     (PRD 4.4 "직접 편집" — 2026-08-09 사용자 결정으로 편집 대상을 단가/작업일/투입인력/비고까지
-    확장). 프론트엔드가 이 값들 중 하나를 고치면 나머지로 금액을 다시 계산해서 보내므로(반대로
-    금액을 고치면 단가를 역산해서 보냄), 여기서는 받은 값을 그대로 저장한다 — 실제 PDF의
-    공급가액 칸이 원본 수식(단가×작업일×투입인력)으로 계산되므로, 발급 시점에 카탈로그
-    기준으로 다시 계산하면 화면에서 본 값과 실제 발급본이 달라진다(pdf_service._compute_item_pricing 참고).
+    확장). 프론트엔드가 단가/수량 중 하나를 고치면 나머지로 금액(단가×수량, 작업일은 무관)을
+    다시 계산해서 보내므로, 여기서는 받은 값을 그대로 저장한다 — 채팅 수정(edit_service)의
+    미리보기도 같은 커밋 경로로 여기 들어온다(2026-08-14, edit_request_text로 출처를 구분).
     """
     supabase = get_supabase()
     quote_res = (
@@ -405,7 +410,7 @@ def update_line_items(entity_quote_id: str, items: List[LineItemIn]) -> EntityQu
         {"total_amount": grand_total, "line_items": new_line_items}
     ).eq("id", entity_quote_id).execute()
 
-    _save_version(entity_quote_id, "직접편집", new_line_items)
+    _save_version(entity_quote_id, edit_request_text, new_line_items)
 
     if quote["is_primary"]:
         sync_service.sync_comparisons_from_primary(quote["estimate_set_id"], grand_total, vat_included)
@@ -433,3 +438,26 @@ def update_line_items(entity_quote_id: str, items: List[LineItemIn]) -> EntityQu
             supabase, quote["entity_id"], quote["task_types"], quote.get("selected_modules")
         ),
     )
+
+
+def list_quote_versions(entity_quote_id: str) -> List[QuoteVersionOut]:
+    """되돌아가기/원본으로 되돌리기 버튼용 — 이 견적서의 버전 이력을 오래된 순으로 반환한다.
+    diff는 저장 경로(직접편집/채팅수정 커밋/동기화/최초생성)와 무관하게 항상 그 시점 전체
+    항목 목록이다(2026-08-14, edit_service가 더 이상 직접 저장하지 않게 되며 보장됨)."""
+    supabase = get_supabase()
+    versions = (
+        supabase.table("quote_versions")
+        .select("version_no, edit_request_text, edited_at, diff")
+        .eq("entity_quote_id", entity_quote_id)
+        .order("version_no")
+        .execute()
+    )
+    return [
+        QuoteVersionOut(
+            version_no=v["version_no"],
+            edit_request_text=v["edit_request_text"],
+            edited_at=v["edited_at"],
+            line_items=v["diff"] or [],
+        )
+        for v in versions.data
+    ]

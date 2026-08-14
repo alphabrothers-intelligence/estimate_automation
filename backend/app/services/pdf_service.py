@@ -13,6 +13,7 @@ openpyxl로 통째로 열고 다시 저장하면 이 파일들의 도장 이미�
 
 import hashlib
 import io
+import itertools
 import json
 import re
 import subprocess
@@ -45,6 +46,13 @@ def _cell_pattern(coord: str) -> re.Pattern:
 
 def _has_formula(inner: str) -> bool:
     return "<f>" in inner or "<f " in inner or "<f/>" in inner
+
+
+def _cell_text_for_wrap(value: Any) -> Optional[str]:
+    """줄바꿈 유무·줄수를 판단할 때 쓸 표시 텍스트."""
+    if isinstance(value, str):
+        return value
+    return None
 
 
 def _build_cell_xml(coord: str, attrs: str, value: Any) -> str:
@@ -234,6 +242,74 @@ def _patch_font_substitution(styles_xml: str) -> str:
         return font_xml
 
     return _FONT_ELEMENT_PATTERN.sub(_fix_font, styles_xml)
+
+
+def _strip_sheet_hyperlinks(sheet_xml: str) -> str:
+    """블렌디드랩 마스터 B2("견적서" 제목) 셀에 실제 <hyperlinks> 요소가 걸려 있었다(원본 제작사
+    yesform.com 템플릿 검색 페이지로 연결되는, 견적서 내용과 무관한 잔재 링크) — 진짜 하이퍼링크는
+    styles.xml의 xfId/font 색상과 무관하게 LibreOffice/Excel이 자체적으로 파란 밑줄을 입혀 렌더링
+    하므로, _patch_hyperlink_style_bleed로 셀 서식만 고쳐선 없어지지 않았다(2026-08-14 재확인 —
+    PDF까지 직접 렌더링해서 확인). 견적서 PDF엔 어차피 무관한 외부 링크이므로 통째로 제거한다."""
+    return re.sub(r"<hyperlinks>.*?</hyperlinks>", "", sheet_xml, flags=re.DOTALL)
+
+
+def _patch_hyperlink_style_bleed(styles_xml: str) -> str:
+    """블렌디드랩 마스터 "견적서" 제목 셀(B2)처럼, 셀 자체 서식은 굵게·검정이어야 하는데도
+    LibreOffice로 PDF 변환하면 파란색 밑줄로 나오는 경우가 있었다(2026-08-13 사용자 발견). 그
+    셀의 xf가 내부적으로 Excel 내장 "Hyperlink" 이름 스타일(cellStyles의 builtinId=8, 9)을
+    부모로 참조하고 있어서인데, 실제 이 마스터들엔 <hyperlinks> 요소(진짜 하이퍼링크)가 없으므로
+    — .xls→.xlsx 변환 중 남은 참조로 보고 — Normal(xfId=0)로 되돌린다. xfId만 고쳐도 밑줄은
+    없어지지만(LibreOffice가 부모 named style을 보고 하이퍼링크로 렌더링하는 부분), 이 xf가
+    applyFont="true"로 자기 fontId에 파란색을 직접 박아둔 경우 색은 그대로 남는다(재확인 —
+    2026-08-13) — 그 fontId들의 색도 검정으로 되돌린다.
+    """
+    cellstyles_m = re.search(r"<cellStyles[^>]*>(.*?)</cellStyles>", styles_xml, re.DOTALL)
+    if not cellstyles_m:
+        return styles_xml
+    hyperlink_xf_ids = {
+        m.group(1)
+        for m in re.finditer(r'<cellStyle\b[^>]*\bxfId="(\d+)"[^>]*\bbuiltinId="[89]"', cellstyles_m.group(0))
+    }
+    if not hyperlink_xf_ids:
+        return styles_xml
+
+    cellxfs_m = re.search(r"<cellXfs[^>]*>(.*?)</cellXfs>", styles_xml, re.DOTALL)
+    if not cellxfs_m:
+        return styles_xml
+
+    direct_font_ids: set = set()
+
+    def _fix_xf(m: re.Match) -> str:
+        xf_xml = m.group(0)
+        xfid_m = re.search(r'\bxfId="(\d+)"', xf_xml)
+        if not xfid_m or xfid_m.group(1) not in hyperlink_xf_ids:
+            return xf_xml
+        font_m = re.search(r'\bfontId="(\d+)"', xf_xml)
+        if font_m:
+            direct_font_ids.add(font_m.group(1))
+        return re.sub(r'\bxfId="\d+"', 'xfId="0"', xf_xml, count=1)
+
+    patched_cellxfs = re.sub(r"<xf\b[^>]*(?:/>|>.*?</xf>)", _fix_xf, cellxfs_m.group(1), flags=re.DOTALL)
+    styles_xml = styles_xml[: cellxfs_m.start(1)] + patched_cellxfs + styles_xml[cellxfs_m.end(1) :]
+
+    if not direct_font_ids:
+        return styles_xml
+    fonts_m = re.search(r"<fonts[^>]*>(.*?)</fonts>", styles_xml, re.DOTALL)
+    if not fonts_m:
+        return styles_xml
+
+    font_index = itertools.count()
+
+    def _fix_font(m: re.Match) -> str:
+        font_xml = m.group(0)
+        if str(next(font_index)) not in direct_font_ids:
+            return font_xml
+        font_xml = re.sub(r'<color rgb="[0-9A-Fa-f]{6,8}"\s*/>', '<color rgb="FF000000"/>', font_xml, count=1)
+        font_xml = re.sub(r'<u\s+val="[^"]*"\s*/>', "", font_xml, count=1)
+        return font_xml
+
+    patched_fonts = re.sub(r"<font>.*?</font>", _fix_font, fonts_m.group(1), flags=re.DOTALL)
+    return styles_xml[: fonts_m.start(1)] + patched_fonts + styles_xml[fonts_m.end(1) :]
 
 
 def _force_fit_to_page(sheet_xml: str) -> str:
@@ -433,13 +509,14 @@ def _normalize_block_row_heights(sheet_xml: str, item_blocks: List[dict], update
 
     lines_by_row: Dict[int, int] = {}
     for coord, value in updates.items():
-        if not isinstance(value, str) or "\n" not in value:
+        text = _cell_text_for_wrap(value)
+        if text is None or "\n" not in text:
             continue
         m = re.match(r"^[A-Z]+(\d+)$", coord)
         if not m:
             continue
         row = int(m.group(1))
-        lines_by_row[row] = max(lines_by_row.get(row, 1), value.count("\n") + 1)
+        lines_by_row[row] = max(lines_by_row.get(row, 1), text.count("\n") + 1)
 
     target_height_by_row: Dict[int, float] = {}
     for block in item_blocks:
@@ -481,6 +558,32 @@ def _normalize_block_row_heights(sheet_xml: str, item_blocks: List[dict], update
     return re.sub(r'<row r="(\d+)"[^>]*?(?:/>|>)', _apply_height, sheet_xml)
 
 
+def _normalize_block_cell_styles(sheet_xml: str, item_blocks: List[dict]) -> str:
+    """항목 블록 안의 "가운데" 행들(첫 행·마지막 행 제외)은 서식이 전부 같아야 하는데, 원본
+    마스터에 원인 불명으로 한 행만 다른 서식이 남아있는 경우가 있다(예: 블렌디드랩 마스터
+    "견적서 (2)" 시트 15행 AC~AF열만 다른 행과 달리 오른쪽 테두리가 있는 스타일이라, 발급 PDF에서
+    그 행만 오른쪽 끝에 없어야 할 구분선이 보임, 2026-08-13 사용자 발견). 첫/마지막 행은 표를
+    여닫는 의도적인 테두리가 있을 수 있어 제외하고, 가운데 행끼리 열별로 가장 흔한 스타일로 맞춘다.
+    """
+    for block in item_blocks:
+        rows = block.get("rows") or []
+        interior_rows = rows[1:-1]
+        if len(interior_rows) < 2:
+            continue
+        style_by_col_row: Dict[str, Dict[int, str]] = {}
+        for row in interior_rows:
+            for m in re.finditer(rf'<c r="([A-Z]+){row}" s="(\d+)"', sheet_xml):
+                style_by_col_row.setdefault(m.group(1), {})[row] = m.group(2)
+        for col, by_row in style_by_col_row.items():
+            majority = Counter(by_row.values()).most_common(1)[0][0]
+            for row, style in by_row.items():
+                if style != majority:
+                    sheet_xml = re.sub(
+                        rf'(<c r="{col}{row}" s=")\d+(")', rf'\g<1>{majority}\g<2>', sheet_xml, count=1
+                    )
+    return sheet_xml
+
+
 def _patch_xlsx(
     source_bytes: bytes,
     sheet_name: str,
@@ -493,9 +596,11 @@ def _patch_xlsx(
         sheet_path = _sheet_internal_path(zin, sheet_name)
         sheet_xml = zin.read(sheet_path).decode("utf-8")
         patched_sheet_xml = _patch_sheet_xml(sheet_xml, updates)
+        patched_sheet_xml = _strip_sheet_hyperlinks(patched_sheet_xml)
         patched_sheet_xml = _strip_all_formula_caches(patched_sheet_xml)
         patched_sheet_xml = _hide_rows(patched_sheet_xml, hidden_rows or set())
         patched_sheet_xml = _normalize_block_row_heights(patched_sheet_xml, item_blocks or [], updates)
+        patched_sheet_xml = _normalize_block_cell_styles(patched_sheet_xml, item_blocks or [])
         patched_sheet_xml = _force_fit_to_page(patched_sheet_xml)
 
         workbook_xml = zin.read("xl/workbook.xml").decode("utf-8")
@@ -510,7 +615,12 @@ def _patch_xlsx(
 
         styles_xml = zin.read("xl/styles.xml").decode("utf-8")
         styles_xml = _patch_font_substitution(styles_xml)
-        wrap_coords = {coord for coord, value in updates.items() if isinstance(value, str) and "\n" in value}
+        styles_xml = _patch_hyperlink_style_bleed(styles_xml)
+        wrap_coords = {
+            coord
+            for coord, value in updates.items()
+            if (text := _cell_text_for_wrap(value)) is not None and "\n" in text
+        }
         patched_sheet_xml, patched_styles_xml = _ensure_wrap_text(patched_sheet_xml, styles_xml, wrap_coords)
 
         skip_files = {"xl/calcChain.xml"}
@@ -723,7 +833,9 @@ def _collect_header_updates(header_fields: Dict[str, str], quote: dict) -> CellU
         elif field == "client_email":
             updates[coord] = quote.get("recipient_email") or ""
         elif field == "service_name":
-            updates[coord] = quote.get("service_name") or ""
+            # 테스티파이 마스터는 이 셀 자체가 "용역명: " 라벨이다(recipient_name의 "귀하"와 같은
+            # 패턴) — 값만 쓰면 라벨이 지워진다(2026-08-13 사용자 발견).
+            updates[coord] = f"용역명: {quote.get('service_name') or ''}"
         elif field == "recipient_block":
             updates[coord] = (
                 f"수신자 : {quote.get('recipient_name') or ''}\n\n아래와 같이 견적서를 발송합니다.\n\n"
@@ -1127,6 +1239,10 @@ def _collect_item_block_updates(
 
             if "item_name" in columns:
                 updates[f"{columns['item_name']}{row}"] = item["name"]
+            # 상품구성(번호 매긴 세부항목) 전용 컬럼은 알파브라더스/ABBG 원본에만 있다 — 그
+            # 컬럼이 없는 법인(테스티파이/블렌디드랩/썬데이워커)은 품명 칸에 접어 넣지 않고
+            # 아예 표시하지 않는다(2026-08-14 사용자 결정 — 원본 양식에 없는 칸이면 괄호로도
+            # 만들어 넣지 않는다).
             if "description" in columns and item.get("description"):
                 updates[f"{columns['description']}{row}"] = item["description"]
             if "unit_price" in columns:

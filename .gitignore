@@ -11,3 +11,8 @@ node_modules/
 .next/
 
 backend/scripts/output/
+
+.DS_Store
+
+# 실제 고객사/법인 견적서 원본·양식 — 절대 커밋하지 않는다(2026-08-14 사용자 결정)
+data/

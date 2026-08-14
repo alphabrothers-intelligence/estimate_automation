@@ -22,6 +22,12 @@ class AllocatedItem(BaseModel):
     category: str
     name: str
     amount: int
+    # 채팅 수정에서만 쓰인다(edit_service.py) — 사용자가 작업일/수량/단가 중 하나를 명시적으로
+    # 바꿔달라고 한 경우에만 Claude가 채우고, 나머지는 null로 둔다(2026-08-14). 항목 자동생성
+    # (allocation_service._allocate_single_group)에서는 항상 null.
+    unit_price: Optional[float] = None
+    work_days: Optional[float] = None
+    quantity: Optional[float] = None
 
 
 class AllocationResult(BaseModel):

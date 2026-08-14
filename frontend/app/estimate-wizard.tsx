@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { useGeneratedEstimateLayout } from "./app-shell";
 import {
   ApiError,
   createEstimateSet,
@@ -9,6 +10,7 @@ import {
   fetchEntities,
   fetchEstimateSet,
   fetchModuleOptions,
+  fetchQuoteVersions,
   generateEstimateSet,
   getEntityQuotePdfUrl,
   getEntityQuoteXlsxUrl,
@@ -170,6 +172,13 @@ function OptionRow({
 // (2026-08-09 사용자 피드백). InlineEditCell과 같은 blur/Enter 저장 패턴을 그대로 따른다.
 // 용역명뿐 아니라 수신자/담당자/연락처/이메일도 같은 패턴이라(2026-08-12) 공용 컴포넌트로 뺐다 —
 // placeholder만으로는 칸이 비면 무슨 값인지 알 수 없다는 사용자 피드백으로 "라벨 :" 을 항상 보여준다.
+// required 필드 강조색 — 기본은 기존 남색(용역명/수신자), ABBG·알파브라더스 담당자/연락처/
+// 이메일은 사용자 요청으로 보라색을 쓴다(2026-08-13).
+const REQUIRED_COLOR_CLASSES: Record<"indigo" | "purple", { badge: string; border: string }> = {
+  indigo: { badge: "text-indigo-600", border: "border-amber-300" },
+  purple: { badge: "text-purple-600", border: "border-purple-300" },
+};
+
 function LabeledInlineField({
   label,
   value,
@@ -177,6 +186,7 @@ function LabeledInlineField({
   type = "text",
   autoComplete,
   required = false,
+  requiredColor = "indigo",
   onSave,
 }: {
   label: string;
@@ -185,6 +195,7 @@ function LabeledInlineField({
   type?: "text" | "tel" | "email";
   autoComplete?: string;
   required?: boolean;
+  requiredColor?: "indigo" | "purple";
   onSave: (value: string) => Promise<void>;
 }) {
   const [draft, setDraft] = useState(value);
@@ -210,7 +221,7 @@ function LabeledInlineField({
     <label className="block min-w-0" onClick={(e) => e.stopPropagation()}>
       <span className="mb-1.5 flex items-center gap-1 text-xs font-semibold text-slate-600">
         {label}
-        {required && <span className="text-indigo-600">필수</span>}
+        {required && <span className={REQUIRED_COLOR_CLASSES[requiredColor].badge}>필수</span>}
       </span>
       <div className="relative">
       <input
@@ -223,13 +234,13 @@ function LabeledInlineField({
         onKeyDown={(e) => e.key === "Enter" && handleSave()}
         placeholder={placeholder}
         className={
-          "h-11 w-full rounded-xl border bg-white px-3.5 pr-16 text-sm text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-indigo-500 focus:ring-4 focus:ring-indigo-100 " +
-          (required && !draft.trim() ? "border-amber-300" : "border-slate-200 hover:border-slate-300")
+          "h-9 w-full rounded-lg border bg-white px-3 pr-12 text-sm text-slate-900 outline-none transition placeholder:text-slate-400 focus:border-indigo-500 focus:ring-3 focus:ring-indigo-100 " +
+          (required && !draft.trim() ? REQUIRED_COLOR_CLASSES[requiredColor].border : "border-slate-200 hover:border-slate-300")
         }
       />
-      {saving && <span className="absolute right-3 top-3 text-xs text-slate-400">저장 중…</span>}
+      {saving && <span className="absolute right-2.5 top-2.5 text-xs text-slate-400">저장 중…</span>}
       {!saving && value && draft.trim() === value && (
-        <span className="absolute right-3 top-2.5 flex h-6 w-6 items-center justify-center rounded-full bg-emerald-50 text-emerald-600" aria-label="저장됨">✓</span>
+        <span className="absolute right-2.5 top-2 flex h-5 w-5 items-center justify-center rounded-full bg-emerald-50 text-xs text-emerald-600" aria-label="저장됨">✓</span>
       )}
       </div>
       {errorMsg && <span className="mt-1 block text-xs text-red-600">{errorMsg}</span>}
@@ -248,7 +259,7 @@ function ServiceNameField({
     <LabeledInlineField
       label="용역명"
       value={quote.service_name ?? ""}
-      placeholder="예: 정량, 정성 데이터 기반 시장 검증 용역 — 발급 전 필수"
+      placeholder="예: 정량·정성 데이터 기반 시장검증 용역"
       required
       onSave={onSave}
     />
@@ -272,7 +283,7 @@ function RecipientInfoFields({
       <LabeledInlineField
         label="수신자"
         value={quote.recipient_name ?? ""}
-        placeholder="고객사명을 입력하세요 — 발급 전 필수"
+        placeholder="예: 주식회사 미구"
         required
         onSave={(value) => onSave({ recipient_name: value })}
       />
@@ -281,23 +292,29 @@ function RecipientInfoFields({
           <LabeledInlineField
             label="담당자"
             value={quote.recipient_contact ?? ""}
-            placeholder="담당자명"
+            placeholder="예: 김미구"
+            required
+            requiredColor="purple"
             onSave={(value) => onSave({ recipient_contact: value })}
           />
           <LabeledInlineField
             label="연락처"
             value={quote.recipient_phone ?? ""}
-            placeholder="연락처"
+            placeholder="예: 010-1234-5678"
             type="tel"
             autoComplete="tel"
+            required
+            requiredColor="purple"
             onSave={(value) => onSave({ recipient_phone: value })}
           />
           <LabeledInlineField
             label="이메일"
             value={quote.recipient_email ?? ""}
-            placeholder="이메일"
+            placeholder="예: migu@company.com"
             type="email"
             autoComplete="email"
+            required
+            requiredColor="purple"
             onSave={(value) => onSave({ recipient_email: value })}
           />
         </>
@@ -340,7 +357,7 @@ function QuoteDateField({
         defaultValue={quote.quote_date ?? ""}
         disabled={saving}
         onChange={(e) => handleChange(e.target.value)}
-        className="h-11 w-full rounded-xl border border-slate-200 bg-white px-3.5 text-sm text-slate-900 outline-none transition hover:border-slate-300 focus:border-indigo-500 focus:ring-4 focus:ring-indigo-100"
+        className="h-9 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-900 outline-none transition hover:border-slate-300 focus:border-indigo-500 focus:ring-3 focus:ring-indigo-100"
       />
       {saving && <span className="absolute right-10 top-3 text-xs text-slate-400">저장 중…</span>}
       </div>
@@ -434,7 +451,7 @@ function TaskModulePicker({
       }
     >
       <label className="flex cursor-pointer items-center justify-between">
-        <ToggleSwitch checked={included} onLabel={`${taskType} 포함`} />
+        <ToggleSwitch checked={included} onLabel={taskType} />
         <input
           type="checkbox"
           checked={included}
@@ -503,6 +520,16 @@ function groupLineItems(items: LineItem[]): LineItemGroup[] {
 // 클릭하면 입력창이 되는 셀 — Enter/포커스 아웃으로 저장, Esc로 취소(ServiceNameField와 같은
 // 인라인 편집 패턴). 항목명・카테고리・금액뿐 아니라 단가/작업일/투입인력/비고도 이 컴포넌트로
 // 편집한다(2026-08-09 편집 범위 확장 — LineItemTable.handleEditItem 참고).
+// 금액 입력칸에 원 단위 천단위 콤마를 실시간으로 붙여준다(2026-08-13 사용자 요청) — 숫자만
+// 남기고 다시 콤마를 끼워 넣는 방식이라 커서가 끝으로 튀는 것 말고는 부작용이 없다.
+function formatWithCommas(raw: string): string {
+  const digits = raw.replace(/[^\d-]/g, "");
+  if (digits === "" || digits === "-") return digits;
+  const negative = digits.startsWith("-");
+  const intPart = (negative ? digits.slice(1) : digits).replace(/^0+(?=\d)/, "");
+  return (negative ? "-" : "") + intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
 function InlineEditCell({
   value,
   display,
@@ -517,29 +544,53 @@ function InlineEditCell({
   onSave: (nextValue: string) => Promise<void>;
 }) {
   const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(value);
+  const [draft, setDraft] = useState(inputType === "number" ? formatWithCommas(value) : value);
   const [saving, setSaving] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  // Enter로 저장이 끝난 직후 짧게 배경색을 강조했다 되돌려, "수정한 내용이 바로 반영됐다"는
+  // 모션을 준다(2026-08-13 사용자 요청).
+  const [justSaved, setJustSaved] = useState(false);
+  const rawDraft = inputType === "number" ? draft.replace(/,/g, "") : draft;
+  // PDF 반영(저장 API + 세트 재조회)은 시간이 걸려도, Enter를 누르면 그 기다림과 무관하게 즉시
+  // 칸을 빠져나오고 입력한 값을 먼저 보여준다(2026-08-13 사용자 요청 — 이전엔 저장이 끝나야
+  // 칸에서 빠져나왔음). commit()이 두 번(Enter → blur) 겹쳐 불리는 걸 막는 가드.
+  const committedRef = useRef(false);
+  const [pendingLabel, setPendingLabel] = useState<string | null>(null);
 
-  async function handleSave() {
-    if (saving) return;
-    if (draft === value) {
-      setEditing(false);
-      return;
-    }
-    if (inputType === "number" && (draft.trim() === "" || Number.isNaN(Number(draft)))) {
-      setErrorMsg("숫자를 입력하세요.");
-      return;
-    }
-    setSaving(true);
+  function startEditing() {
+    committedRef.current = false;
     setErrorMsg(null);
-    try {
-      await onSave(draft);
+    setDraft(inputType === "number" ? formatWithCommas(value) : value);
+    setEditing(true);
+  }
+
+  async function commit() {
+    if (committedRef.current) return;
+    committedRef.current = true;
+    if (rawDraft === value) {
       setEditing(false);
+      return;
+    }
+    if (inputType === "number" && (rawDraft.trim() === "" || Number.isNaN(Number(rawDraft)))) {
+      setErrorMsg("숫자를 입력하세요.");
+      committedRef.current = false;
+      return;
+    }
+    setErrorMsg(null);
+    setSaving(true);
+    setPendingLabel(draft);
+    setEditing(false); // 저장 완료를 기다리지 않고 바로 칸을 빠져나온다 — 저장은 아래에서 이어서 진행.
+    try {
+      await onSave(rawDraft);
+      setJustSaved(true);
+      setTimeout(() => setJustSaved(false), 600);
     } catch (e) {
       setErrorMsg(e instanceof ApiError ? e.message : "저장에 실패했습니다.");
+      committedRef.current = false;
+      setEditing(true); // 실패하면 다시 편집 상태로 돌아가 고칠 수 있게 한다.
     } finally {
       setSaving(false);
+      setPendingLabel(null);
     }
   }
 
@@ -547,18 +598,25 @@ function InlineEditCell({
     return (
       <div onClick={(e) => e.stopPropagation()}>
         <input
-          type={inputType}
+          type="text"
+          inputMode={inputType === "number" ? "numeric" : undefined}
           autoFocus
           value={draft}
-          disabled={saving}
-          onChange={(e) => setDraft(e.target.value)}
+          onChange={(e) =>
+            setDraft(inputType === "number" ? formatWithCommas(e.target.value) : e.target.value)
+          }
           onFocus={(e) => e.target.select()}
-          onBlur={handleSave}
+          onBlur={commit}
           onKeyDown={(e) => {
-            if (e.key === "Enter") handleSave();
+            if (e.key === "Enter") {
+              e.preventDefault();
+              commit();
+            }
             if (e.key === "Escape") {
-              setDraft(value);
+              committedRef.current = true; // Escape는 저장하지 않고 그냥 나간다.
+              setDraft(inputType === "number" ? formatWithCommas(value) : value);
               e.currentTarget.blur();
+              setEditing(false);
             }
           }}
           className={
@@ -576,16 +634,18 @@ function InlineEditCell({
       type="button"
       onClick={(e) => {
         e.stopPropagation();
-        setDraft(value);
-        setEditing(true);
+        startEditing();
       }}
       title="클릭해서 수정"
+      disabled={saving}
       className={
-        "w-full whitespace-pre-line rounded px-1 py-0.5 hover:bg-indigo-50 " +
-        (align === "right" ? "text-right" : "text-left")
+        "w-full whitespace-pre-line rounded px-1 py-0.5 transition-colors duration-500 hover:bg-indigo-50 " +
+        (align === "right" ? "text-right" : "text-left") +
+        (justSaved ? " bg-amber-100" : "") +
+        (saving ? " text-gray-400" : "")
       }
     >
-      {display}
+      {saving ? pendingLabel : display}
     </button>
   );
 }
@@ -650,7 +710,10 @@ function ItemDetailCells({
         return (
           <td
             key={key}
-            className={"py-2 pr-3 text-sm text-gray-600 " + (isText ? "text-left" : "text-right")}
+            className={
+              "py-2 pr-3 text-sm text-gray-600 " +
+              (isText ? "text-left" : "whitespace-nowrap text-right")
+            }
           >
             <InlineEditCell
               value={renderDetailEditValue(item, key)}
@@ -692,8 +755,8 @@ function CategoryRows({
   const splitCells = (taskType?: string) =>
     showCategorySplit && (
       <>
-        <td className="px-3 py-2.5 text-sm text-gray-600">{taskType ?? "—"}</td>
-        <td className="px-3 py-2.5 text-sm text-gray-600">{taskType ?? "—"}</td>
+        <td className="whitespace-nowrap px-3 py-2.5 text-sm text-gray-600">{taskType ?? "—"}</td>
+        <td className="whitespace-nowrap px-3 py-2.5 text-sm text-gray-600">{taskType ?? "—"}</td>
       </>
     );
 
@@ -715,7 +778,7 @@ function CategoryRows({
           />
         </td>
         <ItemDetailCells item={item} order={order} onEditItem={(patch) => onEditItem(item._index, patch)} />
-        <td className="px-3 py-2.5 text-right font-semibold text-gray-900">
+        <td className="whitespace-nowrap px-3 py-2.5 text-right font-semibold text-gray-900">
           <InlineEditCell
             value={String(item.amount)}
             display={`${group.amount.toLocaleString()}원`}
@@ -758,7 +821,7 @@ function CategoryRows({
           </button>
         </td>
         <td className="py-2 pr-3 text-right text-sm text-gray-400" colSpan={order.length} />
-        <td className="px-3 py-2.5 text-right font-bold text-gray-900">
+        <td className="whitespace-nowrap px-3 py-2.5 text-right font-bold text-gray-900">
           {group.amount.toLocaleString()}원
         </td>
         {hasNote && <td className="px-3 py-2.5" />}
@@ -781,7 +844,7 @@ function CategoryRows({
               />
             </td>
             <ItemDetailCells item={item} order={order} onEditItem={(patch) => onEditItem(item._index, patch)} />
-            <td className="py-2 pr-3 text-right text-sm text-gray-700">
+            <td className="whitespace-nowrap py-2 pr-3 text-right text-sm text-gray-700">
               <InlineEditCell
                 value={String(item.amount)}
                 display={`${item.amount.toLocaleString()}원`}
@@ -818,6 +881,17 @@ function computeVatBreakdown(totalAmount: number, vatIncluded: boolean) {
   return { supplyAmount, vatAmount, grandTotal };
 }
 
+// 수정 반영하기 전 미리보기(pending) 항목들만으로 총합계를 화면에 보여줄 때 쓴다 —
+// estimate_service.update_line_items의 grand_total 계산과 동일한 식이어야 커밋 후 값과
+// 일치한다(2026-08-14).
+function computeGrandTotal(items: LineItem[], vatIncluded: boolean): number {
+  const supply = items.reduce((sum, item) => sum + item.amount, 0);
+  return vatIncluded ? Math.round(supply * 1.1) : supply + Math.round(supply * 0.1);
+}
+
+// 직접편집이든 채팅 수정이든 커밋("수정 반영하기") 전까지는 화면에서만 미리보이는 상태.
+type PendingEdit = { items: LineItem[]; editRequestText: string };
+
 function LineItemTable({
   items,
   columnLabels,
@@ -826,6 +900,7 @@ function LineItemTable({
   vatIncluded,
   showCategorySplit = false,
   highlightKeys,
+  keepTotal,
   onSaveLineItems,
 }: {
   items: LineItem[];
@@ -835,7 +910,8 @@ function LineItemTable({
   vatIncluded: boolean;
   showCategorySplit?: boolean;
   highlightKeys?: Set<string>;
-  onSaveLineItems: (items: LineItem[]) => Promise<void>;
+  keepTotal: boolean;
+  onSaveLineItems: (items: LineItem[]) => void;
 }) {
   const groups = groupLineItems(items);
   const order = detailColumnOrder.length > 0 ? detailColumnOrder : DEFAULT_DETAIL_ORDER;
@@ -843,35 +919,51 @@ function LineItemTable({
   const hasNote = Boolean(columnLabels.note);
   const labelColSpan = (showCategorySplit ? 2 : 0) + 1 + order.length;
   const { supplyAmount, vatAmount, grandTotal } = computeVatBreakdown(totalAmount, vatIncluded);
-  const [keepTotal, setKeepTotal] = useState(false);
+  const [allocationFeedback, setAllocationFeedback] = useState<string | null>(null);
+  const hasTextDetail = order.some((key) => TEXT_DETAIL_KEYS.has(key));
+
+  function detailColumnWidth(key: string): string {
+    if (TEXT_DETAIL_KEYS.has(key)) return showCategorySplit ? "24%" : "30%";
+    if (!hasTextDetail) {
+      if (key === "unit_price") return "20%";
+      if (key === "work_days" || key === "quantity") return "10%";
+      return "10%";
+    }
+    if (key === "work_days" || key === "quantity") return "7%";
+    if (key === "unit_price") return "12%";
+    return "9%";
+  }
 
   async function handleEditItem(index: number, patch: LineItemPatch) {
     const merged: LineItem = { ...items[index], ...patch };
-    // 실제 발급 PDF의 공급가액 칸은 원본 수식(단가×작업일×투입인력)으로 재계산되므로, 화면에서
-    // 어느 값을 고치든 세 값의 곱과 공급가액이 항상 일치하도록 나머지를 다시 계산해서 보낸다
-    // (2026-08-09 — 단가/작업일/투입인력 직접편집 추가, pdf_service._compute_item_pricing과 짝).
+    // 공급가액 = 단가×수량만으로 계산한다. 작업일은 정보성 필드로 가격에 영향을 주지 않는다
+    // (2026-08-14 사용자 결정 — 일부 원본 xlsx 시트엔 단가×작업일×수량 수식이 있지만, 그건
+    // pdf_service._compute_item_pricing이 발급 시점에 역산으로 흡수하는 별개 문제다. 여기(화면/
+    // 채팅 편집)의 amount는 항상 단가×수량이어야 한다 — edit_service.edit_entity_quote와 동일 규칙).
     if ("amount" in patch) {
-      const divisor = (merged.work_days ?? 1) * (merged.quantity ?? 1);
+      const divisor = merged.quantity ?? 1;
       merged.unit_price = divisor ? merged.amount / divisor : merged.amount;
     } else if ("unit_price" in patch || "work_days" in patch || "quantity" in patch) {
-      merged.amount = Math.round((merged.unit_price ?? 0) * (merged.work_days ?? 1) * (merged.quantity ?? 1));
+      merged.amount = Math.round((merged.unit_price ?? 0) * (merged.quantity ?? 1));
     }
 
     let next = items.map((item, i) => (i === index ? merged : item));
 
     // 총액 유지 모드: 이 항목의 증감분을 나머지 항목에 (기존 비중대로) 비례 배분해 총액을 그대로 유지한다.
+    let redistributedDelta: number | null = null;
     if (keepTotal && "amount" in patch && items.length > 1) {
       const originalTotal = items.reduce((sum, item) => sum + item.amount, 0);
       const delta = merged.amount - items[index].amount;
       const othersSum = originalTotal - items[index].amount;
       if (delta !== 0 && othersSum > 0) {
+        redistributedDelta = delta;
         // ponytail: delta가 othersSum보다 크면(다른 항목을 전부 0으로 깎아도 못 흡수) scale을 0에서
         // 멈춘다 — 이 경우 총액이 정확히 안 맞을 수 있음. 필요해지면 음수 방지 대신 에러로 막을 것.
         const scale = Math.max(0, (othersSum - delta) / othersSum);
         next = items.map((item, i) => {
           if (i === index) return merged;
           const scaledAmount = Math.round(item.amount * scale);
-          const divisor = (item.work_days ?? 1) * (item.quantity ?? 1);
+          const divisor = item.quantity ?? 1;
           return { ...item, amount: scaledAmount, unit_price: divisor ? scaledAmount / divisor : scaledAmount };
         });
         // 반올림 오차는 마지막 "다른" 항목에서 흡수해 총액을 원래 값과 정확히 맞춘다
@@ -881,37 +973,54 @@ function LineItemTable({
           const lastOtherIndex = index === next.length - 1 ? next.length - 2 : next.length - 1;
           const item = next[lastOtherIndex];
           const fixedAmount = item.amount + roundingDiff;
-          const divisor = (item.work_days ?? 1) * (item.quantity ?? 1);
+          const divisor = item.quantity ?? 1;
           next[lastOtherIndex] = { ...item, amount: fixedAmount, unit_price: divisor ? fixedAmount / divisor : fixedAmount };
         }
       }
     }
 
-    await onSaveLineItems(next);
+    onSaveLineItems(next);
+    setAllocationFeedback(
+      redistributedDelta !== null
+        ? `차액 ${Math.abs(redistributedDelta).toLocaleString()}원을 다른 ${items.length - 1}개 항목에 자동 배분했습니다.`
+        : null
+    );
   }
 
   return (
     <div>
-      <div className="mb-2 flex justify-end">
-        <label className="flex items-center gap-1.5 text-sm text-gray-600">
-          <input
-            type="checkbox"
-            checked={keepTotal}
-            onChange={(e) => setKeepTotal(e.target.checked)}
-          />
-          총액 유지 (금액 수정 시 다른 항목에서 자동 배분)
-        </label>
-      </div>
-      <div className="overflow-x-auto rounded-lg border border-gray-200 bg-white">
-      <table className="w-full min-w-[560px] border-collapse text-base">
+      {allocationFeedback && (
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-xl bg-indigo-50 px-3.5 py-2.5 text-xs text-indigo-800">
+          <span>{allocationFeedback}</span>
+        </div>
+      )}
+      <div
+        className={
+          "overflow-x-auto rounded-lg border border-gray-200 bg-white " +
+          (!showCategorySplit && !hasTextDetail ? "w-full max-w-[980px]" : "w-full")
+        }
+      >
+      <table className="w-full min-w-[760px] table-fixed border-collapse text-base">
+        <colgroup>
+          {showCategorySplit && (
+            <>
+              <col style={{ width: "8%" }} />
+              <col style={{ width: "8%" }} />
+            </>
+          )}
+          <col style={{ width: showCategorySplit ? "18%" : hasTextDetail ? "35%" : "32%" }} />
+          {order.map((key) => <col key={key} style={{ width: detailColumnWidth(key) }} />)}
+          <col style={{ width: hasTextDetail ? "13%" : "28%" }} />
+          {hasNote && <col style={{ width: "16%" }} />}
+        </colgroup>
         <thead>
           <tr className="border-b border-gray-200 bg-gray-100">
             {showCategorySplit && (
               <>
-                <th className="px-3 py-2 text-left text-sm font-semibold text-gray-600">
+                <th className="whitespace-nowrap px-3 py-2 text-left text-sm font-semibold text-gray-600">
                   {columnLabels.category_large ?? "구분(대)"}
                 </th>
-                <th className="px-3 py-2 text-left text-sm font-semibold text-gray-600">
+                <th className="whitespace-nowrap px-3 py-2 text-left text-sm font-semibold text-gray-600">
                   {columnLabels.category_mid ?? "구분(중)"}
                 </th>
               </>
@@ -924,13 +1033,13 @@ function LineItemTable({
                 key={key}
                 className={
                   "px-3 py-2 text-sm font-semibold text-gray-600 " +
-                  (TEXT_DETAIL_KEYS.has(key) ? "text-center" : "text-right")
+                  (TEXT_DETAIL_KEYS.has(key) ? "text-left" : "whitespace-nowrap text-right")
                 }
               >
                 {labelFor(key)}
               </th>
             ))}
-            <th className="px-3 py-2 text-right text-sm font-semibold text-gray-600">
+            <th className="whitespace-nowrap px-3 py-2 text-right text-sm font-semibold text-gray-600">
               {columnLabels.supply_amount ?? columnLabels.amount ?? DEFAULT_COLUMN_LABELS.supply_amount}
             </th>
             {hasNote && (
@@ -1047,35 +1156,73 @@ function ComparisonSummaryTable({ quotes, primaryTotal }: { quotes: EntityQuote[
 function QuoteCard({
   quote,
   vatIncluded,
-  onOpenChat,
+  pending,
   onSaveServiceName,
   onSaveQuoteDate,
   onSaveRecipientInfo,
-  onSaveLineItems,
+  onStageLineItems,
+  onCommitPending,
+  onDiscardPending,
+  onRevertToOriginal,
+  onRevertToPrevious,
 }: {
   quote: EntityQuote;
   vatIncluded: boolean;
-  onOpenChat: () => void;
+  pending: PendingEdit | null;
   onSaveServiceName: (value: string) => Promise<void>;
   onSaveQuoteDate: (value: string) => Promise<void>;
   onSaveRecipientInfo: (input: RecipientInfoInput) => Promise<void>;
-  onSaveLineItems: (items: LineItem[]) => Promise<void>;
+  onStageLineItems: (items: LineItem[]) => void;
+  onCommitPending: () => Promise<void>;
+  onDiscardPending: () => void;
+  onRevertToOriginal: () => Promise<void>;
+  onRevertToPrevious: () => Promise<void>;
 }) {
+  const contactRequired = RECIPIENT_CONTACT_ENTITIES.includes(quote.entity_name);
+  const missingRequiredFields = [
+    !quote.quote_date && "작성일",
+    !quote.recipient_name && "수신자",
+    quote.entity_name === TESTIFY_NAME && !quote.service_name && "용역명",
+    contactRequired && !quote.recipient_contact && "담당자",
+    contactRequired && !quote.recipient_phone && "연락처",
+    contactRequired && !quote.recipient_email && "이메일",
+  ].filter(Boolean);
+  const hasMissingRequired = missingRequiredFields.length > 0;
+  const [infoExpanded, setInfoExpanded] = useState(false);
+  const [keepTotal, setKeepTotal] = useState(true);
+  const [busyAction, setBusyAction] = useState<"commit" | "original" | "previous" | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const displayQuote = pending
+    ? { ...quote, line_items: pending.items, total_amount: computeGrandTotal(pending.items, vatIncluded) }
+    : quote;
+
+  async function runAction(kind: "commit" | "original" | "previous", fn: () => Promise<void>) {
+    setBusyAction(kind);
+    setActionError(null);
+    try {
+      await fn();
+    } catch (e) {
+      setActionError(e instanceof ApiError ? e.message : "처리에 실패했습니다.");
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
   return (
     // 내용(왼쪽, 편집)과 뷰어(오른쪽, 실제 양식)를 나란히 둔다 — 이전엔 편집 표 밑에 800px
     // iframe이 이어져서 미리보기를 보려면 한참 스크롤해야 했고, 수정할 때마다 표와 미리보기를
     // 번갈아 스크롤해야 했다. 뷰어는 sticky라 편집 중에도 계속 눈에 보인다.
-    <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,3fr)_minmax(360px,2fr)] xl:items-start">
-      <div className="overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-sm">
+    <div className="mx-auto grid w-full max-w-[1500px] grid-cols-1 gap-5 min-[1600px]:grid-cols-[minmax(680px,1fr)_440px] min-[1600px]:items-start min-[1900px]:grid-cols-[minmax(720px,1010px)_470px]">
+      <div className="overflow-hidden rounded-2xl border border-black/10 bg-white shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
         <div className="border-b border-slate-100 px-6 py-5">
-          <div className="flex items-start justify-between gap-4">
+          <div className="flex flex-wrap items-start justify-between gap-4">
           <div>
             <div className="flex flex-wrap items-center gap-2">
               <span
                 className={
                   quote.is_primary
-                    ? "rounded-full bg-indigo-600 px-3 py-1 text-xs font-bold text-white"
-                    : "rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-600"
+                    ? "rounded-md bg-slate-900 px-2.5 py-1 text-xs font-semibold text-white"
+                    : "rounded-md bg-slate-100 px-2.5 py-1 text-xs font-semibold text-slate-600"
                 }
               >
                 {quote.is_primary ? "본견적서" : "비교견적서"}
@@ -1092,82 +1239,200 @@ function QuoteCard({
             <p className="mt-2 text-2xl font-bold tracking-tight text-slate-950">{quote.entity_name}</p>
             <p className="mt-1 text-sm text-slate-500">아래 정보를 입력하면 실제 견적서에 바로 반영됩니다.</p>
           </div>
-          <div className="text-right">
-            <p className="text-xs font-medium text-slate-400">견적 금액</p>
+          <div className="ml-auto text-right">
+            <p className="text-xs font-medium text-slate-400">견적 금액{pending && " (미반영 변경 포함)"}</p>
             <p className="mt-1 whitespace-nowrap text-3xl font-bold tracking-tight text-slate-950">
-              {quote.total_amount.toLocaleString()}
+              {displayQuote.total_amount.toLocaleString()}
               <span className="ml-0.5 text-base font-medium text-slate-400">원</span>
             </p>
+            {quote.line_items.length > 0 && (
+              <div className="mt-3 flex justify-end gap-2">
+                <a
+                  href={getEntityQuotePdfUrl(quote.id)}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-indigo-700"
+                >
+                  <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <path d="M12 3v12m0 0 4-4m-4 4-4-4M5 20h14" />
+                  </svg>
+                  PDF 다운로드
+                </a>
+                <a
+                  href={getEntityQuoteXlsxUrl(quote.id)}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-black/10 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-700 transition hover:bg-slate-100"
+                >
+                  <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <path d="M12 3v12m0 0 4-4m-4 4-4-4M5 20h14" />
+                  </svg>
+                  엑셀 다운로드
+                </a>
+              </div>
+            )}
           </div>
           </div>
         </div>
 
-        <div className="border-b border-slate-100 bg-slate-50/70 px-6 py-5">
-          <div className="mb-4 flex items-center justify-between gap-3">
+        <div
+          className={
+            "border-b px-5 py-3.5 transition-colors " +
+            (hasMissingRequired ? "border-amber-200 bg-amber-50/80" : "border-slate-100 bg-slate-50/70")
+          }
+        >
+          <div className={"flex items-center justify-between gap-3 " + (infoExpanded ? "mb-3" : "")}>
             <div>
-              <h3 className="text-sm font-bold text-slate-900">견적서 발급 정보</h3>
-              <p className="mt-0.5 text-xs text-slate-500">입력 후 다른 곳을 누르면 자동 저장됩니다.</p>
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                <h3 className="flex items-center gap-1.5 text-sm font-bold text-slate-900">
+                  {hasMissingRequired && (
+                    <svg className="h-4 w-4 text-amber-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                      <path d="M12 9v4m0 4h.01" />
+                      <path d="M10.3 3.9 2.5 17.5A2 2 0 0 0 4.2 20h15.6a2 2 0 0 0 1.7-2.5L13.7 3.9a2 2 0 0 0-3.4 0Z" />
+                    </svg>
+                  )}
+                  견적서 발급 정보
+                </h3>
+                {hasMissingRequired && (
+                  <span className="rounded-md bg-amber-100 px-2 py-0.5 text-[11px] font-bold text-amber-800">
+                    필수 입력 정보 미입력 · {missingRequiredFields.length}개
+                  </span>
+                )}
+                {!infoExpanded && (
+                  <p className="text-xs text-slate-500">
+                    {quote.quote_date ?? "날짜 미입력"} · {quote.recipient_name || "수신자 미입력"}
+                  </p>
+                )}
+              </div>
+              {infoExpanded && (
+                <p className={"mt-0.5 text-xs " + (hasMissingRequired ? "font-medium text-amber-700" : "text-slate-500")}>
+                  {hasMissingRequired ? "견적서 발급 전 반드시 입력해 주세요." : "입력 후 자동 저장됩니다."}
+                </p>
+              )}
             </div>
-            <span className="rounded-full bg-white px-2.5 py-1 text-[11px] font-medium text-slate-500 ring-1 ring-slate-200">자동 저장</span>
+            <button
+              type="button"
+              onClick={() => setInfoExpanded((value) => !value)}
+              className={
+                "shrink-0 rounded-lg border px-3 py-1.5 text-xs font-semibold transition " +
+                (hasMissingRequired
+                  ? "border-amber-600 bg-amber-600 text-white shadow-sm hover:bg-amber-700"
+                  : "border-slate-200 bg-white text-slate-600 hover:border-indigo-200 hover:text-indigo-700")
+              }
+              aria-expanded={infoExpanded}
+            >
+              {infoExpanded ? "접기" : "정보 수정"}
+            </button>
           </div>
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <QuoteDateField quote={quote} onSave={onSaveQuoteDate} />
-            {quote.entity_name === TESTIFY_NAME && (
-              <ServiceNameField quote={quote} onSave={onSaveServiceName} />
-            )}
-          </div>
-          <div className="mt-3">
-            <RecipientInfoFields quote={quote} onSave={onSaveRecipientInfo} />
-          </div>
+          {infoExpanded && (
+            <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+              <QuoteDateField quote={quote} onSave={onSaveQuoteDate} />
+              {quote.entity_name === TESTIFY_NAME && (
+                <ServiceNameField quote={quote} onSave={onSaveServiceName} />
+              )}
+              <div className={quote.entity_name === TESTIFY_NAME ? "lg:col-span-2" : "lg:col-span-1"}>
+                <RecipientInfoFields quote={quote} onSave={onSaveRecipientInfo} />
+              </div>
+            </div>
+          )}
         </div>
 
         {quote.line_items.length > 0 ? (
           <div className="px-6 py-5">
-            <div className="mb-3 flex items-center justify-between">
-              <h3 className="text-sm font-bold text-slate-900">견적 항목</h3>
-              <span className="text-xs text-slate-400">항목을 눌러 직접 수정할 수 있습니다.</span>
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-bold text-slate-900">견적 항목</h3>
+                <p className="mt-0.5 text-xs text-slate-400">항목을 눌러 직접 수정할 수 있습니다.</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setKeepTotal((value) => !value)}
+                aria-pressed={keepTotal}
+                title={
+                  keepTotal
+                    ? "항목 금액 변경 시 차액을 다른 항목에 자동 배분합니다."
+                    : "항목 금액을 변경하면 견적 총액도 함께 변경됩니다."
+                }
+                className={
+                  "inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-semibold transition " +
+                  (keepTotal
+                    ? "border-slate-900 bg-slate-900 text-white"
+                    : "border-black/10 bg-slate-50 text-slate-600 hover:bg-slate-100")
+                }
+              >
+                <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  {keepTotal ? (
+                    <><rect x="5" y="10" width="14" height="10" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3" /></>
+                  ) : (
+                    <><rect x="5" y="10" width="14" height="10" rx="2" /><path d="M9 10V7a4 4 0 0 1 7.5-2" /></>
+                  )}
+                </svg>
+                {keepTotal ? `총합계 ${displayQuote.total_amount.toLocaleString()}원 고정` : "총합계 변경 가능"}
+              </button>
             </div>
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-100 bg-slate-50/70 px-3.5 py-2.5">
+              <p className="text-xs text-slate-500">
+                {pending ? (
+                  <span className="font-semibold text-amber-700">저장되지 않은 변경사항이 있습니다 · 수정 반영하기를 눌러야 실제 견적서에 저장됩니다.</span>
+                ) : (
+                  "직접 편집하거나 채팅으로 수정하면 여기서 미리 확인한 뒤 반영할 수 있습니다."
+                )}
+              </p>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={busyAction !== null}
+                  onClick={() => runAction("previous", onRevertToPrevious)}
+                  className="rounded-lg border border-black/10 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {busyAction === "previous" ? "불러오는 중…" : "뒤로 가기"}
+                </button>
+                <button
+                  type="button"
+                  disabled={busyAction !== null}
+                  onClick={() => runAction("original", onRevertToOriginal)}
+                  className="rounded-lg border border-black/10 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {busyAction === "original" ? "불러오는 중…" : "원본으로 되돌리기"}
+                </button>
+                {pending && (
+                  <button
+                    type="button"
+                    disabled={busyAction !== null}
+                    onClick={onDiscardPending}
+                    className="rounded-lg border border-black/10 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    되돌아가기
+                  </button>
+                )}
+                {pending && (
+                  <button
+                    type="button"
+                    disabled={busyAction !== null}
+                    onClick={() => runAction("commit", onCommitPending)}
+                    className="rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {busyAction === "commit" ? "반영하는 중…" : "수정 반영하기"}
+                  </button>
+                )}
+              </div>
+            </div>
+            {actionError && <p className="mb-3 text-xs text-red-600">{actionError}</p>}
             <LineItemTable
-              items={quote.line_items}
+              items={displayQuote.line_items}
               columnLabels={quote.column_labels}
               detailColumnOrder={quote.detail_column_order}
-              totalAmount={quote.total_amount}
+              totalAmount={displayQuote.total_amount}
               vatIncluded={vatIncluded}
               showCategorySplit={quote.show_category_split}
-              onSaveLineItems={onSaveLineItems}
+              keepTotal={keepTotal}
+              onSaveLineItems={onStageLineItems}
             />
           </div>
         ) : (
           <p className="px-6 py-8 text-sm text-gray-400">아직 항목이 생성되지 않았습니다.</p>
         )}
 
-        {quote.line_items.length > 0 && (
-          <div className="flex flex-wrap gap-2 border-t border-slate-100 px-6 py-5">
-            <button
-              type="button"
-              onClick={onOpenChat}
-              className="rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-indigo-500"
-            >
-              채팅으로 수정
-            </button>
-            <a
-              href={getEntityQuotePdfUrl(quote.id)}
-              className="rounded-xl border border-slate-200 px-4 py-2.5 text-sm font-semibold text-slate-700 transition hover:border-slate-300 hover:bg-slate-50"
-            >
-              PDF 다운로드
-            </a>
-            <a
-              href={getEntityQuoteXlsxUrl(quote.id)}
-              className="rounded-xl border border-slate-200 px-4 py-2.5 text-sm font-semibold text-slate-700 transition hover:border-slate-300 hover:bg-slate-50"
-            >
-              엑셀 다운로드
-            </a>
-          </div>
-        )}
       </div>
 
       {quote.line_items.length > 0 && (
-        <div className="xl:sticky xl:top-6">
+        <div className="hidden min-[1600px]:sticky min-[1600px]:top-6 min-[1600px]:block">
           <QuotePreviewPane quote={quote} />
         </div>
       )}
@@ -1186,7 +1451,7 @@ function QuotePreviewPane({ quote }: { quote: EntityQuote }) {
   const loading = loadedKey !== previewKey;
 
   return (
-    <div className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm">
+    <div className="rounded-2xl border border-black/10 bg-white p-3 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
       <div className="mb-3 flex items-center justify-between gap-3">
         <div>
           <p className="text-sm font-bold text-slate-900">{quote.is_primary ? "본견적서" : "비교견적서"} 미리보기</p>
@@ -1215,22 +1480,14 @@ function QuotePreviewPane({ quote }: { quote: EntityQuote }) {
   );
 }
 
-function EditChatModal({
+function PersistentEditChat({
   quote,
   messages,
-  vatIncluded,
-  highlightKeys,
   onSend,
-  onClose,
-  onSaveLineItems,
 }: {
   quote: EntityQuote;
   messages: ChatMessage[];
-  vatIncluded: boolean;
-  highlightKeys?: Set<string>;
   onSend: (text: string) => Promise<void>;
-  onClose: () => void;
-  onSaveLineItems: (items: LineItem[]) => Promise<void>;
 }) {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
@@ -1257,34 +1514,40 @@ function EditChatModal({
   }
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4"
-      onClick={onClose}
-    >
-      <div
-        className="flex h-[82vh] w-full max-w-5xl overflow-hidden rounded-2xl bg-white shadow-xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* Left: 채팅 */}
-        <div className="flex w-2/5 flex-col border-r border-gray-200">
-          <div className="border-b border-gray-100 px-5 py-4">
-            <p className="text-sm font-semibold text-gray-900">채팅으로 수정</p>
-            <p className="mt-0.5 text-xs text-gray-500">
-              {quote.entity_name} · {quote.is_primary ? "본견적" : "비교견적"}
-            </p>
+    <aside className="estimate-chat-dock flex h-[560px] flex-col overflow-hidden rounded-2xl border border-black/10 bg-white shadow-[0_1px_2px_rgba(0,0,0,0.04)] xl:sticky xl:top-6 xl:h-[calc(100vh-3rem)]">
+          <div className="border-b border-slate-100 px-5 py-5 xl:pt-7">
+            <div className="flex items-center gap-2">
+              <span className="grid h-8 w-8 place-items-center rounded-lg bg-slate-100 text-slate-700">
+                <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4Z" />
+                </svg>
+              </span>
+              <div>
+                <p className="text-sm font-bold text-slate-900">채팅으로 견적 수정</p>
+                <p className="mt-0.5 text-xs text-slate-500">
+                  {quote.entity_name} · {quote.is_primary ? "본견적서" : "비교견적서"}
+                </p>
+              </div>
+            </div>
           </div>
-          <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto px-5 py-4">
+          <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto px-4 py-5">
             {messages.length === 0 && (
-              <p className="text-sm text-gray-400">
-                예: “2번 항목 200만원 낮추고 총액 유지해줘” 처럼 자연어로 요청해보세요.
-              </p>
+              <div className="rounded-2xl bg-slate-50 p-4">
+                <p className="text-sm font-semibold text-slate-700">어떻게 수정할까요?</p>
+                <p className="mt-1.5 text-xs leading-5 text-slate-500">
+                  수정할 내용을 편하게 입력하세요. 변경 사항은 오른쪽 견적서에 바로 반영됩니다.
+                </p>
+                <button type="button" onClick={() => setInput("2번 항목 금액을 낮추고 총액은 유지해줘")} className="mt-3 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-left text-xs text-slate-600 transition hover:border-indigo-200 hover:text-indigo-700">
+                  “2번 항목 금액을 낮추고 총액은 유지해줘”
+                </button>
+              </div>
             )}
             {messages.map((m, i) => (
               <div key={i} className={m.role === "user" ? "flex justify-end" : "flex justify-start"}>
                 <div
                   className={
                     "max-w-[85%] rounded-2xl px-3 py-2 text-sm " +
-                    (m.role === "user" ? "bg-indigo-600 text-white" : "bg-gray-100 text-gray-800")
+                    (m.role === "user" ? "bg-indigo-600 text-white" : "bg-slate-100 text-slate-800")
                   }
                 >
                   <p className="whitespace-pre-line">{m.text}</p>
@@ -1307,74 +1570,49 @@ function EditChatModal({
             )}
           </div>
           {errorMsg && <p className="px-5 pb-1 text-xs text-red-600">{errorMsg}</p>}
-          <div className="flex gap-2 border-t border-gray-100 px-4 py-3">
-            <input
-              type="text"
+          <div className="border-t border-slate-100 p-4">
+            <div className="rounded-2xl border border-slate-200 bg-white p-2 transition focus-within:border-indigo-400 focus-within:ring-4 focus-within:ring-indigo-50">
+            <textarea
+              rows={3}
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleSend()}
-              placeholder="예: 2번 항목 200만원 낮추고 총액 유지해줘"
-              className="flex-1 rounded-full border border-gray-300 px-4 py-2 text-sm focus:border-indigo-500 focus:outline-none"
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  handleSend();
+                }
+              }}
+              placeholder="수정할 내용을 입력하세요"
+              className="w-full resize-none px-2 py-1 text-sm text-slate-900 outline-none placeholder:text-slate-400"
             />
+            <div className="flex items-center justify-between gap-2 px-1 pb-0.5">
+              <span className="text-[11px] text-slate-400">Enter 전송 · Shift+Enter 줄바꿈</span>
             <button
               type="button"
               disabled={sending || !input.trim()}
               onClick={handleSend}
-              className="rounded-full bg-gray-900 px-4 py-2 text-sm font-medium text-white hover:bg-gray-700 disabled:cursor-not-allowed disabled:bg-gray-300"
+              aria-label="수정 요청 보내기"
+              className="grid h-9 w-9 place-items-center rounded-xl bg-indigo-600 text-white transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-slate-200"
             >
-              {sending ? "…" : "전송"}
+              {sending ? "…" : <span aria-hidden="true">↑</span>}
             </button>
-          </div>
-        </div>
-
-        {/* Right: 실시간 견적 미리보기 */}
-        <div className="flex w-3/5 flex-col">
-          <div className="flex items-center justify-between border-b border-gray-100 px-6 py-4">
-            <div>
-              <p className="text-base font-semibold text-gray-900">{quote.entity_name}</p>
-              <p className="text-xs text-gray-500">{quote.is_primary ? "본견적" : "비교견적"}</p>
             </div>
-            <div className="text-right">
-              <p className="text-lg font-bold text-gray-900">
-                {quote.total_amount.toLocaleString()}원
-              </p>
-              {quote.is_catalog_borrowed && (
-                <p className="text-xs font-medium text-amber-600">
-                  {quote.catalog_source_entity_name} 카탈로그 차용
-                </p>
-              )}
             </div>
           </div>
-          <div className="flex-1 overflow-y-auto px-6 py-4">
-            <LineItemTable
-              items={quote.line_items}
-              columnLabels={quote.column_labels}
-              detailColumnOrder={quote.detail_column_order}
-              totalAmount={quote.total_amount}
-              vatIncluded={vatIncluded}
-              showCategorySplit={quote.show_category_split}
-              highlightKeys={highlightKeys}
-              onSaveLineItems={onSaveLineItems}
-            />
-          </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="border-t border-gray-100 px-6 py-3 text-sm font-medium text-gray-600 hover:bg-gray-50"
-          >
-            닫기
-          </button>
-        </div>
-      </div>
-    </div>
+    </aside>
   );
 }
+
+const DEFAULT_MARKUP_PERCENT = 10;
 
 type EntitySelection = {
   entityId: string;
   role: "primary" | "comparison";
   // 과업종류(마케팅/시장검증)별 포함 여부 + 체크된 module_name들.
   tasks: Record<FixedTaskType, { included: boolean; moduleNames: string[] }>;
+  // 비교견적 마크업(%) — role이 comparison일 때만 쓰인다(2026-08-14 사용자 요청 — 고정 +10%
+  // 대신 기업마다 다르게 조절 가능해야 함).
+  markupPercent: number;
 };
 
 function emptyTasks(): EntitySelection["tasks"] {
@@ -1432,6 +1670,7 @@ function additiveModuleNamesMatchingLabels(
 }
 
 export default function EstimateWizard({ initialEstimateSetId }: { initialEstimateSetId?: string } = {}) {
+  const setGeneratedEstimateLayout = useGeneratedEstimateLayout();
   const [entities, setEntities] = useState<EntityOption[]>([]);
   const [entitiesLoading, setEntitiesLoading] = useState(true);
   // 과업종류별로 취급하지 않는 법인(예: 썬데이워커/ABBG × 시장검증)을 숨기기 위한 정보.
@@ -1458,15 +1697,46 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
   const [result, setResult] = useState<EstimateSet | null>(null);
   const [generating, setGenerating] = useState(false);
 
-  const [activeQuoteId, setActiveQuoteId] = useState<string | null>(null);
   const [viewedQuoteId, setViewedQuoteId] = useState<string | null>(null);
   const [chatHistory, setChatHistory] = useState<Record<string, ChatMessage[]>>({});
-  // 채팅 수정 직후 오른쪽 미리보기에서 어느 항목이 바뀌었는지 표시하기 위한 키 집합
-  // ("카테고리::항목명"). 사용자가 "수정되는지도 몰라요"라고 지적한 부분(2026-08-10) 대응.
-  const [lastChangedKeys, setLastChangedKeys] = useState<Record<string, Set<string>>>({});
+  // 직접편집·채팅 수정 모두 여기 쌓였다가 "수정 반영하기"를 눌러야 실제 저장된다(2026-08-14).
+  const [pendingByQuote, setPendingByQuote] = useState<Record<string, PendingEdit>>({});
+  const pendingByQuoteRef = useRef(pendingByQuote);
+  pendingByQuoteRef.current = pendingByQuote;
+  const resultRef = useRef(result);
+  resultRef.current = result;
 
   const [moduleOptions, setModuleOptions] = useState<EntityModuleOptions[]>([]);
   const [moduleSelections, setModuleSelections] = useState<Record<string, string[]>>({});
+
+  // "수정 반영하기"를 안 눌러도 저장이 되게 하는 안전망. 견적서 탭을 바꾸거나(SPA 내 이탈)
+  // 이 화면 자체를 벗어나면(라우트 이동) 그 시점까지의 pending을 자동으로 커밋한다. 브라우저
+  // 탭을 완전히 닫는 경우엔 비동기 저장 요청이 끝난다는 보장이 없어 대신 이탈을 막는 확인창을 띄운다.
+  useEffect(() => {
+    return () => {
+      if (viewedQuoteId && pendingByQuoteRef.current[viewedQuoteId]) {
+        handleCommitPending(viewedQuoteId);
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewedQuoteId]);
+
+  useEffect(() => {
+    return () => {
+      Object.keys(pendingByQuoteRef.current).forEach((quoteId) => handleCommitPending(quoteId));
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    function handleBeforeUnload(e: BeforeUnloadEvent) {
+      if (Object.keys(pendingByQuoteRef.current).length === 0) return;
+      e.preventDefault();
+      e.returnValue = "";
+    }
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, []);
 
   // 견적서 목록에서 기존 세트를 클릭해 들어온 경우, 새로 만드는 대신 그 결과 화면을 바로 불러온다.
   const [initialLoading, setInitialLoading] = useState(!!initialEstimateSetId);
@@ -1486,6 +1756,11 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
   const referenceEntityId = primaryEntityId || entitySelections[0]?.entityId || "";
   const resultId = result?.id;
   const resultHasItems = result?.entity_quotes.some((q) => q.line_items.length > 0) ?? false;
+
+  useEffect(() => {
+    setGeneratedEstimateLayout(Boolean(result));
+    return () => setGeneratedEstimateLayout(false);
+  }, [result, setGeneratedEstimateLayout]);
 
   // 법인 목록은 과업종류 필터링 없이 한 번만 불러온다(2026-08 개편 — 기업을 먼저 고르므로).
   // 기존 /api/entities?task_type= 엔드포인트를 그대로 재사용해 두 과업종류 각각 호출한 뒤
@@ -1601,7 +1876,7 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
     // 비교견적서는 개수 제한 없음(2026-08-12 사용자 결정) — 본견적 1곳만 setRole에서 별도로 막는다.
     setEntitySelections((prev) => {
       if (prev.some((s) => s.entityId === entityId)) return prev.filter((s) => s.entityId !== entityId);
-      return [...prev, { entityId, role: "comparison" as const, tasks: emptyTasks() }];
+      return [...prev, { entityId, role: "comparison" as const, tasks: emptyTasks(), markupPercent: DEFAULT_MARKUP_PERCENT }];
     });
   }
 
@@ -1613,6 +1888,10 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
         return s;
       });
     });
+  }
+
+  function setMarkupPercent(entityId: string, percent: number) {
+    setEntitySelections((prev) => prev.map((s) => (s.entityId === entityId ? { ...s, markupPercent: percent } : s)));
   }
 
   function toggleTaskIncluded(entityId: string, taskType: FixedTaskType, included: boolean) {
@@ -1689,6 +1968,7 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
           entity_id: s.entityId,
           is_primary: s.role === "primary",
           task_types: FIXED_TASK_TYPES.filter((t) => effectiveTasks(s)[t].included),
+          markup_ratio: s.role === "comparison" ? s.markupPercent / 100 : undefined,
         })),
         service_name: primaryIsTestify ? serviceName : undefined,
       });
@@ -1723,9 +2003,9 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
     setVatIncluded(true);
     setServiceName("");
     setError(null);
-    setActiveQuoteId(null);
     setViewedQuoteId(null);
     setChatHistory({});
+    setPendingByQuote({});
     setModuleOptions([]);
     setModuleSelections({});
   }
@@ -1770,9 +2050,50 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
     handleQuoteEdited(updated);
   }
 
-  async function handleSaveLineItems(quoteId: string, items: LineItem[]) {
-    const updated = await updateLineItems(quoteId, items);
-    handleQuoteEdited(updated);
+  // 직접편집(표 셀 수정)이 호출한다 — 아직 저장하지 않고 화면 미리보기(pending)만 갱신한다.
+  function handleStageLineItems(quoteId: string, items: LineItem[]) {
+    setPendingByQuote((prev) => ({ ...prev, [quoteId]: { items, editRequestText: "직접편집" } }));
+  }
+
+  // "수정 반영하기" — pending을 실제로 저장한다. 직접편집이든 채팅 수정이든 같은 경로로 커밋된다.
+  async function handleCommitPending(quoteId: string) {
+    const pending = pendingByQuoteRef.current[quoteId];
+    if (!pending) return;
+    await updateLineItems(quoteId, pending.items, pending.editRequestText);
+    setPendingByQuote((prev) => {
+      const next = { ...prev };
+      delete next[quoteId];
+      return next;
+    });
+    // 본견적 수정은 백엔드에서 같은 세트의 비교견적 총액도 함께 재계산한다(sync_service) —
+    // 수정된 견적 하나만 병합하면 화면에 남은 비교견적들이 옛 총액인 채로 보이므로 세트 전체를 다시 받는다.
+    // resultRef를 쓰는 이유: 이 함수는 화면 이탈 시 자동 flush(useEffect cleanup)에서도 호출되는데,
+    // 그 클로저는 마운트 시점 값을 캡처해 result가 stale할 수 있다.
+    if (resultRef.current) setResult(await fetchEstimateSet(resultRef.current.id));
+  }
+
+  // "되돌아가기" — pending을 버리고 마지막으로 저장된 상태로 화면을 되돌린다.
+  function handleDiscardPending(quoteId: string) {
+    setPendingByQuote((prev) => {
+      const next = { ...prev };
+      delete next[quoteId];
+      return next;
+    });
+  }
+
+  // "원본으로 되돌리기"/"뒤로 가기" — 과거 버전의 항목들을 pending에 올려 미리 보여준다. 여기서도
+  // 바로 저장하지 않고 "수정 반영하기"를 눌러야 커밋된다(되돌리기도 직접편집과 같은 경로 공유).
+  async function handleRevertToVersion(quoteId: string, which: "original" | "previous") {
+    const versions = await fetchQuoteVersions(quoteId);
+    if (versions.length === 0) return;
+    const target = which === "original" ? versions[0] : versions[Math.max(0, versions.length - 2)];
+    setPendingByQuote((prev) => ({
+      ...prev,
+      [quoteId]: {
+        items: target.line_items as LineItem[],
+        editRequestText: which === "original" ? "원본으로 되돌리기" : "이전 버전으로 되돌리기",
+      },
+    }));
   }
 
   async function handleSendEdit(quoteId: string, text: string) {
@@ -1781,8 +2102,13 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
       [quoteId]: [...(prev[quoteId] ?? []), { role: "user", text }],
     }));
 
+    // 채팅 수정도 미리보기 전용(edit_service)이라 여기서 바로 저장되지 않는다 — 직접편집과 같은
+    // pending 상태에 얹어서, 화면에서 확인 후 "수정 반영하기"를 눌러야 실제로 커밋된다.
     const editResult = await editEntityQuote(quoteId, text);
-    handleQuoteEdited(editResult.entity_quote);
+    setPendingByQuote((prev) => ({
+      ...prev,
+      [quoteId]: { items: editResult.entity_quote.line_items as LineItem[], editRequestText: text },
+    }));
 
     const summary =
       editResult.changed_items.length > 0
@@ -1792,10 +2118,6 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
     setChatHistory((prev) => ({
       ...prev,
       [quoteId]: [...(prev[quoteId] ?? []), { role: "assistant", text: summary, scope: editResult.scope }],
-    }));
-    setLastChangedKeys((prev) => ({
-      ...prev,
-      [quoteId]: new Set(editResult.changed_items.map((i) => `${i.category}::${i.name}`)),
     }));
   }
 
@@ -1807,7 +2129,6 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
     const hasItems = result.entity_quotes.some((q) => q.line_items.length > 0);
     const primaryQuote = result.entity_quotes.find((q) => q.is_primary) ?? null;
     const comparisonQuotes = result.entity_quotes.filter((q) => !q.is_primary);
-    const activeQuote = result.entity_quotes.find((q) => q.id === activeQuoteId) ?? null;
     const viewedQuote =
       result.entity_quotes.find((q) => q.id === viewedQuoteId) ?? primaryQuote ?? comparisonQuotes[0] ?? null;
     const modulesToChoose = moduleOptions.filter((o) => o.has_modules);
@@ -1817,10 +2138,25 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
     );
 
     return (
-      <div className="space-y-6">
-        <div className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-gray-200 bg-white p-6 shadow-sm">
+      <div
+        className={
+          viewedQuote && hasItems
+            ? "mx-auto grid w-full max-w-[1860px] grid-cols-1 gap-5 xl:grid-cols-[340px_minmax(0,1fr)] xl:items-start"
+            : ""
+        }
+      >
+        {viewedQuote && hasItems && (
+          <PersistentEditChat
+            key={viewedQuote.id}
+            quote={viewedQuote}
+            messages={chatHistory[viewedQuote.id] ?? []}
+            onSend={(text) => handleSendEdit(viewedQuote.id, text)}
+          />
+        )}
+        <div className="mx-auto w-full max-w-[1500px] min-w-0 space-y-6">
+        <div className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-black/10 bg-white p-5 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
           <div>
-            <p className="text-sm font-medium text-emerald-600">견적 세트 생성 완료</p>
+            <p className="text-xs font-semibold text-slate-500">견적 세트 생성 완료</p>
             <h2 className="mt-1 text-2xl font-bold text-gray-900">{result.project_name}</h2>
           </div>
           <div className="flex flex-wrap gap-8">
@@ -1841,9 +2177,10 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
           <button
             onClick={handleReset}
             title="지금 만든 견적은 그대로 두고, 처음 화면으로 돌아가 다른 견적을 새로 만듭니다."
-            className="rounded-full border border-gray-300 px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-50"
+            className="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-black/10 bg-slate-50 text-lg text-slate-600 transition hover:bg-slate-100"
+            aria-label="다른 견적 새로 만들기"
           >
-            + 다른 견적 새로 만들기
+            <span aria-hidden="true">＋</span>
           </button>
         </div>
 
@@ -1959,11 +2296,11 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
         ) : (
           <div className="space-y-5">
             {result.entity_quotes.length > 1 && (
-              <ComparisonSummaryTable quotes={result.entity_quotes} primaryTotal={primaryQuote?.total_amount} />
+              <ComparisonSummaryTable quotes={displayQuotes} primaryTotal={primaryQuote?.total_amount} />
             )}
 
             {result.entity_quotes.length > 1 && (
-              <div className="flex flex-wrap gap-2">
+              <div className="flex flex-wrap gap-2 border-b border-slate-200 pb-3">
                 {displayQuotes.map((q) => {
                   const selected = (viewedQuote?.id ?? primaryQuote?.id) === q.id;
                   return (
@@ -1971,21 +2308,38 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
                       key={q.id}
                       type="button"
                       onClick={() => setViewedQuoteId(q.id)}
+                      aria-pressed={selected}
                       className={
-                        "rounded-full border px-4 py-2 text-sm font-medium " +
+                        "inline-flex items-center gap-1.5 rounded-lg border px-3 py-2 text-sm font-medium transition " +
                         (selected
-                          ? q.is_primary
-                            ? "border-indigo-600 bg-indigo-600 text-white shadow-sm"
-                            : "border-slate-700 bg-slate-700 text-white shadow-sm"
-                          : q.is_primary
-                            ? "border-indigo-200 bg-indigo-50 text-indigo-700 hover:border-indigo-300"
-                            : "border-gray-300 bg-white text-gray-700 hover:border-gray-400")
+                          ? "border-slate-900 bg-slate-900 text-white"
+                          : "border-black/10 bg-white text-slate-700 hover:bg-slate-50")
                       }
                     >
-                      {q.entity_name}
-                      <span className="ml-1.5 text-xs opacity-70">{q.is_primary ? "본견적서" : "비교견적서"}</span>
+                      {selected && (
+                        <svg className="h-3.5 w-3.5 shrink-0" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                          <path d="m3 8 3 3 7-7" />
+                        </svg>
+                      )}
+                      <span>{q.entity_name}</span>
+                      <span
+                        className={
+                          "rounded-full px-2 py-0.5 text-[10px] font-bold " +
+                          (q.is_primary
+                            ? selected
+                              ? "bg-blue-500/25 text-blue-100"
+                              : "bg-blue-50 text-blue-700"
+                            : selected
+                              ? "bg-white/10 text-white"
+                              : "bg-slate-100 text-slate-500")
+                        }
+                      >
+                        {q.is_primary ? "본견적" : "비교견적"}
+                      </span>
                       {q.total_amount > 0 && (
-                        <span className="ml-1.5 text-xs opacity-70">· {q.total_amount.toLocaleString()}원</span>
+                        <span className={"text-xs " + (selected ? "text-slate-300" : "text-slate-400")}>
+                          · {q.total_amount.toLocaleString()}원
+                        </span>
                       )}
                     </button>
                   );
@@ -1998,27 +2352,21 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
                 key={viewedQuote.id}
                 quote={viewedQuote}
                 vatIncluded={result.vat_included}
-                onOpenChat={() => setActiveQuoteId(viewedQuote.id)}
+                pending={pendingByQuote[viewedQuote.id] ?? null}
                 onSaveServiceName={(value) => handleSaveServiceName(viewedQuote.id, value)}
                 onSaveQuoteDate={(value) => handleSaveQuoteDate(viewedQuote.id, value)}
                 onSaveRecipientInfo={(input) => handleSaveRecipientInfo(viewedQuote.id, input)}
-                onSaveLineItems={(items) => handleSaveLineItems(viewedQuote.id, items)}
+                onStageLineItems={(items) => handleStageLineItems(viewedQuote.id, items)}
+                onCommitPending={() => handleCommitPending(viewedQuote.id)}
+                onDiscardPending={() => handleDiscardPending(viewedQuote.id)}
+                onRevertToOriginal={() => handleRevertToVersion(viewedQuote.id, "original")}
+                onRevertToPrevious={() => handleRevertToVersion(viewedQuote.id, "previous")}
               />
             )}
           </div>
         )}
 
-        {activeQuote && (
-          <EditChatModal
-            quote={activeQuote}
-            messages={chatHistory[activeQuote.id] ?? []}
-            vatIncluded={result.vat_included}
-            highlightKeys={lastChangedKeys[activeQuote.id]}
-            onSend={(text) => handleSendEdit(activeQuote.id, text)}
-            onClose={() => setActiveQuoteId(null)}
-            onSaveLineItems={(items) => handleSaveLineItems(activeQuote.id, items)}
-          />
-        )}
+        </div>
       </div>
     );
   }
@@ -2092,20 +2440,36 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
             {entitySelections.map((s) => (
               <div key={s.entityId} className="flex flex-wrap items-center justify-between gap-3 bg-white px-4 py-3">
                 <span className="text-base font-semibold text-gray-900">{entityLabel(s.entityId)}</span>
-                <div className="inline-flex rounded-full border border-gray-200 bg-gray-50 p-0.5">
-                  {(["primary", "comparison"] as const).map((role) => (
-                    <button
-                      key={role}
-                      type="button"
-                      onClick={() => setRole(s.entityId, role)}
-                      className={
-                        "rounded-full px-3.5 py-1.5 text-sm font-medium transition-colors " +
-                        (s.role === role ? "bg-indigo-600 text-white shadow-sm" : "text-gray-600 hover:text-gray-900")
-                      }
-                    >
-                      {role === "primary" ? "본견적" : "비교견적 +10%"}
-                    </button>
-                  ))}
+                <div className="flex items-center gap-2">
+                  {s.role === "comparison" && (
+                    <label className="flex items-center gap-1 text-sm text-gray-500">
+                      <span>마크업</span>
+                      <input
+                        type="number"
+                        step="1"
+                        value={s.markupPercent}
+                        onChange={(e) => setMarkupPercent(s.entityId, Number(e.target.value))}
+                        onClick={(e) => e.stopPropagation()}
+                        className="w-14 rounded-md border border-gray-200 px-1.5 py-1 text-right text-sm"
+                      />
+                      <span>%</span>
+                    </label>
+                  )}
+                  <div className="inline-flex rounded-full border border-gray-200 bg-gray-50 p-0.5">
+                    {(["primary", "comparison"] as const).map((role) => (
+                      <button
+                        key={role}
+                        type="button"
+                        onClick={() => setRole(s.entityId, role)}
+                        className={
+                          "rounded-full px-3.5 py-1.5 text-sm font-medium transition-colors " +
+                          (s.role === role ? "bg-indigo-600 text-white shadow-sm" : "text-gray-600 hover:text-gray-900")
+                        }
+                      >
+                        {role === "primary" ? "본견적" : "비교견적"}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </div>
             ))}
