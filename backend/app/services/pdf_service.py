@@ -244,6 +244,16 @@ def _patch_font_substitution(styles_xml: str) -> str:
     return _FONT_ELEMENT_PATTERN.sub(_fix_font, styles_xml)
 
 
+def _strip_sheet_background_picture(sheet_xml: str) -> str:
+    """ABBG 마스터는 알파브라더스 양식을 복제해 만든 흔적으로 시트 배경 서식(Format Background)에
+    알파브라더스 워터마크(image1.jpeg)가 그대로 남아있다(2026-08-16 발견). Excel은 배경 서식 이미지를
+    인쇄/PDF 내보내기에서 항상 제외하지만(사용자가 엑셀에서 직접 PDF로 내보내면 정상으로 보이는 이유),
+    LibreOffice headless는 이를 그대로 렌더링해 잘못된 워터마크가 찍힌다. 실제 ABBG 워터마크는 별도
+    VML 도형(vmlDrawing)으로 들어있어 이 배경을 지워도 영향 없다. 알파브라더스 자신은 이 배경 이미지가
+    본인 워터마크이므로(2026-08-13 fix로 색공간만 수정, 유지) 이 함수는 ABBG에만 적용한다."""
+    return re.sub(r"<picture[^/]*/>", "", sheet_xml)
+
+
 def _strip_sheet_hyperlinks(sheet_xml: str) -> str:
     """블렌디드랩 마스터 B2("견적서" 제목) 셀에 실제 <hyperlinks> 요소가 걸려 있었다(원본 제작사
     yesform.com 템플릿 검색 페이지로 연결되는, 견적서 내용과 무관한 잔재 링크) — 진짜 하이퍼링크는
@@ -591,11 +601,14 @@ def _patch_xlsx(
     dest_path: Path,
     hidden_rows: Optional[set] = None,
     item_blocks: Optional[List[dict]] = None,
+    strip_background: bool = False,
 ) -> None:
     with zipfile.ZipFile(io.BytesIO(source_bytes), "r") as zin:
         sheet_path = _sheet_internal_path(zin, sheet_name)
         sheet_xml = zin.read(sheet_path).decode("utf-8")
         patched_sheet_xml = _patch_sheet_xml(sheet_xml, updates)
+        if strip_background:
+            patched_sheet_xml = _strip_sheet_background_picture(patched_sheet_xml)
         patched_sheet_xml = _strip_sheet_hyperlinks(patched_sheet_xml)
         patched_sheet_xml = _strip_all_formula_caches(patched_sheet_xml)
         patched_sheet_xml = _hide_rows(patched_sheet_xml, hidden_rows or set())
@@ -981,15 +994,35 @@ def _assign_groups_to_blocks(groups: List[Dict[str, Any]], blocks: List[dict], c
             status_code=422,
             detail=f"이 양식은 카테고리 {len(blocks)}개까지만 담을 수 있는데 항목이 {len(groups)}개 카테고리로 나뉘어 있습니다.",
         )
+    assignments = _try_assign_labeled(groups, blocks)
+    if assignments is not None:
+        return assignments
+    # 카테고리별 세부 항목 그대로는 블록 자리다툼(예: 4행짜리 블록이 하나뿐인데 4개 이상인
+    # 카테고리가 둘 이상)으로 못 담을 수 있다. 전부 소계로 접으면 자리다툼이 없는 카테고리까지
+    # 세부 항목을 잃으므로, 자리를 가장 많이 차지하는 카테고리부터 하나씩만 접어가며 다시
+    # 시도해 꼭 필요한 만큼만 접는다(각 블록은 어차피 카테고리당 1줄 소계 셀을 이미 갖고 있음).
+    working = list(groups)
+    for idx in sorted(range(len(working)), key=lambda i: len(working[i]["items"]), reverse=True):
+        if len(working[idx]["items"]) <= 1:
+            continue
+        working[idx] = _rollup_to_category_totals([working[idx]])[0]
+        assignments = _try_assign_labeled(working, blocks)
+        if assignments is not None:
+            return assignments
+    biggest = max(groups, key=lambda g: len(g["items"]))
+    raise HTTPException(
+        status_code=422,
+        detail=f"'{biggest['category']}' 항목이 {len(biggest['items'])}개인데 카테고리 소계로 접어도 남은 양식 블록 중 담을 수 있는 곳이 없습니다.",
+    )
+
+
+def _try_assign_labeled(groups: List[Dict[str, Any]], blocks: List[dict]) -> Optional[List[tuple]]:
     remaining_blocks = list(blocks)
     assignments = []
     for group in sorted(groups, key=lambda g: len(g["items"]), reverse=True):
         candidates = [b for b in remaining_blocks if len(b["rows"]) >= len(group["items"])]
         if not candidates:
-            raise HTTPException(
-                status_code=422,
-                detail=f"'{group['category']}' 항목이 {len(group['items'])}개인데 남은 양식 블록 중 담을 수 있는 곳이 없습니다.",
-            )
+            return None
         best = min(candidates, key=lambda b: len(b["rows"]))
         assignments.append((best, group, 0))
         remaining_blocks.remove(best)
@@ -1367,6 +1400,7 @@ def _build_filled_xlsx_from_quote(quote: dict, filled_path: Path) -> None:
         filled_path,
         hidden_rows=hidden_rows,
         item_blocks=[b for b in cell_map.get("item_blocks", []) if b.get("role") != "labor_fte"],
+        strip_background=(entity_name == "ABBG"),
     )
 
 

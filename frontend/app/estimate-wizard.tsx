@@ -950,8 +950,11 @@ function LineItemTable({
     let next = items.map((item, i) => (i === index ? merged : item));
 
     // 총액 유지 모드: 이 항목의 증감분을 나머지 항목에 (기존 비중대로) 비례 배분해 총액을 그대로 유지한다.
+    // amount 필드를 직접 바꾸든, unit_price/quantity를 바꿔서 amount가 간접적으로 바뀌든(work_days는
+    // 정보성이라 amount에 영향 없음, 939번 줄 주석 참고) 똑같이 걸려야 해서 patch 키가 아니라 실제
+    // amount 변화 여부로 판단한다.
     let redistributedDelta: number | null = null;
-    if (keepTotal && "amount" in patch && items.length > 1) {
+    if (keepTotal && merged.amount !== items[index].amount && items.length > 1) {
       const originalTotal = items.reduce((sum, item) => sum + item.amount, 0);
       const delta = merged.amount - items[index].amount;
       const othersSum = originalTotal - items[index].amount;
@@ -1097,62 +1100,6 @@ function LineItemTable({
   );
 }
 
-function ComparisonSummaryTable({ quotes, primaryTotal }: { quotes: EntityQuote[]; primaryTotal?: number }) {
-  return (
-    <div className="overflow-x-auto rounded-xl border border-gray-200 bg-white">
-      <table className="w-full min-w-[480px] text-sm">
-        <thead className="border-b border-gray-200 bg-gray-50 text-left text-xs font-semibold uppercase tracking-wide text-gray-500">
-          <tr>
-            <th className="px-4 py-2.5">법인</th>
-            <th className="px-4 py-2.5">구분</th>
-            <th className="px-4 py-2.5 text-right">총액</th>
-            <th className="px-4 py-2.5 text-right">본견적 대비</th>
-          </tr>
-        </thead>
-        <tbody className="divide-y divide-gray-100">
-          {quotes.map((q) => {
-            const diffPercent =
-              !q.is_primary && primaryTotal ? ((q.total_amount - primaryTotal) / primaryTotal) * 100 : null;
-            return (
-              <tr key={q.id}>
-                <td className="px-4 py-2.5 font-medium text-gray-900">{q.entity_name}</td>
-                <td className="px-4 py-2.5">
-                  <span
-                    className={
-                      q.is_primary
-                        ? "rounded-full bg-indigo-100 px-2 py-0.5 text-xs font-semibold text-indigo-700"
-                        : "rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-600"
-                    }
-                  >
-                    {q.is_primary ? "본견적" : "비교견적"}
-                  </span>
-                </td>
-                <td className="px-4 py-2.5 text-right font-semibold text-gray-900">
-                  {q.total_amount.toLocaleString()}원
-                </td>
-                <td
-                  className={
-                    "px-4 py-2.5 text-right text-sm font-semibold " +
-                    (diffPercent === null
-                      ? "text-gray-300"
-                      : diffPercent > 0
-                      ? "text-rose-600"
-                      : diffPercent < 0
-                      ? "text-blue-600"
-                      : "text-gray-400")
-                  }
-                >
-                  {diffPercent === null ? "-" : `${diffPercent > 0 ? "+" : ""}${diffPercent.toFixed(1)}%`}
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
 function QuoteCard({
   quote,
   vatIncluded,
@@ -1214,7 +1161,7 @@ function QuoteCard({
     // 번갈아 스크롤해야 했다. 뷰어는 sticky라 편집 중에도 계속 눈에 보인다.
     <div className="mx-auto grid w-full max-w-[1500px] grid-cols-1 gap-5 min-[1600px]:grid-cols-[minmax(680px,1fr)_440px] min-[1600px]:items-start min-[1900px]:grid-cols-[minmax(720px,1010px)_470px]">
       <div className="overflow-hidden rounded-2xl border border-black/10 bg-white shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
-        <div className="border-b border-slate-100 px-6 py-5">
+        <div className="border-b border-slate-100 px-6 py-4">
           <div className="flex flex-wrap items-start justify-between gap-4">
           <div>
             <div className="flex flex-wrap items-center gap-2">
@@ -1236,17 +1183,17 @@ function QuoteCard({
                 </span>
               )}
             </div>
-            <p className="mt-2 text-2xl font-bold tracking-tight text-slate-950">{quote.entity_name}</p>
-            <p className="mt-1 text-sm text-slate-500">아래 정보를 입력하면 실제 견적서에 바로 반영됩니다.</p>
+            <p className="mt-2 text-xl font-bold tracking-tight text-slate-950">{quote.entity_name}</p>
+            <p className="mt-1 text-xs text-slate-500">수정 내용은 저장 후 실제 견적서에 반영됩니다.</p>
           </div>
           <div className="ml-auto text-right">
             <p className="text-xs font-medium text-slate-400">견적 금액{pending && " (미반영 변경 포함)"}</p>
-            <p className="mt-1 whitespace-nowrap text-3xl font-bold tracking-tight text-slate-950">
+            <p className="mt-1 whitespace-nowrap text-2xl font-bold tracking-tight text-slate-950">
               {displayQuote.total_amount.toLocaleString()}
               <span className="ml-0.5 text-base font-medium text-slate-400">원</span>
             </p>
             {quote.line_items.length > 0 && (
-              <div className="mt-3 flex justify-end gap-2">
+              <div className="mt-2 flex justify-end gap-2">
                 <a
                   href={getEntityQuotePdfUrl(quote.id)}
                   className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-indigo-700"
@@ -1335,82 +1282,92 @@ function QuoteCard({
 
         {quote.line_items.length > 0 ? (
           <div className="px-6 py-5">
-            <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
               <div>
                 <h3 className="text-sm font-bold text-slate-900">견적 항목</h3>
                 <p className="mt-0.5 text-xs text-slate-400">항목을 눌러 직접 수정할 수 있습니다.</p>
               </div>
-              <button
-                type="button"
-                onClick={() => setKeepTotal((value) => !value)}
-                aria-pressed={keepTotal}
+              <label
+                className="flex cursor-pointer items-center rounded-lg border border-black/10 bg-slate-50 px-2.5 py-1.5 transition hover:bg-slate-100"
                 title={
                   keepTotal
                     ? "항목 금액 변경 시 차액을 다른 항목에 자동 배분합니다."
                     : "항목 금액을 변경하면 견적 총액도 함께 변경됩니다."
                 }
-                className={
-                  "inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-semibold transition " +
-                  (keepTotal
-                    ? "border-slate-900 bg-slate-900 text-white"
-                    : "border-black/10 bg-slate-50 text-slate-600 hover:bg-slate-100")
-                }
               >
-                <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                  {keepTotal ? (
-                    <><rect x="5" y="10" width="14" height="10" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3" /></>
-                  ) : (
-                    <><rect x="5" y="10" width="14" height="10" rx="2" /><path d="M9 10V7a4 4 0 0 1 7.5-2" /></>
-                  )}
-                </svg>
-                {keepTotal ? `총합계 ${displayQuote.total_amount.toLocaleString()}원 고정` : "총합계 변경 가능"}
-              </button>
+                <ToggleSwitch
+                  checked={keepTotal}
+                  onLabel={keepTotal ? "총합계 유지" : "총합계 변경"}
+                />
+                <input
+                  type="checkbox"
+                  checked={keepTotal}
+                  onChange={() => setKeepTotal((value) => !value)}
+                  className="sr-only"
+                />
+              </label>
             </div>
-            <div className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-100 bg-slate-50/70 px-3.5 py-2.5">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-100 bg-slate-50/70 px-3.5 py-2">
               <p className="text-xs text-slate-500">
                 {pending ? (
-                  <span className="font-semibold text-amber-700">저장되지 않은 변경사항이 있습니다 · 수정 반영하기를 눌러야 실제 견적서에 저장됩니다.</span>
+                  <span className="font-semibold text-amber-700">저장되지 않은 변경사항</span>
                 ) : (
-                  "직접 편집하거나 채팅으로 수정하면 여기서 미리 확인한 뒤 반영할 수 있습니다."
+                  <span className="inline-flex items-center gap-1.5"><span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />저장됨</span>
                 )}
               </p>
-              <div className="flex flex-wrap items-center gap-2">
-                <button
-                  type="button"
-                  disabled={busyAction !== null}
-                  onClick={() => runAction("previous", onRevertToPrevious)}
-                  className="rounded-lg border border-black/10 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {busyAction === "previous" ? "불러오는 중…" : "뒤로 가기"}
-                </button>
-                <button
-                  type="button"
-                  disabled={busyAction !== null}
-                  onClick={() => runAction("original", onRevertToOriginal)}
-                  className="rounded-lg border border-black/10 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {busyAction === "original" ? "불러오는 중…" : "원본으로 되돌리기"}
-                </button>
+              <div className="flex items-center gap-2">
                 {pending && (
+                  <>
+                    <button
+                      type="button"
+                      disabled={busyAction !== null}
+                      title="미리보기 변경사항을 버리고 마지막으로 저장된 상태로 돌아갑니다."
+                      onClick={onDiscardPending}
+                      className="rounded-lg border border-black/10 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      변경 취소
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busyAction !== null}
+                      title="미리보기 변경사항을 실제 견적서에 저장합니다."
+                      onClick={() => runAction("commit", onCommitPending)}
+                      className="rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {busyAction === "commit" ? "반영하는 중…" : "수정 반영하기"}
+                    </button>
+                  </>
+                )}
+                <div className="flex items-center overflow-hidden rounded-lg border border-slate-200 bg-white" aria-label="버전 불러오기">
+                  <span className="px-2 text-[11px] font-semibold text-slate-400">버전</span>
                   <button
                     type="button"
                     disabled={busyAction !== null}
-                    onClick={onDiscardPending}
-                    className="rounded-lg border border-black/10 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+                    onClick={() => runAction("previous", onRevertToPrevious)}
+                    title="이전 저장 버전 불러오기"
+                    aria-label="이전 저장 버전 불러오기"
+                    className="grid h-8 w-8 place-items-center border-l border-slate-200 text-slate-600 transition hover:bg-slate-50 hover:text-slate-950 disabled:cursor-not-allowed disabled:opacity-40"
                   >
-                    되돌아가기
+                    {busyAction === "previous" ? (
+                      <span className="text-xs">…</span>
+                    ) : (
+                      <svg className="h-[18px] w-[18px]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                        <path d="M9 14 4 9l5-5" />
+                        <path d="M4 9h10a6 6 0 0 1 0 12h-1" />
+                      </svg>
+                    )}
                   </button>
-                )}
-                {pending && (
                   <button
                     type="button"
                     disabled={busyAction !== null}
-                    onClick={() => runAction("commit", onCommitPending)}
-                    className="rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
+                    onClick={() => runAction("original", onRevertToOriginal)}
+                    title="최초 생성 원본 불러오기"
+                    aria-label="최초 생성 원본 불러오기"
+                    className="h-8 border-l border-slate-200 px-2.5 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 hover:text-slate-950 disabled:cursor-not-allowed disabled:opacity-40"
                   >
-                    {busyAction === "commit" ? "반영하는 중…" : "수정 반영하기"}
+                    {busyAction === "original" ? "…" : "원본"}
                   </button>
-                )}
+                </div>
               </div>
             </div>
             {actionError && <p className="mb-3 text-xs text-red-600">{actionError}</p>}
@@ -1515,7 +1472,7 @@ function PersistentEditChat({
 
   return (
     <aside className="estimate-chat-dock flex h-[560px] flex-col overflow-hidden rounded-2xl border border-black/10 bg-white shadow-[0_1px_2px_rgba(0,0,0,0.04)] xl:sticky xl:top-6 xl:h-[calc(100vh-3rem)]">
-          <div className="border-b border-slate-100 px-5 py-5 xl:pt-7">
+          <div className="border-b border-slate-100 px-5 py-4">
             <div className="flex items-center gap-2">
               <span className="grid h-8 w-8 place-items-center rounded-lg bg-slate-100 text-slate-700">
                 <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -1530,14 +1487,11 @@ function PersistentEditChat({
               </div>
             </div>
           </div>
-          <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto px-4 py-5">
+          <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto px-4 py-4">
             {messages.length === 0 && (
-              <div className="rounded-2xl bg-slate-50 p-4">
-                <p className="text-sm font-semibold text-slate-700">어떻게 수정할까요?</p>
-                <p className="mt-1.5 text-xs leading-5 text-slate-500">
-                  수정할 내용을 편하게 입력하세요. 변경 사항은 오른쪽 견적서에 바로 반영됩니다.
-                </p>
-                <button type="button" onClick={() => setInput("2번 항목 금액을 낮추고 총액은 유지해줘")} className="mt-3 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-left text-xs text-slate-600 transition hover:border-indigo-200 hover:text-indigo-700">
+              <div className="rounded-xl bg-slate-50 p-3.5">
+                <p className="text-sm font-semibold text-slate-700">무엇을 바꿀까요?</p>
+                <button type="button" onClick={() => setInput("2번 항목 금액을 낮추고 총액은 유지해줘")} className="mt-2.5 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-left text-xs text-slate-600 transition hover:border-indigo-200 hover:text-indigo-700">
                   “2번 항목 금액을 낮추고 총액은 유지해줘”
                 </button>
               </div>
@@ -1571,9 +1525,9 @@ function PersistentEditChat({
           </div>
           {errorMsg && <p className="px-5 pb-1 text-xs text-red-600">{errorMsg}</p>}
           <div className="border-t border-slate-100 p-4">
-            <div className="rounded-2xl border border-slate-200 bg-white p-2 transition focus-within:border-indigo-400 focus-within:ring-4 focus-within:ring-indigo-50">
+            <div className="rounded-xl border border-slate-200 bg-white p-2 transition focus-within:border-indigo-400 focus-within:ring-4 focus-within:ring-indigo-50">
             <textarea
-              rows={3}
+              rows={2}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
@@ -2153,25 +2107,13 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
             onSend={(text) => handleSendEdit(viewedQuote.id, text)}
           />
         )}
-        <div className="mx-auto w-full max-w-[1500px] min-w-0 space-y-6">
-        <div className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-black/10 bg-white p-5 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
-          <div>
-            <p className="text-xs font-semibold text-slate-500">견적 세트 생성 완료</p>
-            <h2 className="mt-1 text-2xl font-bold text-gray-900">{result.project_name}</h2>
-          </div>
-          <div className="flex flex-wrap gap-8">
-            <div>
-              <p className="text-xs text-gray-500">과업종류</p>
-              <p className="mt-1 text-base font-semibold text-gray-900">{result.task_type}</p>
-            </div>
-            <div>
-              <p className="text-xs text-gray-500">총액</p>
-              <p className="mt-1 text-base font-semibold text-gray-900">
-                {result.total_amount.toLocaleString()}원
-                <span className="ml-1 text-xs font-normal text-gray-400">
-                  ({result.vat_included ? "VAT 포함" : "VAT 별도"})
-                </span>
-              </p>
+        <div className="mx-auto w-full max-w-[1500px] min-w-0 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-black/10 bg-white px-5 py-4 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
+          <div className="min-w-0">
+            <p className="text-[11px] font-semibold text-emerald-700">견적 세트 생성 완료</p>
+            <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1">
+              <h2 className="truncate text-xl font-bold tracking-tight text-slate-950">{result.project_name}</h2>
+              <span className="text-xs text-slate-500">{result.task_type} · {result.total_amount.toLocaleString()}원 · VAT {result.vat_included ? "포함" : "별도"}</span>
             </div>
           </div>
           <button
@@ -2294,13 +2236,10 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
             )}
           </div>
         ) : (
-          <div className="space-y-5">
+          <div className="space-y-4">
             {result.entity_quotes.length > 1 && (
-              <ComparisonSummaryTable quotes={displayQuotes} primaryTotal={primaryQuote?.total_amount} />
-            )}
-
-            {result.entity_quotes.length > 1 && (
-              <div className="flex flex-wrap gap-2 border-b border-slate-200 pb-3">
+              <div className="flex items-center gap-2 overflow-x-auto border-b border-slate-200 pb-3 [scrollbar-width:none]">
+                <span className="shrink-0 text-xs font-semibold text-slate-400">견적서 {displayQuotes.length}개</span>
                 {displayQuotes.map((q) => {
                   const selected = (viewedQuote?.id ?? primaryQuote?.id) === q.id;
                   return (
@@ -2310,7 +2249,7 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
                       onClick={() => setViewedQuoteId(q.id)}
                       aria-pressed={selected}
                       className={
-                        "inline-flex items-center gap-1.5 rounded-lg border px-3 py-2 text-sm font-medium transition " +
+                        "inline-flex shrink-0 items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm font-medium transition " +
                         (selected
                           ? "border-slate-900 bg-slate-900 text-white"
                           : "border-black/10 bg-white text-slate-700 hover:bg-slate-50")
@@ -2448,7 +2387,11 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
                         type="number"
                         step="1"
                         value={s.markupPercent}
-                        onChange={(e) => setMarkupPercent(s.entityId, Number(e.target.value))}
+                        onChange={(e) => {
+                          const raw = e.target.value.replace(/^0+(?=\d)/, "");
+                          e.target.value = raw;
+                          setMarkupPercent(s.entityId, raw === "" ? 0 : Number(raw));
+                        }}
                         onClick={(e) => e.stopPropagation()}
                         className="w-14 rounded-md border border-gray-200 px-1.5 py-1 text-right text-sm"
                       />

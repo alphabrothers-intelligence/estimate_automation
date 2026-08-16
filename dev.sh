@@ -15,4 +15,6 @@ pids+=($!)
 (cd frontend && npm run dev -- -p 3001) &
 pids+=($!)
 
-wait -n "${pids[@]}"
+# macOS 기본 bash(3.2)엔 `wait -n`(bash 4.3+)이 없어 스크립트가 죽고 trap이 두 서버를
+# 바로 종료시켰다(2026-08-16 발견) — 그냥 둘 다 끝날 때까지 기다리는 것으로 대체.
+wait
