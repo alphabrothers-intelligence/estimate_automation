@@ -56,8 +56,8 @@ def _fetch_catalog_rows(entity_id: str, task_type: str) -> List[dict]:
     res = (
         supabase.table("item_catalogs")
         .select(
-            "module_name, item_name, historical_ratio, is_required, standard_description, "
-            "sort_order, alt_group"
+            "module_name, mid_category, item_name, historical_ratio, is_required, "
+            "standard_description, sort_order, alt_group, module_weight"
         )
         .eq("entity_id", entity_id)
         .eq("task_type", task_type)
@@ -233,10 +233,12 @@ def get_catalog_for_generation(
     items = [
         CatalogItem(
             module_name=r["module_name"],
+            mid_category=r.get("mid_category"),
             item_name=r["item_name"],
             historical_ratio=float(r["historical_ratio"]) if r["historical_ratio"] is not None else None,
             is_required=r["is_required"],
             standard_description=r["standard_description"],
+            module_weight=float(r["module_weight"]) if r.get("module_weight") is not None else None,
         )
         for r in filtered_rows
     ]

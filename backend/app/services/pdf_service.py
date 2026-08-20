@@ -29,7 +29,7 @@ from xml.sax.saxutils import escape
 from fastapi import HTTPException
 
 from app.config import get_supabase
-from app.services import catalog_service, template_storage
+from app.services import allocation_service, catalog_service, template_storage, xlsx_rows
 
 CellUpdates = Dict[str, Any]  # 셀 좌표("H16") -> 값(str|int|float|None). None이면 값을 비운다.
 
@@ -53,6 +53,122 @@ def _cell_text_for_wrap(value: Any) -> Optional[str]:
     if isinstance(value, str):
         return value
     return None
+
+
+# ─── 셀 폭 계산 (글자 깨짐 방지) ────────────────────────────────────────────────
+# 마스터 양식의 "구분(대)" 같은 칸은 폭이 한글 3~4자밖에 안 되는데 모듈명은 "자사몰 데이터 세팅"
+# 처럼 길어서, wrapText만 켜두면 단어 중간이 잘려 세로로 한 글자씩 쌓이고 행 높이를 넘어가는
+# 부분은 아예 잘려나갔다(2026-08-20 사용자 지적, 테스티파이·알파브라더스 양식). 칸에 실제로 몇
+# 글자가 들어가는지 알아야 "줄바꿈으로 담을지 / 글자를 줄여 담을지"를 정할 수 있어서, 열 폭과
+# 병합 범위를 시트 XML에서 직접 읽는다.
+_DEFAULT_COL_WIDTH = 8.43  # 엑셀 기본 열 폭(문자 수 단위)
+_CELL_PADDING = 1.0  # 좌우 여백 몫
+
+
+def _col_index(letters: str) -> int:
+    index = 0
+    for ch in letters:
+        index = index * 26 + (ord(ch) - 64)
+    return index
+
+
+def _column_widths(sheet_xml: str) -> Dict[int, float]:
+    """<cols> 정의에서 열 번호 -> 폭(문자 수 단위)."""
+    widths: Dict[int, float] = {}
+    for tag in re.findall(r"<col\b[^>]*/>", sheet_xml):
+        attrs = dict(re.findall(r'(\w+)="([^"]*)"', tag))
+        if "width" not in attrs or "min" not in attrs or "max" not in attrs:
+            continue
+        for col in range(int(attrs["min"]), int(attrs["max"]) + 1):
+            widths[col] = float(attrs["width"])
+    return widths
+
+
+def _merge_spans(sheet_xml: str) -> Dict[str, tuple]:
+    """병합 좌상단 좌표 -> (시작 열 번호, 끝 열 번호). 병합된 칸은 그 폭을 다 쓸 수 있다."""
+    return {
+        f"{c1}{r1}": (_col_index(c1), _col_index(c2))
+        for c1, r1, c2, _r2 in re.findall(r'<mergeCell ref="([A-Z]+)(\d+):([A-Z]+)(\d+)"/>', sheet_xml)
+    }
+
+
+def _text_width(text: str) -> float:
+    """한글·한자·전각 문자는 폭 단위('0' 한 글자) 기준으로 대략 두 배를 차지한다."""
+    return sum(2.0 if ord(ch) > 0x2E7F else 1.0 for ch in text)
+
+
+def _font_size_by_style(styles_xml: str) -> tuple:
+    """(스타일 인덱스 -> 글자 크기, 기본 글자 크기). 열 폭은 워크북 기본 글꼴 기준이라, 셀
+    글꼴이 그보다 작으면 같은 폭에 그만큼 더 들어간다(테스티파이 마스터: 기본 11pt, 표 안 8pt →
+    1.375배). 이 보정을 빼면 안 넘치는 글자까지 넘친다고 판단해 쓸데없이 줄이거나 행을 키운다."""
+    fonts_block = re.search(r"<fonts\b[^>]*>(.*?)</fonts>", styles_xml, re.DOTALL)
+    if not fonts_block:
+        return {}, 11.0
+    sizes = [
+        float(sz.group(1)) if (sz := re.search(r'<sz val="([\d.]+)"', font)) else 11.0
+        for font in re.findall(r"<font\b[^>]*?(?:/>|>.*?</font>)", fonts_block.group(1), re.DOTALL)
+    ]
+    xfs_block = re.search(r"<cellXfs\b[^>]*>(.*?)</cellXfs>", styles_xml, re.DOTALL)
+    by_style: Dict[int, float] = {}
+    if xfs_block:
+        for idx, xf in enumerate(re.findall(r"<xf\b[^>]*?(?:/>|>.*?</xf>)", xfs_block.group(1), re.DOTALL)):
+            font_id = int(m.group(1)) if (m := re.search(r'fontId="(\d+)"', xf)) else 0
+            if font_id < len(sizes):
+                by_style[idx] = sizes[font_id]
+    return by_style, (sizes[0] if sizes else 11.0)
+
+
+def _capacity_fn(sheet_xml: str, styles_xml: str):
+    """좌표 -> 그 칸에 들어가는 글자 폭(문자 수 단위). 병합 폭과 셀 글꼴 크기를 함께 본다."""
+    widths = _column_widths(sheet_xml)
+    spans = _merge_spans(sheet_xml)
+    size_by_style, base_size = _font_size_by_style(styles_xml)
+
+    def capacity(coord: str) -> Optional[float]:
+        m = re.match(r"([A-Z]+)(\d+)$", coord)
+        if not m:
+            return None
+        start, end = spans.get(coord, (_col_index(m.group(1)), _col_index(m.group(1))))
+        total = sum(widths.get(col, _DEFAULT_COL_WIDTH) for col in range(start, end + 1))
+        cm = re.search(rf'<c r="{re.escape(coord)}"[^>]*?(?:/>|>)', sheet_xml)
+        style = int(s.group(1)) if cm and (s := re.search(r'\ss="(\d+)"', cm.group(0))) else None
+        scale = base_size / size_by_style.get(style, base_size) if style is not None else 1.0
+        return max((total - _CELL_PADDING) * scale, 1.0)
+
+    return capacity
+
+
+def _wrapped_line_count(text: str, capacity: Optional[float]) -> int:
+    """wrapText로 담았을 때 실제 몇 줄이 되는지 — 행 높이를 그만큼 확보하려고 센다.
+
+    엑셀은 공백에서 우선 끊고, 한 단어가 칸보다 길면 그 안에서 잘라 다음 줄로 넘긴다.
+    """
+    if capacity is None:
+        return text.count("\n") + 1
+    lines = 0
+    for paragraph in text.split("\n"):
+        used, count = 0.0, 1
+        for word in re.split(r"(\s+)", paragraph):
+            width = _text_width(word)
+            if used and used + width > capacity:
+                count += 1
+                used = 0.0
+                if word.isspace():
+                    continue
+            # 단어 하나가 칸보다 길면 칸 폭만큼씩 잘려 여러 줄을 먹는다.
+            while width > capacity:
+                count += 1
+                width -= capacity
+            used += width
+        lines += count
+    return lines
+
+
+def _needs_shrink(text: str, capacity: Optional[float]) -> bool:
+    """줄바꿈으로는 못 담는 경우 — 단어 하나가 칸보다 넓으면 단어 중간이 깨진다."""
+    if capacity is None:
+        return False
+    return any(_text_width(word) > capacity for word in text.split())
 
 
 def _build_cell_xml(coord: str, attrs: str, value: Any) -> str:
@@ -441,12 +557,15 @@ def _hide_rows(sheet_xml: str, row_numbers: set) -> str:
     return re.sub(r'<row r="(\d+)"[^>]*?(?:/>|>)', _mark_hidden, sheet_xml)
 
 
-def _ensure_wrap_text(sheet_xml: str, styles_xml: str, coords: set) -> tuple[str, str]:
-    """줄바꿈(\\n)이 들어간 값을 쓰는 셀(예: ABBG "상세내용" 칸의 세로형 개조식 목록, PRD 6.2)이
+def _ensure_alignment(sheet_xml: str, styles_xml: str, coord_attrs: Dict[str, Dict[str, str]]) -> tuple[str, str]:
+    """셀별로 필요한 <alignment> 속성을 보장한다 (wrapText / shrinkToFit / horizontal / vertical).
+
+    줄바꿈(\\n)이 들어간 값을 쓰는 셀(예: ABBG "상세내용" 칸의 세로형 개조식 목록, PRD 6.2)이
     원래 wrapText 서식이 없으면(2026-08-10 확인 — ABBG 마스터의 해당 칸이 그랬다) 한 줄로
-    뭉개져 찍힌다. 그 셀의 스타일을 wrapText=1로 복제한 새 스타일로만 바꿔치기한다 — 같은
-    스타일을 공유하는 다른 셀(서식이 원래대로여야 함)에는 영향을 주지 않는다."""
-    if not coords:
+    뭉개져 찍힌다. 그 셀의 스타일을 필요한 속성만 바꾼 새 스타일로 복제해 바꿔치기한다 — 같은
+    스타일을 공유하는 다른 셀(서식이 원래대로여야 함)에는 영향을 주지 않는다.
+    """
+    if not coord_attrs:
         return sheet_xml, styles_xml
     m = re.search(r'(<cellXfs count=")(\d+)(">)(.*?)(</cellXfs>)', styles_xml, re.DOTALL)
     if not m:
@@ -455,9 +574,9 @@ def _ensure_wrap_text(sheet_xml: str, styles_xml: str, coords: set) -> tuple[str
     body = m.group(4)
     xf_entries = re.findall(r'<xf\b[^>]*?(?:/>|>.*?</xf>)', body, re.DOTALL)
     new_entries: List[str] = []
-    wrap_cache: Dict[int, int] = {}
+    style_cache: Dict[tuple, int] = {}
 
-    for coord in coords:
+    for coord, attrs in coord_attrs.items():
         cm = re.search(rf'<c r="{re.escape(coord)}"[^>]*?(?:/>|>)', sheet_xml)
         if not cm:
             continue
@@ -465,28 +584,35 @@ def _ensure_wrap_text(sheet_xml: str, styles_xml: str, coords: set) -> tuple[str
         if not s_match:
             continue
         old_idx = int(s_match.group(1))
-        if old_idx >= len(xf_entries) or re.search(r'wrapText="(1|true)"', xf_entries[old_idx]):
+        if old_idx >= len(xf_entries):
             continue
-        if old_idx not in wrap_cache:
-            xf = xf_entries[old_idx]
+        xf = xf_entries[old_idx]
+        # 원본이 이미 원하는 값을 다 갖고 있으면 스타일을 새로 만들 이유가 없다.
+        missing = {k: v for k, v in attrs.items() if not re.search(rf'{k}="{v}"', xf)}
+        if not missing:
+            continue
+        cache_key = (old_idx, tuple(sorted(missing.items())))
+        if cache_key not in style_cache:
             align_match = re.search(r"<alignment\b[^>]*/>", xf)
             if align_match:
                 align_tag = align_match.group(0)
-                # .xls에서 변환된 마스터(블렌디드랩 등)는 wrapText="false"처럼 true/false
-                # 표기를 쓴다 — "1"만 보고 없다고 판단해 속성을 또 붙이면 wrapText가 중복
-                # 지정된 잘못된 XML이 되어 styles.xml 전체가 깨진다(2026-08-10 발견).
-                if "wrapText=" in align_tag:
-                    new_align_tag = re.sub(r'wrapText="[^"]*"', 'wrapText="1"', align_tag)
-                else:
-                    new_align_tag = align_tag[:-2] + ' wrapText="1"/>'
-                wrapped_xf = xf[: align_match.start()] + new_align_tag + xf[align_match.end() :]
+                for key, value in missing.items():
+                    # .xls에서 변환된 마스터(블렌디드랩 등)는 wrapText="false"처럼 true/false
+                    # 표기를 쓴다 — "1"만 보고 없다고 판단해 속성을 또 붙이면 속성이 중복
+                    # 지정된 잘못된 XML이 되어 styles.xml 전체가 깨진다(2026-08-10 발견).
+                    if f"{key}=" in align_tag:
+                        align_tag = re.sub(rf'{key}="[^"]*"', f'{key}="{value}"', align_tag)
+                    else:
+                        align_tag = align_tag[:-2] + f' {key}="{value}"/>'
+                patched_xf = xf[: align_match.start()] + align_tag + xf[align_match.end() :]
             elif xf.endswith("/>"):
-                wrapped_xf = xf[:-2] + '><alignment wrapText="1"/></xf>'
+                attr_text = " ".join(f'{k}="{v}"' for k, v in missing.items())
+                patched_xf = xf[:-2] + f"><alignment {attr_text}/></xf>"
             else:
                 continue  # 이미 있는 <alignment>...</alignment> 형태는 드물어 다루지 않는다
-            wrap_cache[old_idx] = count + len(new_entries)
-            new_entries.append(wrapped_xf)
-        new_idx = wrap_cache[old_idx]
+            style_cache[cache_key] = count + len(new_entries)
+            new_entries.append(patched_xf)
+        new_idx = style_cache[cache_key]
         sheet_xml = sheet_xml[: cm.start()] + cm.group(0).replace(f's="{old_idx}"', f's="{new_idx}"', 1) + sheet_xml[cm.end() :]
 
     if not new_entries:
@@ -503,7 +629,67 @@ def _ensure_wrap_text(sheet_xml: str, styles_xml: str, coords: set) -> tuple[str
     return sheet_xml, styles_xml
 
 
-def _normalize_block_row_heights(sheet_xml: str, item_blocks: List[dict], updates: CellUpdates) -> str:
+def _block_rows(item_blocks: List[dict]) -> set:
+    """항목 블록이 차지하는 모든 행 번호 — 항목 행 + 카테고리 라벨/소계/구분 칸이 있는 행."""
+    rows: set = set()
+    for block in item_blocks:
+        rows.update(block.get("rows") or [])
+        for value in block.values():
+            if isinstance(value, str) and (m := re.match(r"^[A-Z]+(\d+)$", value)):
+                rows.add(int(m.group(1)))
+    return rows
+
+
+# 가운데 정렬까지 해줄 칸 — 모듈명·구분(중)·상품명처럼 "짧은 라벨이 들어갈 좁은 칸"이다.
+# (사용자 요청 2026-08-20: "가운데 정렬과 글씨가 적당히 잘려서 들어갔으면 좋겠습니다")
+_CENTERED_COLUMN_KEYS = ("category", "category_mid", "item_name")
+
+
+def _plan_text_fitting(
+    sheet_xml: str, styles_xml: str, updates: CellUpdates, item_blocks: List[dict], columns: Dict[str, str]
+) -> Dict[str, Dict[str, str]]:
+    """셀에 넣는 글자가 칸을 넘칠 때 어떻게 담을지 셀별로 정한다.
+
+    - 줄바꿈으로 담을 수 있으면 wrapText (행 높이는 _normalize_block_row_heights가 맞춘다)
+    - 한 단어조차 칸보다 넓으면 wrapText로는 단어 중간이 깨지므로 shrinkToFit으로 글자를 줄인다
+      (LibreOffice는 병합셀에도 shrinkToFit을 적용하지만, wrapText가 켜져 있으면 무시하므로
+      반드시 함께 꺼야 한다 — 2026-08-20 실제 변환으로 확인)
+    """
+    capacity = _capacity_fn(sheet_xml, styles_xml)
+    block_rows = _block_rows(item_blocks)
+    centered_cols = {columns.get(key) for key in _CENTERED_COLUMN_KEYS if columns.get(key)}
+
+    plan: Dict[str, Dict[str, str]] = {}
+    for coord, value in updates.items():
+        text = _cell_text_for_wrap(value)
+        if not text:
+            continue
+        m = re.match(r"^([A-Z]+)(\d+)$", coord)
+        in_block = bool(m) and int(m.group(2)) in block_rows
+        if not in_block and "\n" not in text:
+            continue  # 항목 표 밖의 한 줄짜리 값(수신처·용역명 등)은 원본 서식 그대로 둔다
+        attrs: Dict[str, str] = {}
+        if _needs_shrink(text, capacity(coord)):
+            attrs.update({"shrinkToFit": "1", "wrapText": "0"})
+        else:
+            attrs["wrapText"] = "1"
+        if in_block and (m.group(1) in centered_cols or _is_category_cell(coord, item_blocks)):
+            attrs.update({"horizontal": "center", "vertical": "center"})
+        plan[coord] = attrs
+    return plan
+
+
+def _is_category_cell(coord: str, item_blocks: List[dict]) -> bool:
+    return any(
+        block.get(key) == coord
+        for block in item_blocks
+        for key in ("category_large_cell", "category_mid_cell", "category_label_cell")
+    )
+
+
+def _normalize_block_row_heights(
+    sheet_xml: str, styles_xml: str, item_blocks: List[dict], updates: CellUpdates
+) -> str:
     """항목 블록(카테고리 하나) 안의 행 높이를 통일한다 — 원본 마스터에 원인 불명의 들쭉날쭉한
     ht 값이 그대로 남아있는 경우가 있고(예: 테스티파이, 2026-08-11 사용자 지적), 실제 채워
     넣는 내용이 줄바꿈(\\n)으로 여러 줄이 되면 그 행만 커지고 나머지는 그대로라 표가 깨져
@@ -517,16 +703,23 @@ def _normalize_block_row_heights(sheet_xml: str, item_blocks: List[dict], update
     for m in re.finditer(r'<row r="(\d+)"[^>]*\bht="([\d.]+)"', sheet_xml):
         row_heights[int(m.group(1))] = float(m.group(2))
 
+    # 줄수는 \n 개수가 아니라 "칸 폭에 맞춰 접힌 뒤의 실제 줄수"로 센다 — \n만 세던 예전 방식은
+    # 긴 한 줄이 칸 폭에서 두세 줄로 접히는 걸 몰라서 그만큼 아래가 잘렸다(2026-08-20 사용자
+    # 지적, 테스티파이 "상품구성" 칸). shrinkToFit으로 줄인 칸은 한 줄이라 세지 않는다.
+    capacity = _capacity_fn(sheet_xml, styles_xml)
     lines_by_row: Dict[int, int] = {}
     for coord, value in updates.items():
         text = _cell_text_for_wrap(value)
-        if text is None or "\n" not in text:
+        if not text:
             continue
         m = re.match(r"^[A-Z]+(\d+)$", coord)
         if not m:
             continue
+        cap = capacity(coord)
+        if _needs_shrink(text, cap):
+            continue
         row = int(m.group(1))
-        lines_by_row[row] = max(lines_by_row.get(row, 1), text.count("\n") + 1)
+        lines_by_row[row] = max(lines_by_row.get(row, 1), _wrapped_line_count(text, cap))
 
     target_height_by_row: Dict[int, float] = {}
     for block in item_blocks:
@@ -594,6 +787,77 @@ def _normalize_block_cell_styles(sheet_xml: str, item_blocks: List[dict]) -> str
     return sheet_xml
 
 
+def _plan_mid_category_merges(sheet_xml: str, columns: Dict[str, str], assignments: list) -> List[tuple]:
+    """구분(중) 칸을 "같은 값이 연달아 오는 행"끼리 하나로 병합할 범위를 계산한다.
+
+    실제 발급본(우유곳간 260811)에서 구분(대) "런칭 마케팅" 아래 구분(중)이 자사몰 구축(1행)/
+    전략수립(1행)/기본 세팅(3행)으로 묶여 있는 모양을 그대로 재현한다. 원본 파일의 병합 모양은
+    그 견적서의 데이터에 맞춰진 것이라 이번 견적 항목과는 맞지 않으므로, 데이터에서 다시 만든다.
+    반환: [(시작열, 시작행, 끝열, 끝행), ...]
+    """
+    col = columns.get("category_mid")
+    if not col:
+        return []
+    # 이 열이 원래 어느 열까지 병합돼 있었는지 원본에서 읽는다(예: C13:D13 → D).
+    m = re.search(rf'<mergeCell ref="{col}\d+:([A-Z]+)\d+"/>', sheet_xml)
+    end_col = m.group(1) if m else col
+
+    ranges: List[tuple] = []
+    for block, group, row_offset in assignments:
+        rows = block["rows"]
+        runs: List[tuple] = []  # (값, 첫 행, 마지막 행)
+        for i, item in enumerate(group["items"]):
+            row_index = row_offset + i
+            if row_index >= len(rows):
+                break
+            value = item.get("mid_category") or group["category"]
+            if runs and runs[-1][0] == value:
+                runs[-1] = (value, runs[-1][1], rows[row_index])
+            else:
+                runs.append((value, rows[row_index], rows[row_index]))
+        ranges.extend((col, start, end_col, end) for _value, start, end in runs)
+    return ranges
+
+
+def _apply_merge_ranges(sheet_xml: str, ranges: List[tuple]) -> str:
+    """지정한 범위로 병합을 다시 만든다 — 해당 행들에 걸쳐 있던 기존 병합은 먼저 걷어낸다."""
+    if not ranges:
+        return sheet_xml
+    touched = {(col, row) for col, start, _end_col, end in ranges for row in range(start, end + 1)}
+    sheet_xml = re.sub(
+        r'<mergeCell ref="([A-Z]+)(\d+):[A-Z]+\d+"/>',
+        lambda m: "" if (m.group(1), int(m.group(2))) in touched else m.group(0),
+        sheet_xml,
+    )
+    return _renumber_merge_count(
+        _add_merge_refs(sheet_xml, [f"{c}{s}:{ec}{e}" for c, s, ec, e in ranges])
+    )
+
+
+def _add_merge_refs(sheet_xml: str, refs: List[str]) -> str:
+    m = re.search(r'<mergeCells[^>]*>', sheet_xml)
+    if not m:
+        return sheet_xml
+    return sheet_xml[: m.end()] + "".join(f'<mergeCell ref="{ref}"/>' for ref in refs) + sheet_xml[m.end() :]
+
+
+def _renumber_merge_count(sheet_xml: str) -> str:
+    count = len(re.findall(r"<mergeCell ", sheet_xml))
+    return re.sub(r'<mergeCells count="\d+"', f'<mergeCells count="{count}"', sheet_xml, count=1)
+
+
+def _drop_formulas(sheet_xml: str, coords: List[str]) -> str:
+    """지정한 셀의 <f>를 없애 평범한 값 셀로 만든다 — _patch_sheet_xml이 "수식 셀은 값을 덮어쓰지
+    않는다"는 규칙을 갖고 있어서, 우리가 계산한 값을 꼭 써야 하는 셀은 먼저 수식을 걷어내야 한다."""
+    for coord in coords:
+        m = _cell_pattern(coord).search(sheet_xml)
+        if not m or not _has_formula(m.group(3) or ""):
+            continue
+        inner = re.sub(r"<f[^>]*>.*?</f>|<f[^>]*/>", "", m.group(3) or "", flags=re.DOTALL)
+        sheet_xml = sheet_xml[: m.start()] + f'<c r="{coord}"{m.group(1)}>{inner}</c>' + sheet_xml[m.end() :]
+    return sheet_xml
+
+
 def _patch_xlsx(
     source_bytes: bytes,
     sheet_name: str,
@@ -602,17 +866,26 @@ def _patch_xlsx(
     hidden_rows: Optional[set] = None,
     item_blocks: Optional[List[dict]] = None,
     strip_background: bool = False,
+    drop_formula_cells: Optional[List[str]] = None,
+    merge_ranges: Optional[List[tuple]] = None,
+    columns: Optional[Dict[str, str]] = None,
 ) -> None:
     with zipfile.ZipFile(io.BytesIO(source_bytes), "r") as zin:
         sheet_path = _sheet_internal_path(zin, sheet_name)
         sheet_xml = zin.read(sheet_path).decode("utf-8")
+        # 글자 폭 계산(_capacity_fn)이 셀 글꼴 크기를 봐야 해서 스타일을 먼저 읽어둔다.
+        styles_xml = zin.read("xl/styles.xml").decode("utf-8")
+        styles_xml = _patch_font_substitution(styles_xml)
+        styles_xml = _patch_hyperlink_style_bleed(styles_xml)
+        sheet_xml = _drop_formulas(sheet_xml, drop_formula_cells or [])
+        sheet_xml = _apply_merge_ranges(sheet_xml, merge_ranges or [])
         patched_sheet_xml = _patch_sheet_xml(sheet_xml, updates)
         if strip_background:
             patched_sheet_xml = _strip_sheet_background_picture(patched_sheet_xml)
         patched_sheet_xml = _strip_sheet_hyperlinks(patched_sheet_xml)
         patched_sheet_xml = _strip_all_formula_caches(patched_sheet_xml)
         patched_sheet_xml = _hide_rows(patched_sheet_xml, hidden_rows or set())
-        patched_sheet_xml = _normalize_block_row_heights(patched_sheet_xml, item_blocks or [], updates)
+        patched_sheet_xml = _normalize_block_row_heights(patched_sheet_xml, styles_xml, item_blocks or [], updates)
         patched_sheet_xml = _normalize_block_cell_styles(patched_sheet_xml, item_blocks or [])
         patched_sheet_xml = _force_fit_to_page(patched_sheet_xml)
 
@@ -626,15 +899,11 @@ def _patch_xlsx(
         workbook_rels_xml = zin.read("xl/_rels/workbook.xml.rels").decode("utf-8")
         patched_content_types, patched_workbook_rels = _strip_calc_chain(content_types_xml, workbook_rels_xml)
 
-        styles_xml = zin.read("xl/styles.xml").decode("utf-8")
-        styles_xml = _patch_font_substitution(styles_xml)
-        styles_xml = _patch_hyperlink_style_bleed(styles_xml)
-        wrap_coords = {
-            coord
-            for coord, value in updates.items()
-            if (text := _cell_text_for_wrap(value)) is not None and "\n" in text
-        }
-        patched_sheet_xml, patched_styles_xml = _ensure_wrap_text(patched_sheet_xml, styles_xml, wrap_coords)
+        patched_sheet_xml, patched_styles_xml = _ensure_alignment(
+            patched_sheet_xml,
+            styles_xml,
+            _plan_text_fitting(patched_sheet_xml, styles_xml, updates, item_blocks or [], columns or {}),
+        )
 
         skip_files = {"xl/calcChain.xml"}
         with zipfile.ZipFile(dest_path, "w", zipfile.ZIP_DEFLATED) as zout:
@@ -686,7 +955,7 @@ def _fetch_work_days_quantity_map(supabase, catalog_entity_id: str, task_type: s
     (법인×과업종류) 카탈로그를 한 번만 통째로 가져와 메모리에서 찾는다."""
     res = (
         supabase.table("item_catalogs")
-        .select("module_name, item_name, work_days, quantity")
+        .select("module_name, item_name, work_days, quantity, unit_price")
         .eq("entity_id", catalog_entity_id)
         .eq("task_type", task_type)
         .eq("is_current", True)
@@ -698,15 +967,21 @@ def _fetch_work_days_quantity_map(supabase, catalog_entity_id: str, task_type: s
     return by_name
 
 
-def _lookup_work_days_quantity(
+def _lookup_catalog_pricing(
     catalog_map: Dict[str, List[dict]], module_name: str, item_name: str
-) -> tuple[float, float]:
+) -> tuple[float, float, Optional[float]]:
+    """(작업일, 수량, 표준단가) — 표준단가는 실제 발급본에서 확인된 항목만 값이 있다(043)."""
     rows = catalog_map.get(item_name)
     if not rows:
-        return 1.0, 1.0
+        return 1.0, 1.0, None
     exact = [r for r in rows if r["module_name"] == module_name]
     row = exact[0] if exact else rows[0]
-    return float(row["work_days"]), float(row["quantity"])
+    # 표준 단가는 모듈까지 정확히 맞을 때만 쓴다 — 항목명이 같아도 모듈이 다르면 완전히 다른
+    # 가격이다(통합 패키지의 "사용성 테스트"는 500만원짜리 묶음, 사용성 테스트 모듈의 같은 이름
+    # 항목은 세부 작업). 항목을 카테고리 소계 한 줄로 접는 경우(_rollup_to_category_totals)
+    # 이름이 모듈명으로 바뀌어 엉뚱한 행에 붙을 수 있다(2026-08-20 재현).
+    unit_price = row.get("unit_price") if exact else None
+    return float(row["work_days"]), float(row["quantity"]), float(unit_price) if unit_price else None
 
 
 def get_column_display(supabase, entity_id: str, task_types: List[str], selected_modules: Optional[list]) -> Dict[str, Any]:
@@ -836,7 +1111,9 @@ def _collect_header_updates(header_fields: Dict[str, str], quote: dict) -> CellU
             updates[coord] = f"{quote_date:%Y%m%d}-{quote['id'][:6].upper()}"
         elif field == "recipient_name":
             # 테스티파이 마스터는 이 셀 자체가 "OOO 귀하" 형태다 — 이름만 쓰면 "귀하"가 지워진다.
-            updates[coord] = f"{quote.get('recipient_name') or ''} 귀하"
+            # 아직 안 적었으면 칸을 통째로 비운다(원본 플레이스홀더 "OOO 귀하"가 찍히면 안 되고,
+            # 이름 없는 " 귀하"도 보기 흉하다). 나중에 채우면 그때 정상 표기된다.
+            updates[coord] = f"{quote['recipient_name']} 귀하" if quote.get("recipient_name") else ""
         elif field in ("client_name", "client_company"):
             updates[coord] = quote.get("recipient_name") or ""
         elif field == "client_contact":
@@ -847,8 +1124,9 @@ def _collect_header_updates(header_fields: Dict[str, str], quote: dict) -> CellU
             updates[coord] = quote.get("recipient_email") or ""
         elif field == "service_name":
             # 테스티파이 마스터는 이 셀 자체가 "용역명: " 라벨이다(recipient_name의 "귀하"와 같은
-            # 패턴) — 값만 쓰면 라벨이 지워진다(2026-08-13 사용자 발견).
-            updates[coord] = f"용역명: {quote.get('service_name') or ''}"
+            # 패턴) — 값만 쓰면 라벨이 지워진다(2026-08-13 사용자 발견). 용역명도 선택 입력이라
+            # 비어 있으면 라벨만 덩그러니 남기지 않고 칸을 비운다.
+            updates[coord] = f"용역명: {quote['service_name']}" if quote.get("service_name") else ""
         elif field == "recipient_block":
             updates[coord] = (
                 f"수신자 : {quote.get('recipient_name') or ''}\n\n아래와 같이 견적서를 발송합니다.\n\n"
@@ -915,34 +1193,9 @@ def _try_assign_flat(groups: List[Dict[str, Any]], flat_blocks: List[dict]) -> O
     return assignments
 
 
-def _try_assign_flat_by_task_type(groups: List[Dict[str, Any]], flat_blocks: List[dict]) -> Optional[List[tuple]]:
-    """알파브라더스처럼 블록마다 구분(대)/구분(중)이 있으면(034 마이그레이션), 과업종류 하나당
-    전용 블록 하나씩 배정한다 — 마케팅과 시장검증이 같은 블록에 섞여 구분(대) 라벨을 하나로
-    억지로 합치는 일이 없게 한다. 과업종류가 1개뿐이면 자연히 첫 블록만 쓰이고 나머지 블록은
-    (호출부가) 미사용으로 비워 숨긴다. 블록 수보다 과업종류가 많거나, 이 표시용 라벨 자체가
-    없는 양식(대부분)이면 None을 돌려줘 기존 방식(_try_assign_flat)으로 넘어가게 한다."""
-    if not flat_blocks or not all(b.get("category_large_cell") for b in flat_blocks):
-        return None
-    groups_by_task_type: Dict[Optional[str], List[Dict[str, Any]]] = {}
-    order: List[Optional[str]] = []
-    for g in groups:
-        tt = g["items"][0].get("task_type") if g["items"] else None
-        if tt not in groups_by_task_type:
-            groups_by_task_type[tt] = []
-            order.append(tt)
-        groups_by_task_type[tt].append(g)
-    if len(order) > len(flat_blocks):
-        return None
-    assignments: List[tuple] = []
-    for block, tt in zip(flat_blocks, order):
-        sub = _try_assign_flat(groups_by_task_type[tt], [block])
-        if sub is None:
-            return None
-        assignments.extend(sub)
-    return assignments
-
-
-def _assign_groups_to_blocks(groups: List[Dict[str, Any]], blocks: List[dict], columns: Dict[str, str]) -> List[tuple]:
+def _assign_groups_to_blocks(
+    groups: List[Dict[str, Any]], blocks: List[dict], columns: Dict[str, str], allow_rollup: bool = True
+) -> List[tuple]:
     """카테고리(그룹)를 양식 블록의 행에 배정한다. 반환값: [(block, group, row_offset), ...]
 
     category_label_cell이 있는 블록은 원본 양식이 카테고리별 전용 영역(헤더+소계)을 갖는다는
@@ -965,20 +1218,22 @@ def _assign_groups_to_blocks(groups: List[Dict[str, Any]], blocks: List[dict], c
             for g in groups
         ]
 
-    labeled_blocks = [b for b in blocks if b.get("category_label_cell")]
-    flat_blocks = [b for b in blocks if not b.get("category_label_cell")]
+    # 카테고리 전용 블록 — 카테고리 라벨 칸이든 구분(대) 칸이든, 그 블록이 카테고리 하나를
+    # 통째로 담는다는 뜻이라 똑같이 "그룹 1개 = 블록 1개"로 배정한다. 구분(대)에 모듈명을 넣게
+    # 되면서(2026-08-19) 예전의 "과업종류 하나당 블록 하나"(_try_assign_flat_by_task_type)는
+    # 성립하지 않는다 — 한 블록에 모듈 여럿을 몰아넣으면 구분(대) 칸이 마지막 모듈명으로
+    # 덮어써지기 때문.
+    category_blocks = [b for b in blocks if b.get("category_label_cell") or b.get("category_large_cell")]
+    flat_blocks = [b for b in blocks if b not in category_blocks]
 
-    if flat_blocks and not labeled_blocks:
-        assignments = _try_assign_flat_by_task_type(groups, flat_blocks)
-        if assignments is not None:
-            return assignments
+    if flat_blocks and not category_blocks:
         assignments = _try_assign_flat(groups, flat_blocks)
         if assignments is not None:
             return assignments
-        rolled_up = _rollup_to_category_totals(groups)
-        assignments = _try_assign_flat(rolled_up, flat_blocks)
-        if assignments is not None:
-            return assignments
+        if allow_rollup:
+            assignments = _try_assign_flat(_rollup_to_category_totals(groups), flat_blocks)
+            if assignments is not None:
+                return assignments
         total_capacity = sum(len(b["rows"]) for b in flat_blocks)
         raise HTTPException(
             status_code=422,
@@ -989,14 +1244,18 @@ def _assign_groups_to_blocks(groups: List[Dict[str, Any]], blocks: List[dict], c
     # module_name 가나다순이라 "설문형 시장검증"이 "시장성 테스트"보다 먼저 오는 경우가 흔함).
     # 그래서 순서대로 짝짓지 않고, 줄 수가 가장 큰 그룹부터 담을 수 있는 블록 중 가장 딱 맞는
     # (여유가 가장 적은) 블록에 배정한다.
-    if len(groups) > len(blocks):
+    if len(groups) > len(category_blocks):
         raise HTTPException(
             status_code=422,
-            detail=f"이 양식은 카테고리 {len(blocks)}개까지만 담을 수 있는데 항목이 {len(groups)}개 카테고리로 나뉘어 있습니다.",
+            detail=f"이 양식은 카테고리 {len(category_blocks)}개까지만 담을 수 있는데 항목이 {len(groups)}개 카테고리로 나뉘어 있습니다.",
         )
     assignments = _try_assign_labeled(groups, blocks)
     if assignments is not None:
         return assignments
+    if not allow_rollup:
+        # 접기 전에 먼저 행을 늘려 보라는 뜻 — 호출부(_resolve_assignment)가 양식을 키운 뒤
+        # 다시 부른다(2026-08-19). 여기서 접어버리면 세부 항목이 소계 한 줄로 사라진다.
+        raise HTTPException(status_code=422, detail="양식 블록에 항목을 그대로 담을 자리가 부족합니다.")
     # 카테고리별 세부 항목 그대로는 블록 자리다툼(예: 4행짜리 블록이 하나뿐인데 4개 이상인
     # 카테고리가 둘 이상)으로 못 담을 수 있다. 전부 소계로 접으면 자리다툼이 없는 카테고리까지
     # 세부 항목을 잃으므로, 자리를 가장 많이 차지하는 카테고리부터 하나씩만 접어가며 다시
@@ -1041,11 +1300,18 @@ def _compute_item_pricing(
         # 사용자가 화면에서 직접 입력·수정했거나 생성 시 계산해 저장해둔 값을 그대로 쓴다 —
         # 발급 시점에 카탈로그 기준으로 다시 역산하면 화면에서 본 값과 실제 PDF가 달라질 수
         # 있다(2026-08-09, 직접편집 대상을 단가/작업일/투입인력까지 확장하며 추가).
-        return item["unit_price"], item["work_days"], item["quantity"]
-    work_days, quantity = _lookup_work_days_quantity(catalog_map, category, item["name"])
+        return item["unit_price"], item["work_days"], item["quantity"], None
+    work_days, quantity, standard_unit_price = _lookup_catalog_pricing(catalog_map, category, item["name"])
     uses_work_days = "supply_amount" in columns and "work_days" in columns and _formula_references_column(
         sheet_xml, f"{columns['supply_amount']}{row}", columns["work_days"]
     )
+    if standard_unit_price:
+        # 표준 단가가 있는 항목(043)은 "이 항목이 다른 항목보다 얼마나 비싼가"라는 상대 중요도를
+        # 그대로 들고 있다. 총액이 달라지면 이 단가들을 통째로 같은 배율로 환산해 중요도를
+        # 유지한다 — 배율은 견적서 전체를 봐야 정해지므로 여기서는 기준값만 돌려주고, 실제
+        # 환산은 compute_line_item_pricing이 한다(2026-08-20 사용자 요구).
+        # 수량·작업일은 카탈로그가 정한 업무량이라 금액을 맞추려고 건드리지 않는다.
+        return standard_unit_price, work_days, quantity, quantity * (work_days if uses_work_days else 1)
     divisor = quantity * (work_days if uses_work_days else 1)
     # 반올림하면 안 된다 — 이 단가 셀 자체는 그냥 값이어도, 같은 행의 공급가액 셀은 원본에
     # 수식(=단가*작업일*수량 등)으로 들어있어 우리가 넣은 amount를 무시하고 이 단가로 다시
@@ -1054,7 +1320,7 @@ def _compute_item_pricing(
     # 실제 PDF 총액이 달라지는 원인이었다(2026-08-11 확인). 나눗셈이 딱 안 떨어지면 정수가
     # 아닌 값을 그대로 쓴다 — 셀 서식이 화면에는 반올림해 보여주므로 표시는 그대로다.
     unit_price = item["amount"] / divisor if divisor else item["amount"]
-    return unit_price, work_days, quantity
+    return unit_price, work_days, quantity, None
 
 
 def _derive_extra_columns(columns: Dict[str, str], amount: float, work_days: float, quantity: float) -> Dict[str, float]:
@@ -1102,6 +1368,166 @@ def _collapse_by_task_type(line_items: List[dict], task_types: List[str]) -> Lis
     return collapsed
 
 
+def _plan_row_growth(groups: List[Dict[str, Any]], blocks: List[dict]) -> List[tuple]:
+    """항목이 양식의 고정 행 수를 넘을 때, 어느 행을 몇 개 복제해 끼워 넣을지 계획한다.
+
+    2026-08-19 사용자 요청 — 화면/채팅으로 항목을 추가하면 PDF·xlsx에도 실제로 새 행이 생겨야
+    한다. 그전에는 여기서 422로 막거나 카테고리 소계 한 줄로 접어 세부 항목을 잃었다.
+
+    남는 행은 어차피 _hide_rows가 숨기므로 넉넉히 늘려도 출력에는 영향이 없다 — 그래서 배정
+    전략(_try_assign_labeled / _try_assign_flat)을 그대로 다시
+    구현하지 않고, 어떤 전략이 뽑히든 성립하도록 블록마다 "필요한 최대치"로 늘린다.
+
+    복제 원본은 블록의 "끝에서 두 번째" 행을 쓴다 — 마지막 행을 복제하면 삽입 지점이 블록
+    합산 수식(=SUM(H29:I30))의 범위 밖이라 그 수식이 새 행을 포함하도록 늘어나지 않는다
+    (2026-08-19 재현). 첫 행은 표를 여는 테두리 서식이 다를 수 있어 피한다.
+    """
+    if not blocks or not groups:
+        return []
+    category_blocks = [b for b in blocks if b.get("category_label_cell") or b.get("category_large_cell")]
+    if category_blocks:
+        # 블록 하나가 카테고리 하나를 통째로 담으므로, 가장 큰 카테고리가 들어갈 만큼 늘린다.
+        needed = max(len(g["items"]) for g in groups)
+    else:
+        # 플랫 양식은 카테고리 구분 없이 이어 담으므로 전체 항목 수만큼 자리가 있으면 된다.
+        needed = sum(len(g["items"]) for g in groups)
+
+    plan = []
+    for block in blocks:
+        rows = block["rows"]
+        if needed > len(rows):
+            clone_row = rows[-2] if len(rows) > 1 else rows[0]
+            plan.append(([clone_row] * (needed - len(rows)), clone_row))
+    return plan
+
+
+def _row_of(coord: str) -> int:
+    return int(re.match(r"[A-Z]+(\d+)", coord).group(1))
+
+
+def _block_source_rows(block: dict) -> List[int]:
+    """블록을 통째로 복제할 때 함께 복제해야 하는 행 — 카테고리 라벨/소계가 항목 행 위의 별도
+    행에 있는 양식(테스티파이 구양식 등)은 그 행까지 포함해야 새 블록이 온전하다."""
+    rows = set(block["rows"])
+    for key in ("category_label_cell", "category_subtotal_cell"):
+        if block.get(key):
+            rows.add(_row_of(block[key]))
+    return sorted(rows)
+
+
+def _plan_block_growth(groups: List[Dict[str, Any]], blocks: List[dict]) -> Optional[tuple]:
+    """카테고리 칸(블록) 자체가 모자라면 마지막 블록을 통째로 복제할 계획을 세운다.
+    반환: (복제 원본 행 목록, 삽입 위치 행, 추가 블록 수) 또는 None."""
+    category_blocks = [b for b in blocks if b.get("category_label_cell") or b.get("category_large_cell")]
+    if not category_blocks or len(groups) <= len(category_blocks):
+        return None
+    source_rows = _block_source_rows(category_blocks[-1])
+    return source_rows, max(source_rows), len(groups) - len(category_blocks)
+
+
+def _appended_blocks(template_block: dict, source_rows: List[int], after_row: int, copies: int) -> List[dict]:
+    """복제로 새로 생긴 블록들의 cell_map 항목을 만든다. 원본 블록의 셀 좌표를 그대로 쓰되
+    행 번호만 복제본 위치로 바꾼다."""
+    size = len(source_rows)
+    new_blocks = []
+    for copy_index in range(copies):
+        offset = after_row + copy_index * size
+        row_of_source = {src: offset + i + 1 for i, src in enumerate(source_rows)}
+        block = {"rows": [row_of_source[r] for r in template_block["rows"]]}
+        for key in ("category_label_cell", "category_subtotal_cell", "category_large_cell", "category_mid_cell"):
+            if template_block.get(key):
+                coord = template_block[key]
+                block[key] = re.sub(r"\d+", str(row_of_source[_row_of(coord)]), coord)
+        new_blocks.append(block)
+    return new_blocks
+
+
+def _grow_template(template: dict, source_bytes: bytes, groups: List[Dict[str, Any]]) -> Optional[tuple]:
+    """부족한 만큼 시트에 행·블록을 실제로 끼워 넣은 (template, source_bytes, sheet_xml)을
+    돌려준다. 늘릴 게 없으면 None — 호출부가 기존 동작(접기/422)으로 넘어간다."""
+    with zipfile.ZipFile(io.BytesIO(source_bytes), "r") as zin:
+        sheet_path = _sheet_internal_path(zin, template["sheet_name"])
+
+    def apply(current_bytes: bytes, current_map: dict, jobs: list) -> tuple:
+        grown_bytes, row_map = xlsx_rows.expand_sheet_rows(
+            current_bytes, sheet_path, template["sheet_name"], jobs
+        )
+        return grown_bytes, xlsx_rows.remap_cell_map(current_map, row_map), row_map
+
+    cell_map = template["cell_map"]
+    changed = False
+
+    # 1단계: 기존 블록의 행 수를 모자란 만큼 늘린다.
+    blocks = [b for b in cell_map.get("item_blocks", []) if b.get("role") != "labor_fte"]
+    row_plan = _plan_row_growth(groups, blocks)
+    if row_plan:
+        source_bytes, new_cell_map, row_map = apply(source_bytes, cell_map, row_plan)
+        # 새로 끼워 넣은 행은 원본에 없던 번호라 remap_cell_map이 모른다 — 복제 원본 바로 아래
+        # 연속된 번호이므로 여기서 직접 채워 넣는다.
+        for original, grown in zip(cell_map.get("item_blocks", []), new_cell_map.get("item_blocks", [])):
+            added = [
+                r
+                for rows, after in row_plan
+                if after in original["rows"]
+                for r in range(row_map[after] + 1, row_map[after] + 1 + len(rows))
+            ]
+            grown["rows"] = sorted(set(grown["rows"]) | set(added))
+        cell_map, changed = new_cell_map, True
+
+    # 2단계: 카테고리 칸(블록) 수가 모자라면, 1단계로 이미 넓어진 마지막 블록을 통째로 복제한다.
+    blocks = [b for b in cell_map.get("item_blocks", []) if b.get("role") != "labor_fte"]
+    block_plan = _plan_block_growth(groups, blocks)
+    if block_plan:
+        source_rows, after_row, copies = block_plan
+        template_block = [b for b in blocks if b.get("category_label_cell") or b.get("category_large_cell")][-1]
+        source_bytes, new_cell_map, _row_map = apply(
+            source_bytes, cell_map, [(source_rows * copies, after_row)]
+        )
+        new_cell_map["item_blocks"] = new_cell_map.get("item_blocks", []) + _appended_blocks(
+            template_block, source_rows, after_row, copies
+        )
+        cell_map, changed = new_cell_map, True
+
+    if not changed:
+        return None
+    # 소계·합계 셀은 원본에 수식으로 들어있는데(예: 합계 = H15+H28+H20+H24) 그 수식은 원본
+    # 블록 개수를 손으로 나열한 것이라, 블록을 복제해 늘리면 새 블록의 소계가 빠진 채 계산된다.
+    # 늘린 시트에서는 이 셀들의 수식을 걷어내고 우리가 계산한 값을 그대로 쓴다(2026-08-19) —
+    # 항목 행의 공급가액 수식(=E16*F16*G16)은 단가 역산 로직이 의존하므로 그대로 둔다.
+    cell_map = {
+        **cell_map,
+        "drop_formula_cells": sorted(
+            # totals에는 셀 좌표뿐 아니라 행 번호(썬데이워커 grand_total_row: 35)도 섞여 있다 —
+            # 좌표만 걸러내지 않으면 str과 int를 함께 정렬하다 TypeError로 발급이 죽는다
+            # (2026-08-20, 썬데이워커 마케팅에서 행을 늘릴 때 재현).
+            {value for value in cell_map.get("totals", {}).values() if isinstance(value, str)}
+            | {b["category_subtotal_cell"] for b in cell_map.get("item_blocks", []) if b.get("category_subtotal_cell")}
+        ),
+    }
+    return (
+        {**template, "cell_map": cell_map},
+        source_bytes,
+        _read_sheet_xml(source_bytes, template["sheet_name"]),
+    )
+
+
+def _assignment_attempts(template: dict, source_bytes: bytes, sheet_xml: str, groups: List[Dict[str, Any]]):
+    """(양식, 파일bytes, 시트xml, 접기허용) 후보를 순서대로 내놓는다.
+
+    1) 원본 그대로 — 들어가면 기존 견적서 출력이 그대로 유지된다.
+    2) 행·블록을 실제로 끼워 넣어 늘린 양식 — 항목을 하나도 잃지 않는다.
+    3) 그래도 안 되면 원본에 카테고리 소계로 접어 담는다(예전 최후 수단 그대로).
+
+    2번을 3번보다 먼저 두는 게 핵심이다 — 순서가 반대면 자리가 모자랄 때 조용히 접혀서
+    세부 항목(상품명·상품구성)이 소계 한 줄로 사라진다(2026-08-19 재현).
+    """
+    yield template, source_bytes, sheet_xml, False
+    grown = _grow_template(template, source_bytes, groups)
+    if grown is not None:
+        yield (*grown, False)
+    yield template, source_bytes, sheet_xml, True
+
+
 def _resolve_assignment(
     supabase, entity_id: str, task_types: List[str], selected_modules: Optional[list], line_items: List[dict]
 ) -> tuple[dict, bytes, str, Dict[str, str], list]:
@@ -1125,17 +1551,29 @@ def _resolve_assignment(
                     detail=f"{Path(storage_path).name}은(는) 구형 포맷이라 아직 PDF 발급을 지원하지 않습니다 (.xlsx로 변환 필요).",
                 )
                 continue
-            cell_map = template["cell_map"]
-            columns = cell_map.get("columns", {})
+            columns = template["cell_map"].get("columns", {})
             try:
                 source_bytes = template_storage.download(storage_path)
                 sheet_xml = _read_sheet_xml(source_bytes, template["sheet_name"])
-                blocks = [b for b in cell_map.get("item_blocks", []) if b.get("role") != "labor_fte"]
-                assignments = _assign_groups_to_blocks(groups, blocks, columns)
             except HTTPException as e:
                 last_error = e
                 continue
-            return template, source_bytes, sheet_xml, columns, assignments
+
+            # 원본 행 수 그대로 담기면 그대로 쓴다 — 기존 견적서의 출력이 달라지지 않게, 행
+            # 삽입은 정말 자리가 모자랄 때만 한다(2026-08-19).
+            for candidate_template, candidate_bytes, candidate_sheet_xml, allow_rollup in _assignment_attempts(
+                template, source_bytes, sheet_xml, groups
+            ):
+                blocks = [
+                    b for b in candidate_template["cell_map"].get("item_blocks", [])
+                    if b.get("role") != "labor_fte"
+                ]
+                try:
+                    assignments = _assign_groups_to_blocks(groups, blocks, columns, allow_rollup)
+                except HTTPException as e:
+                    last_error = e
+                    continue
+                return candidate_template, candidate_bytes, candidate_sheet_xml, columns, assignments
     raise last_error or HTTPException(status_code=422, detail="이 견적서를 담을 수 있는 양식을 찾지 못했습니다.")
 
 
@@ -1146,6 +1584,8 @@ def compute_line_item_pricing(
     selected_modules: Optional[list],
     catalog_entity_id_by_task_type: Dict[str, str],
     line_items: List[dict],
+    unit: int = allocation_service.UNIT_PRICE_UNIT,
+    target_supply: Optional[int] = None,
 ) -> List[dict]:
     """line_items(name/amount/category, 각 항목에 task_type 포함)에 unit_price/work_days/quantity를
     채워 반환한다.
@@ -1155,30 +1595,165 @@ def compute_line_item_pricing(
     계산이 안 되는 경우엔 미리보기가 생성 자체를 막으면 안 되므로, 실패시키지 않고
     단가=배분금액·작업일=수량=1로 대체한다 — 실제 PDF 발급 시의 엄격한 검증(_collect_item_block_updates)과는
     다르다.
+
+    여기가 단가·공급가액을 단위(기본 10만원)로 떨어뜨리는(allocation_service.snap_unit_price) 유일한
+    지점이다 — 항목 자동생성(generation_service)과 채팅 수정(edit_service)이 둘 다 여기를
+    거치므로 한쪽만 단위가 안 맞는 일이 없다(2026-08-20). 그 대신 스냅 뒤 소계가 조금 달라지므로
+    총액은 반드시 이 함수의 결과에서 다시 합산해야 한다. 비교견적서는 호출부가
+    unit=COMPARISON_AMOUNT_UNIT(100만원)을 넘겨 더 굵은 단위로 스냅한다(2026-08-20 사용자 요구
+    — 비교견적서에 만원/1000원/100원/1원 단위 금액이 나오면 안 됨).
+
+    target_supply를 주면 스냅으로 벌어진 차액을 다시 목표 공급가액으로 되돌린다
+    (allocation_service.reconcile_snapped_items) — 최초 생성처럼 "사용자가 입력한 총액"이라는
+    기준이 있는 경우엔 반드시 넘겨야 한다. 채팅/직접 편집은 총액이 바뀌는 게 정상이라 안 넘긴다.
     """
     try:
         _template, _source_bytes, sheet_xml, columns, assignments = _resolve_assignment(
             supabase, entity_id, task_types, selected_modules, line_items
         )
     except HTTPException:
-        return [{**item, "unit_price": item["amount"], "work_days": 1.0, "quantity": 1.0} for item in line_items]
+        columns, assignments = {}, None
 
-    catalog_maps = _build_catalog_maps(supabase, catalog_entity_id_by_task_type)
-    enriched: List[dict] = []
-    for block, group, row_offset in assignments:
-        rows = block["rows"]
-        for i, item in enumerate(group["items"]):
-            row_index = row_offset + i
-            if row_index >= len(rows):
-                enriched.append({**item, "unit_price": item["amount"], "work_days": 1.0, "quantity": 1.0})
-                continue
-            catalog_map = catalog_maps.get(item.get("task_type"), {})
-            unit_price, work_days, quantity = _compute_item_pricing(
-                catalog_map, columns, sheet_xml, group["category"], item, rows[row_index]
-            )
-            extra = _derive_extra_columns(columns, item["amount"], work_days, quantity)
-            enriched.append({**item, "unit_price": unit_price, "work_days": work_days, "quantity": quantity, **extra})
+    plans: List[tuple] = []  # (항목, 단가, 작업일, 수량, 표준단가 배수(None이면 표준단가 아님))
+    if assignments is None:
+        plans = [(item, item["amount"], 1.0, 1.0, None) for item in line_items]
+    else:
+        catalog_maps = _build_catalog_maps(supabase, catalog_entity_id_by_task_type)
+        for block, group, row_offset in assignments:
+            rows = block["rows"]
+            for i, item in enumerate(group["items"]):
+                row_index = row_offset + i
+                if row_index >= len(rows):
+                    plans.append((item, item["amount"], 1.0, 1.0, None))
+                    continue
+                catalog_map = catalog_maps.get(item.get("task_type"), {})
+                plans.append(
+                    (item,)
+                    + _compute_item_pricing(
+                        catalog_map, columns, sheet_xml, group["category"], item, rows[row_index]
+                    )
+                )
+
+    plans = _scale_standard_unit_prices(plans)
+    if any(plan[4] for plan in plans):
+        # 표준 단가(043)가 섞인 견적서는 비교견적서라도 10만원 단위로 다룬다 — 100만원 단위로
+        # 밀면 실제 발급본의 단가 구성(자사몰 구축 300만 : 마케팅 전략안 10만)이 통째로
+        # 무너진다(2026-08-20 확인). 100만원 단위 규칙의 목적(만원·천원 단위 방지)은 표준 단가가
+        # 이미 10만원 배수라 그대로 달성된다.
+        unit = allocation_service.UNIT_PRICE_UNIT
+    enriched = [
+        _snapped(item, unit_price, work_days, quantity, columns, unit, span)
+        for item, unit_price, work_days, quantity, span in plans
+    ]
+
+    if target_supply:
+        enriched = allocation_service.reconcile_snapped_items(enriched, target_supply, unit)
+        # tax_amount/input_mm는 공급가액에서 파생되므로 금액이 조정된 뒤 다시 계산한다.
+        for item in enriched:
+            item.update(_derive_extra_columns(columns, item["amount"], item["work_days"], item["quantity"]))
     return enriched
+
+
+def _scale_standard_unit_prices(plans: List[tuple]) -> List[tuple]:
+    """표준 단가(043) 항목들의 단가를 목표 금액에 맞춰 통째로 같은 배율로 환산한다.
+
+    2026-08-20 사용자 요구 — "아무리 총 금액이 달라져도 세부 항목의 단가를 비율로 환산해서
+    중요도를 유지해야 한다(자사몰 구축은 원래 다른 항목보다 비싸다)". 카탈로그의 표준 단가
+    세트가 그 중요도 자체이므로, 항목별로 따로 반올림하지 않고 세트 전체에 배율 하나를 곱한다.
+
+    배율 = (이 항목들에 배분된 금액의 합) ÷ (표준 단가 기준 금액의 합).
+    분자는 AI가 정한 모듈 간 배분을 존중하고, 분모는 카탈로그의 상대 중요도를 담고 있다 —
+    결과적으로 모듈 간 비중은 AI가, 모듈 안의 항목 간 비중은 카탈로그가 정한다.
+    환산 후 단가는 10만원 단위로 떨어뜨린다(실제 발급본의 모든 단가가 10만원의 배수다).
+
+    그 10만원 반올림 때문에 합계가 목표에서 조금 벗어나는데, 그 잔액을 뒤에서 항목별로
+    메우면(reconcile_snapped_items) 작은 항목이 통째로 3배가 되어 중요도가 깨진다
+    (100,000원짜리 마케팅 전략안이 300,000원이 됨 — 2026-08-20 확인). 그래서 잔액을 나중에
+    메우는 대신, 반올림까지 끝낸 합계가 목표와 정확히 맞는 배율을 이분 탐색으로 찾는다.
+    배율이 커지면 합계는 계단식으로 단조 증가하므로 탐색이 성립한다.
+    """
+    # locked(사용자가 직접 지정한 금액) 항목은 배율 대상에서 뺀다 — 카탈로그 비율로 환산하면
+    # 사용자가 말한 금액이 사라진다(2026-08-20).
+    standard = [p for p in plans if p[4] and not p[0].get("locked")]
+    if not standard:
+        return plans
+    base = sum(unit_price * span for _item, unit_price, _wd, _qty, span in standard)
+    target = sum(item["amount"] for item, *_rest in standard)
+    if base <= 0 or target <= 0:
+        return plans
+
+    def snapped(unit_price: float, factor: float) -> int:
+        # 스냅 단위는 기준 단가 자신에게서 가져온다 — 실제 발급본 단가가 10만원 배수면(테스티파이
+        # 마케팅 등) 10만원 단위를 지키고, 만원 배수면(알파브라더스 시장검증의 150,000·210,000)
+        # 만원 단위를 지킨다. 일괄로 10만원에 맞추면 후자의 원본 구성이 통째로 깨진다.
+        unit = allocation_service.UNIT_PRICE_UNIT
+        if unit_price % unit:
+            unit //= 10
+        return max(unit, round(unit_price * factor / unit) * unit)
+
+    def total_at(factor: float) -> int:
+        return sum(snapped(unit_price, factor) * span for _i, unit_price, _wd, _q, span in standard)
+
+    factor = target / base
+    if total_at(factor) != target:
+        # lo는 항상 "목표 이하", hi는 "목표 초과". 딱 맞는 배율을 못 찾으면 lo를 쓴다 —
+        # 모자란 쪽으로 끝내야 남은 잔액을 reconcile이 채우는 방향이 되어 총액이 안 넘친다.
+        lo, hi, found = 0.0, max(factor * 4, 1.0), None
+        for _ in range(80):
+            mid = (lo + hi) / 2
+            total = total_at(mid)
+            if total == target:
+                found = mid
+                break
+            if total < target:
+                lo = mid
+            else:
+                hi = mid
+        # lo가 0이면 단가를 전부 하한(10만원)까지 내려도 목표를 넘는다는 뜻 — 그때는 최소 구성
+        # 대신 원래 비율을 쓰고 넘치는 만큼은 그대로 둔다(reconcile이 마저 줄인다).
+        factor = found if found is not None else (lo or factor)
+
+    return [
+        plan
+        if not plan[4] or plan[0].get("locked")
+        else (plan[0], snapped(plan[1], factor), plan[2], plan[3], plan[4])
+        for plan in plans
+    ]
+
+
+def _snapped(
+    item: dict,
+    unit_price,
+    work_days: float,
+    quantity: float,
+    columns: Dict[str, str],
+    unit: int,
+    span: Optional[float] = None,
+) -> dict:
+    """공급가액을 단가에 맞춰 다시 세운 항목을 만든다.
+
+    span(수량×작업일)이 있으면 표준 단가(043) 항목이라 공급가액은 단가×span으로 그냥 떨어진다.
+    없으면 예전처럼 배분금액에서 단가를 역산한 뒤 unit 배수로 스냅한다.
+
+    locked=True면 사용자가 직접 지정한 금액이라 스냅하지 않고 그대로 쓴다 — 10만원 격자는
+    사용자가 값을 안 준 항목에만 적용하는 기본값이지, 사용자가 말한 금액을 덮어쓸 규칙이
+    아니다(2026-08-20 사용자 결정).
+    """
+    if item.get("locked"):
+        amount, unit_price = item["amount"], item.get("unit_price") or unit_price
+    elif span:
+        amount = round(unit_price * span)
+    else:
+        amount, unit_price = allocation_service.snap_unit_price(item["amount"], unit_price, unit)
+    extra = _derive_extra_columns(columns, amount, work_days, quantity)
+    return {
+        **item,
+        "amount": amount,
+        "unit_price": unit_price,
+        "work_days": work_days,
+        "quantity": quantity,
+        **extra,
+    }
 
 
 def _collect_item_block_updates(
@@ -1251,14 +1826,17 @@ def _collect_item_block_updates(
             updates[block["category_label_cell"]] = group["category"]
         if block.get("category_subtotal_cell"):
             updates[block["category_subtotal_cell"]] = group["amount"]
-        # 구분(대)/구분(중) — 지금은 둘 다 과업종류명을 그대로 쓴다(예: "마케팅"/"마케팅",
-        # 실제 알파브라더스 원본 샘플의 "시장검증"/"시장검증" 표기와 동일한 방식, PRD 6.2).
-        group_task_type = group["items"][0].get("task_type") if group["items"] else None
-        if group_task_type:
-            if block.get("category_large_cell"):
-                updates[block["category_large_cell"]] = group_task_type
-            if block.get("category_mid_cell"):
-                updates[block["category_mid_cell"]] = group_task_type
+        # 구분(대)에는 모듈명(=group["category"], 예: "런칭 마케팅"/"퍼포먼스")을 넣는다
+        # (2026-08-19 사용자 결정 — 이전엔 구분(대)/구분(중) 둘 다 과업종류명("마케팅")을 넣어
+        # 두 칸이 같은 값으로 중복됐다). 구분(중)은 항목마다 다를 수 있어(런칭 마케팅 안의
+        # 자사몰 구축/전략수립/기본 세팅) 블록 단위 셀이 아니라 아래 행별 컬럼으로 채운다.
+        if block.get("category_large_cell"):
+            updates[block["category_large_cell"]] = group["category"]
+        if block.get("category_mid_cell"):
+            # 구분(중) 전용 컬럼이 없는 옛 양식(알파브라더스)은 블록 셀 하나뿐이라, 그 블록
+            # 항목들의 구분(중)이 모두 같을 때만 의미가 있다 — 섞여 있으면 모듈명으로 대체한다.
+            mids = {item.get("mid_category") for item in group["items"]}
+            updates[block["category_mid_cell"]] = mids.pop() if len(mids) == 1 and None not in mids else group["category"]
 
         for i, item in enumerate(group["items"]):
             row_index = row_offset + i
@@ -1266,10 +1844,16 @@ def _collect_item_block_updates(
                 continue
             row = rows[row_index]
             catalog_map = catalog_maps.get(item.get("task_type"), {})
-            unit_price, work_days, quantity = _compute_item_pricing(
+            # 발급 시점엔 line_items에 단가·작업일·수량이 이미 저장돼 있어 첫 분기로 빠진다
+            # (표준 단가 환산은 생성/수정 시점에 compute_line_item_pricing이 이미 끝냈다).
+            unit_price, work_days, quantity, _span = _compute_item_pricing(
                 catalog_map, columns, sheet_xml, group["category"], item, row
             )
 
+            if "category_mid" in columns:
+                # 구분(중)은 같은 값이 이어지는 행끼리 아래에서 병합하므로(_plan_mid_category_merges)
+                # 여기서는 모든 행에 값을 채운다 — 병합되면 첫 행 값만 보인다.
+                updates[f"{columns['category_mid']}{row}"] = item.get("mid_category") or group["category"]
             if "item_name" in columns:
                 updates[f"{columns['item_name']}{row}"] = item["name"]
             # 상품구성(번호 매긴 세부항목) 전용 컬럼은 알파브라더스/ABBG 원본에만 있다 — 그
@@ -1351,17 +1935,21 @@ def _build_filled_xlsx_from_quote(quote: dict, filled_path: Path) -> None:
 
     if not quote["line_items"]:
         raise HTTPException(status_code=422, detail="항목이 아직 생성되지 않았습니다. 먼저 항목·금액을 생성하세요.")
-    if not quote["recipient_name"]:
-        raise HTTPException(status_code=422, detail="수신자(고객사명)가 없습니다.")
+    # 수신자·용역명이 비어도 발급을 막지 않는다(2026-08-20 사용자 결정) — 이 두 칸은 선택
+    # 입력이고, 발급 후 "정보 수정"에서 채우면 그때 PDF에 반영된다. 예전엔 여기서 422가 나서
+    # 이름을 안 적었다는 이유만으로 미리보기조차 안 떴다.
 
-    vat_included = quote["estimate_sets"]["vat_included"]
-    grand_total = float(quote["total_amount"])
-    if vat_included:
-        supply_amount = round(grand_total / 1.1)
-        vat_amount = grand_total - supply_amount
-    else:
-        supply_amount = grand_total
-        vat_amount = round(supply_amount * 0.1)
+    # 소계·부가세·합계는 항목 금액의 합에서 직접 뽑는다 — 표에 찍히는 행들이 실제로 더해지는
+    # 값이라 어긋날 수가 없다. 예전에는 estimate_sets.vat_included로 갈라 total_amount에서
+    # 역산했는데, vat_included는 "생성할 때 입력한 총액이 부가세 포함이었나"라는 입력 플래그일
+    # 뿐이고 저장된 total_amount는 항상 부가세 포함이라(estimate_service.update_line_items가
+    # 두 경우 모두 소계×1.1로 저장) vat_included=false면 소계 칸에 총합계가 들어갔다.
+    # 대부분의 양식은 이 칸들이 수식이라 우리가 쓴 값을 무시하고 행에서 다시 계산해 겉으로는
+    # 드러나지 않았지만, 행을 늘린 시트(_grow_template)는 수식을 걷어내고 이 값을 그대로 쓴다
+    # (2026-08-19 발견).
+    supply_amount = sum(item["amount"] for item in quote["line_items"])
+    vat_amount = round(supply_amount * 0.1)
+    grand_total = supply_amount + vat_amount
 
     entity_name = quote["entity_templates"]["name"]
     task_types = quote["task_types"]
@@ -1386,6 +1974,23 @@ def _build_filled_xlsx_from_quote(quote: dict, filled_path: Path) -> None:
         sheet_xml,
     )
 
+    # 항목 행의 "입력" 칸(상품명·상품구성·단가·작업일·수량·구분(중))에 수식이 남아 있으면
+    # _patch_sheet_xml이 "수식 셀은 값을 덮어쓰지 않는다"는 규칙 때문에 우리가 계산한 값을
+    # 무시한다. 실제로 테스티파이 신양식 마스터의 단가 칸 하나(Meta 광고 운영 = 실비의 10%)에
+    # 견적별 수식이 남아 있어 총액이 1,100원 어긋났다(2026-08-19). 공급가액 칸의 =단가×수량
+    # 수식은 단가 역산 로직이 의존하므로 그대로 둔다.
+    input_columns = [
+        columns[key]
+        for key in ("category_mid", "item_name", "description", "unit_price", "work_days", "quantity")
+        if key in columns
+    ]
+    item_input_cells = [
+        f"{col}{row}"
+        for block in cell_map.get("item_blocks", [])
+        for row in block["rows"]
+        for col in input_columns
+    ]
+
     updates: CellUpdates = {}
     updates.update(_collect_header_updates(cell_map.get("header_fields", {}), quote))
     updates.update(item_updates)
@@ -1401,6 +2006,9 @@ def _build_filled_xlsx_from_quote(quote: dict, filled_path: Path) -> None:
         hidden_rows=hidden_rows,
         item_blocks=[b for b in cell_map.get("item_blocks", []) if b.get("role") != "labor_fte"],
         strip_background=(entity_name == "ABBG"),
+        drop_formula_cells=list(cell_map.get("drop_formula_cells") or []) + item_input_cells,
+        merge_ranges=_plan_mid_category_merges(sheet_xml, columns, assignments),
+        columns=columns,
     )
 
 

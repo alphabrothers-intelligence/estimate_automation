@@ -260,7 +260,6 @@ function ServiceNameField({
       label="용역명"
       value={quote.service_name ?? ""}
       placeholder="예: 정량·정성 데이터 기반 시장검증 용역"
-      required
       onSave={onSave}
     />
   );
@@ -269,7 +268,9 @@ function ServiceNameField({
 // 담당자/연락처/이메일 칸은 ABBG·알파브라더스 양식에만 있다(010_seed_quote_templates.sql
 // header_fields의 client_contact/client_phone/client_email). 수신자(고객사명)는 모든 법인
 // 양식에 대응 칸이 있어 공통으로 보여준다.
-const RECIPIENT_CONTACT_ENTITIES = ["ABBG", "알파브라더스"];
+// 견적서 상단에 담당자/연락처/이메일 칸이 있는 양식들. 테스티파이는 039 마이그레이션으로
+// 알파브라더스형 신양식으로 갈아타면서 이 칸들이 생겼다(2026-08-19).
+const RECIPIENT_CONTACT_ENTITIES = ["ABBG", "알파브라더스", "테스티파이"];
 
 function RecipientInfoFields({
   quote,
@@ -284,7 +285,6 @@ function RecipientInfoFields({
         label="수신자"
         value={quote.recipient_name ?? ""}
         placeholder="예: 주식회사 미구"
-        required
         onSave={(value) => onSave({ recipient_name: value })}
       />
       {RECIPIENT_CONTACT_ENTITIES.includes(quote.entity_name) && (
@@ -639,7 +639,8 @@ function InlineEditCell({
       title="클릭해서 수정"
       disabled={saving}
       className={
-        "w-full whitespace-pre-line rounded px-1 py-0.5 transition-colors duration-500 hover:bg-indigo-50 " +
+        "w-full rounded px-1 py-0.5 transition-colors duration-500 hover:bg-indigo-50 " +
+        (inputType === "number" ? "whitespace-nowrap " : "whitespace-pre-line break-words ") +
         (align === "right" ? "text-right" : "text-left") +
         (justSaved ? " bg-amber-100" : "") +
         (saving ? " text-gray-400" : "")
@@ -750,13 +751,19 @@ function CategoryRows({
   // 모르겠다"는 피드백(2026-08-10) 대응. 다음 수정이나 항목 재생성 전까지 유지된다.
   const isChanged = (item: { category: string; name: string }) =>
     highlightKeys?.has(`${item.category}::${item.name}`) ?? false;
-  // 알파브라더스 원본 양식은 구분(대)/구분(중) 두 칸에 같은 과업종류명을 그대로 쓴다
-  // (pdf_service._collect_item_block_updates의 group_task_type과 동일한 값).
-  const splitCells = (taskType?: string) =>
+  // 구분(대)에는 모듈명(group.category), 구분(중)에는 항목의 mid_category를 보여준다 —
+  // 발급되는 PDF(pdf_service._collect_item_block_updates)와 같은 값이어야 한다. 구분(중)이
+  // 없는 카탈로그는 구분(대)와 같은 값으로 채워진다(2026-08-19).
+  // 표가 table-fixed라 열 폭이 고정이다 — 여기에 whitespace-nowrap을 주면 긴 구분명이
+  // 줄바꿈 없이 옆 칸 위로 그대로 흘러넘쳐 상품명과 겹쳐 보였다(2026-08-20 사용자 지적).
+  // 넘칠 때는 줄을 바꿔 담는다.
+  const splitCells = (item?: LineItem) =>
     showCategorySplit && (
       <>
-        <td className="whitespace-nowrap px-3 py-2.5 text-sm text-gray-600">{taskType ?? "—"}</td>
-        <td className="whitespace-nowrap px-3 py-2.5 text-sm text-gray-600">{taskType ?? "—"}</td>
+        <td className="break-words px-3 py-2.5 text-sm text-gray-600">{group.category}</td>
+        <td className="break-words px-3 py-2.5 text-sm text-gray-600">
+          {item?.mid_category ?? group.category}
+        </td>
       </>
     );
 
@@ -769,7 +776,7 @@ function CategoryRows({
           (isChanged(item) ? "border-l-4 border-l-amber-400 bg-amber-50" : "bg-white")
         }
       >
-        {splitCells(item.task_type)}
+        {splitCells(item)}
         <td className="px-3 py-2.5 text-gray-800">
           <InlineEditCell
             value={group.category}
@@ -803,12 +810,12 @@ function CategoryRows({
   return (
     <>
       <tr className="border-b border-gray-200 bg-white last:border-b-0">
-        {splitCells(group.items[0]?.task_type)}
+        {splitCells(group.items[0])}
         <td className="px-3 py-2.5 font-bold text-gray-900">
           <button
             type="button"
             onClick={() => setExpanded((v) => !v)}
-            className="flex items-center gap-1.5"
+            className="flex min-w-0 items-center gap-1.5 break-words text-left"
           >
             <svg
               viewBox="0 0 20 20"
@@ -835,7 +842,7 @@ function CategoryRows({
               (isChanged(item) ? "border-l-4 border-l-amber-400 bg-amber-50" : "bg-gray-50")
             }
           >
-            {splitCells(item.task_type)}
+            {splitCells(item)}
             <td className="py-2 pl-9 pr-3 text-sm text-gray-700">
               <InlineEditCell
                 value={item.name}
@@ -892,6 +899,43 @@ function computeGrandTotal(items: LineItem[], vatIncluded: boolean): number {
 // 직접편집이든 채팅 수정이든 커밋("수정 반영하기") 전까지는 화면에서만 미리보이는 상태.
 type PendingEdit = { items: LineItem[]; editRequestText: string };
 
+// 백엔드 allocation_service.AMOUNT_UNIT과 같은 값 — 견적 금액은 1만원 단위로 떨어뜨린다
+// (2026-08-19 사용자 결정). 여기서 어긋나면 화면과 발급본의 금액이 달라진다.
+const AMOUNT_UNIT = 10_000;
+
+// 백엔드 allocation_service.reconcile_amounts의 JS 쌍둥이 — 소계/총합계를 직접 고쳤을 때
+// 항목들을 비례 배분한 뒤 1만원 단위로 떨어뜨리고, 남는 차액은 가장 큰 항목이 흡수한다.
+// 두 구현이 같은 규칙을 따라야 "수정 반영하기" 전후로 금액이 흔들리지 않는다.
+function reconcileAmounts(amounts: number[], target: number): number[] {
+  if (amounts.length === 0) return amounts;
+  const sum = (values: number[]) => values.reduce((acc, v) => acc + v, 0);
+  const absorbDiff = (values: number[]) => {
+    const out = [...values];
+    const diff = target - sum(out);
+    if (diff !== 0) {
+      let biggest = 0;
+      out.forEach((v, i) => {
+        if (v > out[biggest]) biggest = i;
+      });
+      out[biggest] += diff;
+    }
+    return out;
+  };
+
+  const current = sum(amounts);
+  const scaled =
+    current > 0 && target !== current ? amounts.map((a) => Math.round((a * target) / current)) : [...amounts];
+
+  // 단위 반올림은 "단위 × 항목수"만큼 여유가 있을 때만 — 그보다 target이 작으면 차액 흡수에서 음수가 난다.
+  if (target >= AMOUNT_UNIT * scaled.length) {
+    const rounded = absorbDiff(
+      scaled.map((a) => (a > 0 ? Math.max(AMOUNT_UNIT, Math.round(a / AMOUNT_UNIT) * AMOUNT_UNIT) : 0))
+    );
+    if (Math.min(...rounded) >= 0) return rounded;
+  }
+  return absorbDiff(scaled);
+}
+
 function LineItemTable({
   items,
   columnLabels,
@@ -923,19 +967,23 @@ function LineItemTable({
   const hasTextDetail = order.some((key) => TEXT_DETAIL_KEYS.has(key));
 
   function detailColumnWidth(key: string): string {
-    if (TEXT_DETAIL_KEYS.has(key)) return showCategorySplit ? "24%" : "30%";
+    if (TEXT_DETAIL_KEYS.has(key)) return showCategorySplit ? "20%" : "30%";
     if (!hasTextDetail) {
       if (key === "unit_price") return "20%";
       if (key === "work_days" || key === "quantity") return "10%";
       return "10%";
     }
     if (key === "work_days" || key === "quantity") return "7%";
-    if (key === "unit_price") return "12%";
+    if (key === "unit_price") return "14%";
     return "9%";
   }
 
   async function handleEditItem(index: number, patch: LineItemPatch) {
-    const merged: LineItem = { ...items[index], ...patch };
+    // 화면에서 직접 친 금액은 잠근다 — 이후 채팅 수정에서 단가 10만원 스냅·카탈로그 비율
+    // 환산이 이 항목을 건드리지 않는다(2026-08-20 사용자 지적: "단가를 고쳐놔도 자꾸 다른
+    // 값이 마음대로 움직인다"). 백엔드 LineItemIn.locked 참고.
+    const pinned = "amount" in patch || "unit_price" in patch || "quantity" in patch;
+    const merged: LineItem = { ...items[index], ...patch, ...(pinned ? { locked: true } : {}) };
     // 공급가액 = 단가×수량만으로 계산한다. 작업일은 정보성 필드로 가격에 영향을 주지 않는다
     // (2026-08-14 사용자 결정 — 일부 원본 xlsx 시트엔 단가×작업일×수량 수식이 있지만, 그건
     // pdf_service._compute_item_pricing이 발급 시점에 역산으로 흡수하는 별개 문제다. 여기(화면/
@@ -954,30 +1002,49 @@ function LineItemTable({
     // 정보성이라 amount에 영향 없음, 939번 줄 주석 참고) 똑같이 걸려야 해서 patch 키가 아니라 실제
     // amount 변화 여부로 판단한다.
     let redistributedDelta: number | null = null;
+    let totalGrewInstead = false;
     if (keepTotal && merged.amount !== items[index].amount && items.length > 1) {
       const originalTotal = items.reduce((sum, item) => sum + item.amount, 0);
       const delta = merged.amount - items[index].amount;
       const othersSum = originalTotal - items[index].amount;
-      if (delta !== 0 && othersSum > 0) {
+      // delta가 othersSum보다 크면 나머지 항목을 아무리 깎아도(0원까지) 총액을 못 지킨다 — 예전엔
+      // 그래도 scale을 0으로 눌러 나머지 항목 전부를 0원으로 만들었는데, 그게 "가격을 바꾸니 다른
+      // 항목이 전부 사라진다"는 버그였다(2026-08-20 사용자 지적). 총액을 지킬 수 없으면 다른 항목을
+      // 건드리지 않고 총합계 유지 모드를 포기한다(= keepTotal 꺼졌을 때와 동일하게 이 항목만 바뀜).
+      if (delta > 0 && othersSum >= 0 && othersSum < delta) totalGrewInstead = true;
+      if (delta !== 0 && othersSum > 0 && othersSum >= delta) {
         redistributedDelta = delta;
-        // ponytail: delta가 othersSum보다 크면(다른 항목을 전부 0으로 깎아도 못 흡수) scale을 0에서
-        // 멈춘다 — 이 경우 총액이 정확히 안 맞을 수 있음. 필요해지면 음수 방지 대신 에러로 막을 것.
-        const scale = Math.max(0, (othersSum - delta) / othersSum);
+        const scale = (othersSum - delta) / othersSum;
         next = items.map((item, i) => {
           if (i === index) return merged;
           const scaledAmount = Math.round(item.amount * scale);
           const divisor = item.quantity ?? 1;
-          return { ...item, amount: scaledAmount, unit_price: divisor ? scaledAmount / divisor : scaledAmount };
+          // 총액 유지로 끌려온 금액은 사용자가 지정한 값이 아니므로 잠금을 푼다.
+          return {
+            ...item,
+            locked: false,
+            amount: scaledAmount,
+            unit_price: divisor ? scaledAmount / divisor : scaledAmount,
+          };
         });
-        // 반올림 오차는 마지막 "다른" 항목에서 흡수해 총액을 원래 값과 정확히 맞춘다
-        // (allocation_service._reconcile_rounding과 동일 패턴).
+        // 반올림 오차는 다른 항목 중 금액이 가장 큰 항목이 흡수한다(reconcileAmounts와 동일
+        // 패턴) — 예전엔 배열의 마지막 항목이 무조건 흡수했는데, 그 항목이 이미 0에 가깝게
+        // 줄어든 상태면 오차를 더하는 순간 음수로 떨어졌다(2026-08-20 사용자 지적). othersSum >=
+        // delta를 위에서 이미 보장했으므로 여기서 음수가 나올 순 없지만, Math.max(0, ...)은
+        // 안전망으로 남겨둔다.
         const roundingDiff = originalTotal - next.reduce((sum, item) => sum + item.amount, 0);
         if (roundingDiff !== 0) {
-          const lastOtherIndex = index === next.length - 1 ? next.length - 2 : next.length - 1;
-          const item = next[lastOtherIndex];
-          const fixedAmount = item.amount + roundingDiff;
-          const divisor = item.quantity ?? 1;
-          next[lastOtherIndex] = { ...item, amount: fixedAmount, unit_price: divisor ? fixedAmount / divisor : fixedAmount };
+          let biggestOtherIndex = -1;
+          next.forEach((item, i) => {
+            if (i === index) return;
+            if (biggestOtherIndex === -1 || item.amount > next[biggestOtherIndex].amount) biggestOtherIndex = i;
+          });
+          if (biggestOtherIndex !== -1) {
+            const item = next[biggestOtherIndex];
+            const fixedAmount = Math.max(0, item.amount + roundingDiff);
+            const divisor = item.quantity ?? 1;
+            next[biggestOtherIndex] = { ...item, amount: fixedAmount, unit_price: divisor ? fixedAmount / divisor : fixedAmount };
+          }
         }
       }
     }
@@ -986,8 +1053,25 @@ function LineItemTable({
     setAllocationFeedback(
       redistributedDelta !== null
         ? `차액 ${Math.abs(redistributedDelta).toLocaleString()}원을 다른 ${items.length - 1}개 항목에 자동 배분했습니다.`
+        : totalGrewInstead
+        ? "다른 항목으로는 차액을 다 흡수할 수 없어 총합계를 유지하지 못했습니다 — 총합계가 함께 늘어났습니다."
         : null
     );
+  }
+
+  // 공급가액 소계・총합계를 직접 고치면 그 목표에 맞춰 전 항목을 다시 배분한다(2026-08-19
+  // 사용자 요청 — "총합계도 수정할 수 있게"). 채팅으로 "소계를 1,000만원으로" 라고 말하는 것과
+  // 같은 결과가 나오도록 백엔드와 같은 배분 규칙(reconcileAmounts)을 쓴다.
+  async function handleEditSupplyTotal(nextSupplyAmount: number) {
+    if (!Number.isFinite(nextSupplyAmount) || nextSupplyAmount <= 0 || items.length === 0) return;
+    const amounts = reconcileAmounts(items.map((item) => item.amount), Math.round(nextSupplyAmount));
+    onSaveLineItems(
+      items.map((item, i) => {
+        const divisor = item.quantity ?? 1;
+        return { ...item, amount: amounts[i], unit_price: divisor ? amounts[i] / divisor : amounts[i] };
+      })
+    );
+    setAllocationFeedback(`총액에 맞춰 ${items.length}개 항목 금액을 1만원 단위로 다시 배분했습니다.`);
   }
 
   return (
@@ -1003,7 +1087,7 @@ function LineItemTable({
           (!showCategorySplit && !hasTextDetail ? "w-full max-w-[980px]" : "w-full")
         }
       >
-      <table className="w-full min-w-[760px] table-fixed border-collapse text-base">
+      <table className="w-full min-w-0 table-fixed border-collapse text-sm">
         <colgroup>
           {showCategorySplit && (
             <>
@@ -1011,19 +1095,19 @@ function LineItemTable({
               <col style={{ width: "8%" }} />
             </>
           )}
-          <col style={{ width: showCategorySplit ? "18%" : hasTextDetail ? "35%" : "32%" }} />
+          <col style={{ width: showCategorySplit ? "16%" : hasTextDetail ? "35%" : "32%" }} />
           {order.map((key) => <col key={key} style={{ width: detailColumnWidth(key) }} />)}
-          <col style={{ width: hasTextDetail ? "13%" : "28%" }} />
+          <col style={{ width: hasTextDetail ? (showCategorySplit ? "16%" : "13%") : "28%" }} />
           {hasNote && <col style={{ width: "16%" }} />}
         </colgroup>
         <thead>
           <tr className="border-b border-gray-200 bg-gray-100">
             {showCategorySplit && (
               <>
-                <th className="whitespace-nowrap px-3 py-2 text-left text-sm font-semibold text-gray-600">
+                <th className="break-words px-3 py-2 text-left text-sm font-semibold text-gray-600">
                   {columnLabels.category_large ?? "구분(대)"}
                 </th>
-                <th className="whitespace-nowrap px-3 py-2 text-left text-sm font-semibold text-gray-600">
+                <th className="break-words px-3 py-2 text-left text-sm font-semibold text-gray-600">
                   {columnLabels.category_mid ?? "구분(중)"}
                 </th>
               </>
@@ -1070,8 +1154,14 @@ function LineItemTable({
             <td className="px-3 py-2 text-right text-sm text-gray-500" colSpan={labelColSpan}>
               공급가액 소계
             </td>
-            <td className="px-3 py-2 text-right text-sm text-gray-700">
-              {supplyAmount.toLocaleString()}원
+            <td className="whitespace-nowrap px-3 py-2 text-right text-sm text-gray-700">
+              <InlineEditCell
+                value={String(supplyAmount)}
+                display={`${supplyAmount.toLocaleString()}원`}
+                align="right"
+                inputType="number"
+                onSave={(v) => handleEditSupplyTotal(Number(v))}
+              />
             </td>
             {hasNote && <td className="px-3 py-2" />}
           </tr>
@@ -1079,7 +1169,7 @@ function LineItemTable({
             <td className="px-3 py-2 text-right text-sm text-gray-500" colSpan={labelColSpan}>
               부가세 (10%)
             </td>
-            <td className="px-3 py-2 text-right text-sm text-gray-700">
+            <td className="whitespace-nowrap px-3 py-2 text-right text-sm text-gray-700">
               {vatAmount.toLocaleString()}원
             </td>
             {hasNote && <td className="px-3 py-2" />}
@@ -1088,8 +1178,16 @@ function LineItemTable({
             <td className="px-3 py-2.5 text-right text-sm font-bold text-gray-900" colSpan={labelColSpan}>
               총합계
             </td>
-            <td className="px-3 py-2.5 text-right text-base font-bold text-indigo-700">
-              {grandTotal.toLocaleString()}원
+            <td className="whitespace-nowrap px-3 py-2.5 text-right text-base font-bold text-indigo-700">
+              {/* 총합계는 항상 공급가액 소계의 1.1배다(computeVatBreakdown) — 입력받은 부가세
+                  포함 금액을 1.1로 나눠 소계 목표로 되돌린 뒤 항목을 다시 배분한다. */}
+              <InlineEditCell
+                value={String(grandTotal)}
+                display={`${grandTotal.toLocaleString()}원`}
+                align="right"
+                inputType="number"
+                onSave={(v) => handleEditSupplyTotal(Math.round(Number(v) / 1.1))}
+              />
             </td>
             {hasNote && <td className="px-3 py-2.5" />}
           </tr>
@@ -1126,10 +1224,10 @@ function QuoteCard({
   onRevertToPrevious: () => Promise<void>;
 }) {
   const contactRequired = RECIPIENT_CONTACT_ENTITIES.includes(quote.entity_name);
+  // 수신자·용역명은 선택 입력이라 여기 없다(2026-08-20) — 비워도 발급되고, 나중에 "정보 수정"에서
+  // 채우면 그때 PDF에 반영된다.
   const missingRequiredFields = [
     !quote.quote_date && "작성일",
-    !quote.recipient_name && "수신자",
-    quote.entity_name === TESTIFY_NAME && !quote.service_name && "용역명",
     contactRequired && !quote.recipient_contact && "담당자",
     contactRequired && !quote.recipient_phone && "연락처",
     contactRequired && !quote.recipient_email && "이메일",
@@ -1174,14 +1272,6 @@ function QuoteCard({
               >
                 {quote.is_primary ? "본견적서" : "비교견적서"}
               </span>
-              {quote.is_catalog_borrowed && (
-                <span
-                  className="rounded-full bg-amber-100 px-3 py-1 text-sm font-medium text-amber-700"
-                  title={`${quote.entity_name}의 실제 카탈로그가 없어 ${quote.catalog_source_entity_name}의 항목 구성을 차용했습니다.`}
-                >
-                  {quote.catalog_source_entity_name} 차용
-                </span>
-              )}
             </div>
             <p className="mt-2 text-xl font-bold tracking-tight text-slate-950">{quote.entity_name}</p>
             <p className="mt-1 text-xs text-slate-500">수정 내용은 저장 후 실제 견적서에 반영됩니다.</p>
@@ -1194,8 +1284,15 @@ function QuoteCard({
             </p>
             {quote.line_items.length > 0 && (
               <div className="mt-2 flex justify-end gap-2">
+                {/* target="_blank"이 없으면 이 링크가 현재 탭의 "이동"으로 시작돼서, 미반영 수정이
+                    남아 있을 때 beforeunload 핸들러가 걸려 크롬의 "사이트에서 나가시겠습니까?"
+                    경고가 뜬다(2026-08-19 사용자 지적) — 실제로는 파일만 내려받고 페이지는 그대로
+                    있는데도 뜨는 오해성 경고다. 새 탭으로 시작하면 현재 문서는 이탈 대상이 아니라
+                    경고가 뜨지 않고, 첨부파일 응답이라 그 탭은 곧바로 닫힌다. */}
                 <a
                   href={getEntityQuotePdfUrl(quote.id)}
+                  target="_blank"
+                  rel="noopener"
                   className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-indigo-700"
                 >
                   <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -1205,6 +1302,8 @@ function QuoteCard({
                 </a>
                 <a
                   href={getEntityQuoteXlsxUrl(quote.id)}
+                  target="_blank"
+                  rel="noopener"
                   className="inline-flex items-center gap-1.5 rounded-lg border border-black/10 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-700 transition hover:bg-slate-100"
                 >
                   <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -1657,8 +1756,6 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
   const [pendingByQuote, setPendingByQuote] = useState<Record<string, PendingEdit>>({});
   const pendingByQuoteRef = useRef(pendingByQuote);
   pendingByQuoteRef.current = pendingByQuote;
-  const resultRef = useRef(result);
-  resultRef.current = result;
 
   const [moduleOptions, setModuleOptions] = useState<EntityModuleOptions[]>([]);
   const [moduleSelections, setModuleSelections] = useState<Record<string, string[]>>({});
@@ -1903,7 +2000,6 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
     allEntitiesHaveTask &&
     projectName.trim().length > 0 &&
     Number(totalAmount) > 0 &&
-    (!primaryIsTestify || serviceName.trim().length > 0) &&
     !submitting;
 
   async function handleSubmit() {
@@ -2013,17 +2109,26 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
   async function handleCommitPending(quoteId: string) {
     const pending = pendingByQuoteRef.current[quoteId];
     if (!pending) return;
-    await updateLineItems(quoteId, pending.items, pending.editRequestText);
+    const { entity_quote, synced_comparison_quotes } = await updateLineItems(
+      quoteId,
+      pending.items,
+      pending.editRequestText
+    );
     setPendingByQuote((prev) => {
       const next = { ...prev };
       delete next[quoteId];
       return next;
     });
-    // 본견적 수정은 백엔드에서 같은 세트의 비교견적 총액도 함께 재계산한다(sync_service) —
-    // 수정된 견적 하나만 병합하면 화면에 남은 비교견적들이 옛 총액인 채로 보이므로 세트 전체를 다시 받는다.
-    // resultRef를 쓰는 이유: 이 함수는 화면 이탈 시 자동 flush(useEffect cleanup)에서도 호출되는데,
-    // 그 클로저는 마운트 시점 값을 캡처해 result가 stale할 수 있다.
-    if (resultRef.current) setResult(await fetchEstimateSet(resultRef.current.id));
+    // 본견적 수정은 백엔드에서 같은 세트의 비교견적 총액도 함께 재계산해(sync_service) 응답에
+    // 실어 보내준다 — 세트 전체를 다시 조회하지 않고 그 값으로 바로 병합한다(2026-08-17,
+    // 커밋 후 불필요한 전체 재조회 제거). setResult는 함수형 업데이트라 항상 최신 상태를
+    // 기준으로 병합되므로, 화면 이탈 시 자동 flush(useEffect cleanup)에서 호출돼도 안전하다.
+    const updatedById = new Map([entity_quote, ...synced_comparison_quotes].map((q) => [q.id, q]));
+    setResult((prev) =>
+      prev
+        ? { ...prev, entity_quotes: prev.entity_quotes.map((q) => updatedById.get(q.id) ?? q) }
+        : prev
+    );
   }
 
   // "되돌아가기" — pending을 버리고 마지막으로 저장된 상태로 화면을 되돌린다.
@@ -2242,6 +2347,10 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
                 <span className="shrink-0 text-xs font-semibold text-slate-400">견적서 {displayQuotes.length}개</span>
                 {displayQuotes.map((q) => {
                   const selected = (viewedQuote?.id ?? primaryQuote?.id) === q.id;
+                  const diffPercent =
+                    !q.is_primary && primaryQuote && primaryQuote.total_amount > 0
+                      ? ((q.total_amount - primaryQuote.total_amount) / primaryQuote.total_amount) * 100
+                      : null;
                   return (
                     <button
                       key={q.id}
@@ -2278,6 +2387,26 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
                       {q.total_amount > 0 && (
                         <span className={"text-xs " + (selected ? "text-slate-300" : "text-slate-400")}>
                           · {q.total_amount.toLocaleString()}원
+                        </span>
+                      )}
+                      {diffPercent !== null && (
+                        <span
+                          className={
+                            "text-[11px] font-semibold " +
+                            (selected
+                              ? diffPercent > 0
+                                ? "text-rose-200"
+                                : diffPercent < 0
+                                  ? "text-sky-200"
+                                  : "text-slate-300"
+                              : diffPercent > 0
+                                ? "text-rose-600"
+                                : diffPercent < 0
+                                  ? "text-sky-600"
+                                  : "text-slate-400")
+                          }
+                        >
+                          {diffPercent > 0 ? "+" : ""}{diffPercent.toFixed(1)}%
                         </span>
                       )}
                     </button>
@@ -2570,10 +2699,12 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
               VAT 포함
             </label>
           </div>
+          {/* 용역명은 예전 테스티파이 양식(B12)에만 있던 칸이다 — 신양식에는 그 칸이 없어
+              더 이상 필수가 아니지만, 입력해 두면 이력에 남으므로 선택 입력으로 남긴다. */}
           {primaryIsTestify && (
             <div>
               <label className="block text-sm text-gray-500">
-                용역명 <span className="text-amber-600">(테스티파이 발급 시 필수)</span>
+                용역명 <span className="text-slate-400">(선택)</span>
               </label>
               <input
                 type="text"

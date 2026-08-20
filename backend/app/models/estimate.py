@@ -138,6 +138,12 @@ class LineItemIn(BaseModel):
     # 알파브라더스·ABBG처럼 "상품구성" 컬럼에 세부 항목을 세로형 개조식으로 나열하는 양식용 —
     # 이 필드가 없으면 직접편집 저장 시 model_dump()가 통째로 지워버린다(2026-08-11 발견).
     description: Optional[str] = None
+    # 구분(중) — description과 같은 이유로 여기 없으면 저장할 때마다 지워진다(2026-08-19).
+    mid_category: Optional[str] = None
+    # 사용자가 채팅에서 금액·단가를 콕 집어 지정한 항목(edit_service). 이 플래그가 붙으면 이후
+    # 단가 10만원 스냅·카탈로그 비율 환산·잔액 흡수가 이 항목을 건드리지 않는다 — 여기 없으면
+    # 저장 왕복에서 지워져서 다음 채팅 수정 때 그 금액이 다시 격자로 밀린다(2026-08-20).
+    locked: bool = False
 
 
 class LineItemsUpdate(BaseModel):
@@ -151,6 +157,14 @@ class EditResult(BaseModel):
     scope: str  # "quote_only" | "catalog_update" | "ambiguous"
     entity_quote: EntityQuoteOut
     changed_items: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class LineItemsUpdateResult(BaseModel):
+    entity_quote: EntityQuoteOut
+    # 본견적을 수정한 경우 같은 세트의 비교견적들도 함께 재계산되는데(sync_service),
+    # 프론트엔드가 이걸 반영하려고 세트 전체를 다시 조회하던 걸 없애기 위해 여기 함께 담아
+    # 돌려준다(2026-08-17). 비교견적을 수정한 경우·동기화 대상이 없는 경우는 빈 배열.
+    synced_comparison_quotes: List[EntityQuoteOut] = Field(default_factory=list)
 
 
 class QuoteVersionOut(BaseModel):

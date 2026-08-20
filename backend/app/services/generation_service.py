@@ -8,7 +8,7 @@ from fastapi import HTTPException
 from app.config import get_supabase
 from app.models.estimate import EntityQuoteOut, EstimateSetOut
 from app.services import module_selection_service, pdf_service
-from app.services.allocation_service import allocate_items
+from app.services.allocation_service import allocate_items, amount_unit_for, grand_total
 from app.services.catalog_service import get_catalog_for_generation, get_module_options
 
 DEFAULT_COMPARISON_MARKUP = 0.10  # PRD 4.3 — 비교견적서 기본 마크업 +10%, EntitySelectionIn.markup_ratio로 기업별 override 가능(2026-08-14)
@@ -125,12 +125,25 @@ def _generate_one_quote(quote: dict, estimate_set: dict, selections: Dict[str, L
     # 계산이 안 되는 경우엔 compute_line_item_pricing이 알아서 안전한 기본값으로 대체하므로
     # 생성 자체가 실패하지는 않는다.
     enriched_line_items = pdf_service.compute_line_item_pricing(
-        supabase, quote["entity_id"], task_types, selected_modules, catalog_entity_id_by_task_type, allocation["line_items"]
+        supabase,
+        quote["entity_id"],
+        task_types,
+        selected_modules,
+        catalog_entity_id_by_task_type,
+        allocation["line_items"],
+        unit=amount_unit_for(quote["is_primary"]),
+        # 사용자가 입력한 총액이 기준이다 — 단가 스냅으로 벌어진 차액을 여기서 되돌리지 않으면
+        # 3,000만원 입력이 3,201만원으로, 비교견적서는 마크업 +10%가 +99%로 발급된다(2026-08-20).
+        target_supply=allocation["supply_amount"],
     )
+
+    # 총액은 반드시 스냅·재조정이 끝난 항목에서 다시 합산한다 — 단가 단위 때문에 목표 공급가액에
+    # 마지막 몇 십만원이 안 맞을 수 있고, 그때 항목 합이 화면 합계의 정답이다(2026-08-20).
+    supply_amount = sum(item["amount"] for item in enriched_line_items)
 
     supabase.table("entity_quotes").update(
         {
-            "total_amount": allocation["grand_total"],
+            "total_amount": grand_total(supply_amount, estimate_set["vat_included"]),
             "line_items": enriched_line_items,
             "is_catalog_borrowed": is_catalog_borrowed,
             "catalog_source_entity_name": catalog_source_entity_name,

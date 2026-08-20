@@ -12,6 +12,7 @@ from app.models.estimate import (
     GenerateRequest,
     EntityQuoteOut,
     LineItemsUpdate,
+    LineItemsUpdateResult,
     QuoteDateUpdate,
     QuoteVersionOut,
     RecipientInfoUpdate,
@@ -74,7 +75,7 @@ def update_recipient_info(entity_quote_id: str, payload: RecipientInfoUpdate):
     return estimate_service.update_recipient_info(entity_quote_id, payload)
 
 
-@entity_quotes_router.put("/{entity_quote_id}/line-items", response_model=EntityQuoteOut)
+@entity_quotes_router.put("/{entity_quote_id}/line-items", response_model=LineItemsUpdateResult)
 def update_line_items(entity_quote_id: str, payload: LineItemsUpdate):
     return estimate_service.update_line_items(
         entity_quote_id, payload.items, payload.edit_request_text or "직접편집"

@@ -18,9 +18,15 @@ export type LineItem = {
   task_type?: string;
   // 알파브라더스처럼 상품구성을 별도 칸(상품구성/상세내용)에 세로로 나열하는 양식용.
   description?: string;
+  // 구분(중) — 구분(대)(category)와 상품명(name) 사이의 중간 분류. 이 칸이 있는 양식
+  // (테스티파이 신양식·알파브라더스)에서만 표시된다(2026-08-19).
+  mid_category?: string;
   // 썬데이워커 전용 — 투입 MM(작업일×수량÷20 근사치, PRD 7.4)과 항목별 세액(공급가액×10%).
   input_mm?: number;
   tax_amount?: number;
+  // 채팅에서 사용자가 금액·단가를 콕 집어 지정한 항목. 저장 시 그대로 되돌려 보내야 다음
+  // 수정 때 그 금액이 10만원 단위로 다시 밀리지 않는다(2026-08-20).
+  locked?: boolean;
 };
 
 export type EntityQuote = {
@@ -221,17 +227,24 @@ export async function generateEstimateSet(
   return handle<EstimateSet>(res);
 }
 
+export type LineItemsUpdateResult = {
+  entity_quote: EntityQuote;
+  // 본견적을 수정하면 같은 세트의 비교견적들도 서버에서 함께 재계산된다 — 세트 전체를
+  // 다시 조회하지 않고 이 값으로 화면을 바로 갱신한다(2026-08-17).
+  synced_comparison_quotes: EntityQuote[];
+};
+
 export async function updateLineItems(
   entityQuoteId: string,
   items: LineItem[],
   editRequestText?: string
-): Promise<EntityQuote> {
+): Promise<LineItemsUpdateResult> {
   const res = await fetch(`${API_BASE_URL}/api/entity-quotes/${entityQuoteId}/line-items`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ items, edit_request_text: editRequestText ?? null }),
   });
-  return handle<EntityQuote>(res);
+  return handle<LineItemsUpdateResult>(res);
 }
 
 export type QuoteVersion = {

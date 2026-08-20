@@ -10,10 +10,16 @@ class EntityOption(BaseModel):
 
 class CatalogItem(BaseModel):
     module_name: Optional[str] = None
+    # 구분(중) — 구분(대)(module_name)와 상품명(item_name) 사이의 중간 분류. 이 칸이 있는
+    # 양식(테스티파이 신양식·알파브라더스)에서만 쓰이고 없는 양식에서는 무시된다 (2026-08-19).
+    mid_category: Optional[str] = None
     item_name: str
     historical_ratio: Optional[float] = None
     is_required: bool
     standard_description: Optional[str] = None
+    # 이 모듈이 참고 견적서에서 차지한 실제 공급가액 — 모듈이 여럿 조합될 때 그 사이의 배분
+    # 비중으로 쓰인다(allocation_service._split_amount_weighted). null이면 균등분배 (2026-08-19).
+    module_weight: Optional[float] = None
 
 
 class CatalogResult(BaseModel):

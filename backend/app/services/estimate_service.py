@@ -5,8 +5,8 @@ from fastapi import HTTPException
 
 from app.config import get_supabase
 from app.models.catalog import EntityModuleOptions
-from app.models.estimate import EntityQuoteOut, EstimateSetCreate, EstimateSetOut, EstimateSetSummary, LineItemIn, QuoteVersionOut, RecipientInfoUpdate
-from app.services import catalog_service, pdf_service
+from app.models.estimate import EntityQuoteOut, EstimateSetCreate, EstimateSetOut, EstimateSetSummary, LineItemIn, LineItemsUpdateResult, QuoteVersionOut, RecipientInfoUpdate
+from app.services import allocation_service, catalog_service, pdf_service
 from app.services.catalog_service import EXCLUDED_ENTITIES_BY_TASK_TYPE
 from app.services.generation_service import _save_version
 from app.services import sync_service
@@ -66,11 +66,10 @@ def create_estimate_set(payload: EstimateSetCreate) -> EstimateSetOut:
                 )
 
     primary_entity_name = all_entities.get(primary_entity_id) if primary_entity_id else None
-    if primary_entity_name == TESTIFY_NAME and not (payload.service_name and payload.service_name.strip()):
-        raise HTTPException(
-            status_code=400,
-            detail="테스티파이를 본견적서 법인으로 선택하면 용역명을 입력해야 합니다.",
-        )
+    # 용역명(service_name)은 예전 테스티파이 양식의 B12 칸 전용 필드였다 — 039 마이그레이션으로
+    # 알파브라더스형 신양식(구분(대)/구분(중)/상품명/상품구성)으로 갈아타면서 그 칸 자체가
+    # 없어져 필수 검증도 함께 뗀다(2026-08-19). 컬럼과 입력 UI는 남겨 둔다(이미 발급된 견적서의
+    # 값을 보존하고, 다시 필요해지면 cell_map에 칸만 다시 이어주면 되도록).
 
     # estimate_sets.task_type은 세트 전체를 대표하는 단일값이 더 이상 없어(기업마다 과업종류가
     # 다를 수 있음), 실제 쓰인 과업종류를 모아 목록 화면 표시용 요약 문자열로만 저장한다.
@@ -376,7 +375,7 @@ def update_recipient_info(entity_quote_id: str, payload: RecipientInfoUpdate) ->
     )
 
 
-def update_line_items(entity_quote_id: str, items: List[LineItemIn], edit_request_text: str = "직접편집") -> EntityQuoteOut:
+def update_line_items(entity_quote_id: str, items: List[LineItemIn], edit_request_text: str = "직접편집") -> LineItemsUpdateResult:
     """화면에서 항목명・금액・단가・작업일・투입인력・비고를 직접 클릭해 고친 뒤 저장한다
     (PRD 4.4 "직접 편집" — 2026-08-09 사용자 결정으로 편집 대상을 단가/작업일/투입인력/비고까지
     확장). 프론트엔드가 단가/수량 중 하나를 고치면 나머지로 금액(단가×수량, 작업일은 무관)을
@@ -402,29 +401,34 @@ def update_line_items(entity_quote_id: str, items: List[LineItemIn], edit_reques
         supabase.table("estimate_sets").select("vat_included").eq("id", quote["estimate_set_id"]).execute()
     ).data[0]["vat_included"]
 
-    supply_amount = sum(item.amount for item in items)
-    grand_total = round(supply_amount * 1.1) if vat_included else supply_amount + round(supply_amount * 0.1)
+    # 직접 편집은 사용자가 친 금액을 그대로 저장한다 — 10만원 단위 스냅은 자동생성·채팅 수정
+    # (compute_line_item_pricing)에서만 하고, 여기서 다시 건드리면 "이 항목만 1,234,567원으로"
+    # 같은 의도적인 값을 되돌려버린다.
+    total = allocation_service.grand_total(sum(item.amount for item in items), vat_included)
 
     new_line_items = [item.model_dump() for item in items]
     supabase.table("entity_quotes").update(
-        {"total_amount": grand_total, "line_items": new_line_items}
+        {"total_amount": total, "line_items": new_line_items}
     ).eq("id", entity_quote_id).execute()
 
     _save_version(entity_quote_id, edit_request_text, new_line_items)
 
+    synced_comparison_quotes = []
     if quote["is_primary"]:
-        sync_service.sync_comparisons_from_primary(quote["estimate_set_id"], grand_total, vat_included)
+        synced_comparison_quotes = sync_service.sync_comparisons_from_primary(
+            quote["estimate_set_id"], total, vat_included
+        )
     else:
-        sync_service.update_ratio_from_comparison(entity_quote_id, quote["estimate_set_id"], grand_total)
+        sync_service.update_ratio_from_comparison(entity_quote_id, quote["estimate_set_id"], total)
 
-    return EntityQuoteOut(
+    entity_quote_out = EntityQuoteOut(
         id=quote["id"],
         entity_id=quote["entity_id"],
         entity_name=quote["entity_templates"]["name"],
         is_primary=quote["is_primary"],
         task_type=quote["task_type"],
         task_types=quote["task_types"],
-        total_amount=grand_total,
+        total_amount=total,
         line_items=new_line_items,
         is_catalog_borrowed=quote["is_catalog_borrowed"],
         catalog_source_entity_name=quote["catalog_source_entity_name"],
@@ -437,6 +441,10 @@ def update_line_items(entity_quote_id: str, items: List[LineItemIn], edit_reques
         **pdf_service.get_column_display(
             supabase, quote["entity_id"], quote["task_types"], quote.get("selected_modules")
         ),
+    )
+
+    return LineItemsUpdateResult(
+        entity_quote=entity_quote_out, synced_comparison_quotes=synced_comparison_quotes
     )
 
 
