@@ -164,11 +164,28 @@ def _wrapped_line_count(text: str, capacity: Optional[float]) -> int:
     return lines
 
 
-def _needs_shrink(text: str, capacity: Optional[float]) -> bool:
-    """줄바꿈으로는 못 담는 경우 — 단어 하나가 칸보다 넓으면 단어 중간이 깨진다."""
+# shrinkToFit은 글자를 줄여 한 줄에 밀어넣는다. 살짝 줄이는 건 깔끔하지만 많이 줄여야 하면
+# 읽을 수 없는 크기가 된다 — 폭 4.7칸에 폭 18짜리 "퍼포먼스 광고 운영"을 넣으라고 하니 26%
+# (8pt→2pt)로 찌그러져 나왔다(2026-08-21 사용자 신고, 알파브라더스 구분 칸). 이 비율 밑으로
+# 줄여야 하면 차라리 줄바꿈한다. 한글은 글자 단위로 접히므로 단어 중간에서 끊겨도 읽힌다.
+_MIN_SHRINK_RATIO = 0.75
+
+# 항목 행 높이 계산(pt). 줄당 높이 + 위아래 여백, 그리고 한 줄짜리 행의 최소 높이.
+_LINE_HEIGHT = 16.0
+_ROW_VERTICAL_PADDING = 12.0
+_MIN_ITEM_ROW_HEIGHT = 30.0
+
+
+def _fit_mode(text: str, capacity: Optional[float]) -> str:
+    """넘치는 글자를 어떻게 담을지 — "shrink"(글자 줄이기) 또는 "wrap"(줄바꿈)."""
     if capacity is None:
-        return False
-    return any(_text_width(word) > capacity for word in text.split())
+        return "wrap"
+    longest_word = max((_text_width(word) for word in text.split()), default=0.0)
+    if longest_word <= capacity:
+        return "wrap"  # 줄바꿈만으로 담긴다
+    if _text_width(text) <= capacity / _MIN_SHRINK_RATIO:
+        return "shrink"  # 조금만 줄이면 한 줄에 들어간다
+    return "wrap"
 
 
 def _build_cell_xml(coord: str, attrs: str, value: Any) -> str:
@@ -669,7 +686,7 @@ def _plan_text_fitting(
         if not in_block and "\n" not in text:
             continue  # 항목 표 밖의 한 줄짜리 값(수신처·용역명 등)은 원본 서식 그대로 둔다
         attrs: Dict[str, str] = {}
-        if _needs_shrink(text, capacity(coord)):
+        if _fit_mode(text, capacity(coord)) == "shrink":
             attrs.update({"shrinkToFit": "1", "wrapText": "0"})
         else:
             attrs["wrapText"] = "1"
@@ -716,28 +733,24 @@ def _normalize_block_row_heights(
         if not m:
             continue
         cap = capacity(coord)
-        if _needs_shrink(text, cap):
-            continue
+        if _fit_mode(text, cap) == "shrink":
+            continue  # 글자를 줄여 한 줄에 담으므로 행 높이를 키울 필요가 없다
         row = int(m.group(1))
         lines_by_row[row] = max(lines_by_row.get(row, 1), _wrapped_line_count(text, cap))
 
+    # 행 높이는 그 행이 실제로 담는 줄수로 정한다. 예전엔 마스터의 기존 ht를 최소값으로 깔고
+    # 블록 전체를 가장 높은 행에 맞췄는데, 알파브라더스·테스티파이 마스터의 항목 행이 ht=150이라
+    # 한 줄짜리 항목까지 150pt가 됐다. A4 인쇄 영역이 700pt 남짓이라 한 장에 네 행밖에 안 들어가
+    # 표가 페이지 경계에서 뜯기고 앞장에 큰 여백이 남았다(2026-08-21 사용자 신고).
+    # ponytail: 줄당 16pt는 폰트 메트릭 기반 정밀 측정이 아닌 고정 근사치 — 줄바꿈 셀이 잘리는
+    # 사례가 나오면 실측 계산으로 교체.
     target_height_by_row: Dict[int, float] = {}
     for block in item_blocks:
-        rows = block.get("rows") or []
-        heights = [row_heights[r] for r in rows if r in row_heights]
-        if not heights:
-            continue
-        base_height = Counter(heights).most_common(1)[0][0]
-        max_lines = max((lines_by_row.get(r, 1) for r in rows), default=1)
-        # base_height를 줄당 높이로 보고 곱하면(예전 방식) 알파브라더스처럼 애초에 여러 줄을
-        # 감안해 크게 잡아둔 마스터(ht=150, 2026-08-13 발견)에서 150*4줄=600처럼 터무니없이
-        # 커져 fit-to-page가 전체를 확 축소해버린다. base_height는 "이미 확보된 여유"로 보고,
-        # 실제 필요한 높이(줄당 16pt 근사치 × 줄수)가 그걸 넘을 때만 키운다.
-        # ponytail: 16pt는 폰트 크기·자간 기반 정밀 측정 아닌 고정 근사치 — 줄바꿈 셀이 잘리는
-        # 사례가 나오면 폰트 메트릭 기반 계산으로 교체.
-        block_height = max(base_height, 16 * max_lines)
-        for row in rows:
-            target_height_by_row[row] = block_height
+        for row in block.get("rows") or []:
+            lines = lines_by_row.get(row, 1)
+            target_height_by_row[row] = max(
+                _MIN_ITEM_ROW_HEIGHT, _LINE_HEIGHT * lines + _ROW_VERTICAL_PADDING
+            )
 
     if not target_height_by_row:
         return sheet_xml
@@ -785,6 +798,82 @@ def _normalize_block_cell_styles(sheet_xml: str, item_blocks: List[dict]) -> str
                         rf'(<c r="{col}{row}" s=")\d+(")', rf'\g<1>{majority}\g<2>', sheet_xml, count=1
                     )
     return sheet_xml
+
+
+def _unused_rows_before_totals(cell_map: dict, item_updates: CellUpdates) -> set:
+    """항목 블록이 끝난 뒤 합계 행 사이에서, 이번 견적이 쓰지 않은 행들.
+
+    썬데이워커 마스터에는 예전 고객 파일의 잔재가 그대로 남아 있다 — "투입 리소스" 라벨과
+    세액 칸의 리터럴 0이 열 줄 넘게. 값만 비우면 빈 줄이 그대로 남아 합계가 저 아래로 밀리므로
+    행 자체를 숨긴다(2026-08-21 사용자 신고). 숨은 행도 SUM 범위에는 그대로 들어가므로 합계는
+    영향받지 않는다.
+
+    grand_total_row가 있는 양식(현재 썬데이워커)에만 적용된다 — 나머지 양식은 항목 블록 바로
+    아래가 합계라 사이에 낄 행이 없다.
+    """
+    totals_row = (cell_map.get("totals") or {}).get("grand_total_row")
+    block_rows = [r for b in (cell_map.get("item_blocks") or []) for r in (b.get("rows") or [])]
+    if not totals_row or not block_rows:
+        return set()
+    written = {
+        int(m.group(1)) for coord in item_updates if (m := re.match(r"[A-Z]+(\d+)$", coord))
+    }
+    return {row for row in range(max(block_rows) + 1, totals_row) if row not in written}
+
+
+def _plan_item_name_merges(sheet_xml: str, columns: Dict[str, str], assignments: list) -> List[tuple]:
+    """품명 칸을 같은 열의 다른 행들이 쓰는 병합 폭에 맞춘다.
+
+    썬데이워커 마스터는 머리글(B12:F12)과 아래 투입 리소스 블록(B20:F20)은 B~F로 병합돼
+    있는데 정작 항목 행(13~19)만 병합이 빠져 있다. 그래서 품명이 한 열 폭(4.8 = 두 글자)에
+    갇혀 "기술성 테스트 설계"가 "기술성/테스트/설계"로 접혀 나왔다(2026-08-21 사용자 신고).
+    원본이 의도한 폭은 그 열에서 가장 흔한 병합 폭이라고 보고 그걸 그대로 쓴다.
+    이미 같은 폭으로 병합된 양식(알파브라더스 E13:H13 등)에서는 같은 범위를 다시 만들 뿐이다.
+    """
+    col = columns.get("item_name")
+    if not col:
+        return []
+    ends = Counter(re.findall(rf'<mergeCell ref="{col}\d+:([A-Z]+)\d+"/>', sheet_xml))
+    if not ends:
+        return []
+    end_col = ends.most_common(1)[0][0]
+    if _col_index(end_col) <= _col_index(col):
+        return []
+    rows = {row for block, _g, _o in assignments for row in (block.get("rows") or [])}
+    return [(col, row, end_col, row) for row in sorted(rows)]
+
+
+def _merge_end_col(sheet_xml: str, anchor: str) -> str:
+    """그 칸이 원본에서 어느 열까지 가로 병합돼 있었는지(예: A13:B17 → "B")."""
+    m = re.search(rf'<mergeCell ref="{anchor}:([A-Z]+)\d+"/>', sheet_xml)
+    return m.group(1) if m else re.match(r"([A-Z]+)", anchor).group(1)
+
+
+def _plan_category_merges(sheet_xml: str, assignments: list) -> List[tuple]:
+    """블록마다 구분(대)/구분(중) 칸을 그 블록의 행 전체에 걸쳐 다시 병합한다.
+
+    마스터에는 첫 블록의 세로 병합(알파브라더스 A13:B17, C13:D17)만 들어 있다. 카테고리가
+    늘어 블록을 복제하면 가로 병합만 따라오고(xlsx_rows._single_row_merges는 한 행 안에서
+    끝나는 병합만 복제한다) 이 병합은 빠진다. 그러면 둘째 블록부터 구분 칸이 한 열 폭(5.7)으로
+    쪼그라들어 "그로스해킹"이 "그로/스해/킹"으로 접혀 나왔다(2026-08-21 사용자 신고).
+
+    끝 열은 첫 블록에 남아 있는 원본 병합에서 읽어 그대로 쓴다.
+    반환: [(시작열, 시작행, 끝열, 끝행), ...]
+    """
+    ranges: List[tuple] = []
+    for key in ("category_large_cell", "category_mid_cell"):
+        anchors = [block[key] for block, _g, _o in assignments if block.get(key)]
+        if not anchors:
+            continue
+        end_col = _merge_end_col(sheet_xml, anchors[0])
+        for block, _group, _offset in assignments:
+            anchor = block.get(key)
+            rows = block.get("rows") or []
+            if not anchor or not rows:
+                continue
+            col = re.match(r"([A-Z]+)", anchor).group(1)
+            ranges.append((col, min(rows), end_col, max(rows)))
+    return ranges
 
 
 def _plan_mid_category_merges(sheet_xml: str, columns: Dict[str, str], assignments: list) -> List[tuple]:
@@ -1525,9 +1614,10 @@ def _assignment_attempts(template: dict, source_bytes: bytes, sheet_xml: str, gr
     columns = template["cell_map"].get("columns", {})
     blocks = template["cell_map"].get("item_blocks", [])
     yield template, source_bytes, sheet_xml, False
-    if _is_name_only_form(columns, blocks):
-        # 품명 한 칸짜리 양식은 행을 늘리기 전에 먼저 묶는다 — 늘려봐야 낱개 이름만 나열된다.
-        yield template, source_bytes, sheet_xml, True
+    # 예전엔 품명 한 칸짜리 양식(썬데이워커·블렌디드랩)만 행을 늘리기 전에 먼저 묶었다.
+    # 그런데 묶으면 품명이 "기술성 테스트\n(설계 / 모집 / 운영 / 리포트)"처럼 길어져 좁은
+    # 품명 칸에서 두 글자씩 접히고, 단가·투입MM은 항목마다 달라 대표값을 못 정해 0으로 나갔다
+    # (2026-08-21 사용자 신고). 행을 늘리면 항목마다 제 단가·수량이 그대로 찍힌다.
     grown = _grow_template(template, source_bytes, groups)
     if grown is not None:
         yield (*grown, False)
@@ -1804,6 +1894,7 @@ def _build_filled_xlsx_from_quote(quote: dict, filled_path: Path) -> None:
         assignments,
         sheet_xml,
     )
+    hidden_rows |= _unused_rows_before_totals(cell_map, item_updates)
 
     # 항목 행의 "입력" 칸(상품명·상품구성·단가·작업일·수량·구분(중))에 수식이 남아 있으면
     # _patch_sheet_xml이 "수식 셀은 값을 덮어쓰지 않는다"는 규칙 때문에 우리가 계산한 값을
@@ -1843,7 +1934,9 @@ def _build_filled_xlsx_from_quote(quote: dict, filled_path: Path) -> None:
         item_blocks=[b for b in cell_map.get("item_blocks", []) if b.get("role") != "labor_fte"],
         strip_background=(entity_name == "ABBG"),
         drop_formula_cells=list(cell_map.get("drop_formula_cells") or []) + item_input_cells,
-        merge_ranges=_plan_mid_category_merges(sheet_xml, columns, assignments),
+        merge_ranges=_plan_category_merges(sheet_xml, assignments)
+        + _plan_item_name_merges(sheet_xml, columns, assignments)
+        + _plan_mid_category_merges(sheet_xml, columns, assignments),
         columns=columns,
     )
 

@@ -18,7 +18,9 @@ app = FastAPI(title="견적서 자동화 API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"http://localhost:\d+",
+    # localhost와 127.0.0.1은 브라우저에게 서로 다른 출처다. 127.0.0.1:3001로 열면 모든 API가
+    # 차단돼 과업·법인 목록이 통째로 빈 화면으로 보인다(2026-08-21 사용자 신고).
+    allow_origin_regex=r"http://(localhost|127\.0\.0\.1):\d+",
     allow_methods=["*"],
     allow_headers=["*"],
 )

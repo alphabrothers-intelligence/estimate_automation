@@ -52,6 +52,10 @@ APPLY_TOOL = {
                         "i": {"type": "integer", "description": "항목 번호(견적서에 표시된 1부터의 번호)"},
                         "name": {"type": "string", "description": "새 상품명. 안 바꾸면 생략"},
                         "category": {"type": "string", "description": "새 구분(대). 안 바꾸면 생략"},
+                        "mid_category": {
+                            "type": "string",
+                            "description": "새 구분(중). 알파브라더스·테스티파이처럼 구분이 두 단계인 양식에서만 쓴다. 안 바꾸면 생략",
+                        },
                         "description": {
                             "type": "string",
                             "description": "새 상품구성. 세로형 개조식(1. 2. 3.)으로 줄바꿈해서 쓴다. 안 바꾸면 생략",
@@ -61,6 +65,30 @@ APPLY_TOOL = {
                         "unit_price": {"type": "integer", "description": "새 단가(원, 만원 단위). 안 바꾸면 생략"},
                     },
                     "required": ["i"],
+                },
+            },
+            "add_items": {
+                "type": "array",
+                "description": "새로 추가할 항목들. 기존 항목을 고치는 게 아니라 없던 행을 만들 때 쓴다.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "after": {
+                            "type": "integer",
+                            "description": "이 번호의 항목 바로 아래에 넣는다. 0이면 맨 위, 생략하면 맨 아래.",
+                        },
+                        "name": {"type": "string", "description": "상품명"},
+                        "category": {"type": "string", "description": "구분(대). 기존 항목과 같은 묶음이면 그 이름을 그대로 쓴다"},
+                        "mid_category": {"type": "string", "description": "구분(중). 두 단계 양식에서만 쓴다"},
+                        "description": {
+                            "type": "string",
+                            "description": "상품구성. 세로형 개조식(1. 2. 3.)으로 줄바꿈해서 쓴다",
+                        },
+                        "work_days": {"type": "integer", "description": "작업일(정수)"},
+                        "quantity": {"type": "integer", "description": "수량(정수)"},
+                        "unit_price": {"type": "integer", "description": "단가(원, 만원 단위)"},
+                    },
+                    "required": ["name", "unit_price"],
                 },
             },
             "remove_item_numbers": {
@@ -77,7 +105,7 @@ APPLY_TOOL = {
                 ),
             },
         },
-        "required": ["items"],
+        "required": [],
     },
 }
 
@@ -120,6 +148,8 @@ def _system_prompt(quote: dict, form: quote_pricing.FormSpec, vat_included: bool
   (예: "이 항목이 왜 이 금액이죠?")에는 도구를 부르지 말고 말로 답하세요.
 - 금액 계산은 서버가 양식 수식으로 다시 맞춥니다. 단가만 정확히 정하면 되고, 합계를 손으로
   맞추려고 애쓰지 마세요.
+- 있는 항목을 고칠 때는 items에 번호(i)로, 없던 행을 새로 만들 때는 add_items에 넣으세요.
+  없는 번호를 items에 쓰면 안 됩니다. 지울 때는 remove_item_numbers입니다.
 - 사용자가 전체 목표 금액을 말했으면 target_supply_amount에 넣으세요. 말하지 않았으면 넣지
   않습니다 — 그러면 고친 항목만 바뀌고 나머지는 그대로 있습니다.
 - 애매하면 임의로 정하지 말고 되물으세요.
@@ -170,11 +200,21 @@ def _attachment_blocks(attachment: Optional[Dict[str, str]]) -> List[dict]:
 def _apply(items: List[dict], edit: dict, form: quote_pricing.FormSpec) -> Tuple[List[dict], Optional[int]]:
     """도구 입력을 현재 항목에 적용한다. 언급하지 않은 항목·칸은 그대로 둔다."""
     result = [dict(it) for it in items]
+    fields = ("name", "category", "mid_category", "description", "work_days", "quantity", "unit_price")
+
+    # 먼저 수정. 삭제·추가로 번호가 밀리기 전에 적용해야 사용자가 본 번호와 맞는다.
     for change in edit.get("items") or []:
         idx = int(change.get("i", 0)) - 1
         if not 0 <= idx < len(result):
+            # 없는 번호를 고치라는 건 대개 "추가"를 잘못된 칸에 쓴 것이다. 상품명이 있으면
+            # 추가로 받아준다 — 예전엔 여기서 조용히 버려서, 모델은 추가했다고 답하는데 표에는
+            # 아무 일도 없었다(2026-08-21 사용자 신고).
+            if change.get("name"):
+                edit.setdefault("add_items", []).append(
+                    {k: v for k, v in change.items() if k != "i"}
+                )
             continue
-        for key in ("name", "category", "description", "work_days", "quantity", "unit_price"):
+        for key in fields:
             if change.get(key) is not None:
                 result[idx][key] = change[key]
         if change.get("description"):
@@ -183,6 +223,32 @@ def _apply(items: List[dict], edit: dict, form: quote_pricing.FormSpec) -> Tuple
     remove = {int(n) - 1 for n in (edit.get("remove_item_numbers") or [])}
     if remove:
         result = [it for n, it in enumerate(result) if n not in remove]
+
+    # 추가는 마지막이다. after는 삭제 전 번호 기준이라 이름으로 다시 찾아 그 뒤에 끼운다 —
+    # 번호로만 넣으면 같은 요청에서 앞 항목을 지웠을 때 엉뚱한 자리에 들어간다.
+    for new_item in edit.get("add_items") or []:
+        row = {
+            "name": new_item.get("name") or "신규 항목",
+            "category": new_item.get("category"),
+            "mid_category": new_item.get("mid_category"),
+            "description": normalize_description(new_item.get("description") or ""),
+            "work_days": new_item.get("work_days") or 1,
+            "quantity": new_item.get("quantity") or 1,
+            "unit_price": int(new_item.get("unit_price") or 0),
+            "amount": 0,  # finalize가 양식 수식으로 다시 계산한다
+        }
+        after = new_item.get("after")
+        pos = len(result)
+        if after is not None:
+            anchor_idx = int(after) - 1
+            anchor = items[anchor_idx].get("name") if 0 <= anchor_idx < len(items) else None
+            if anchor:
+                pos = next(
+                    (n + 1 for n, it in enumerate(result) if it.get("name") == anchor), len(result)
+                )
+            elif int(after) == 0:
+                pos = 0
+        result.insert(pos, row)
 
     target = edit.get("target_supply_amount")
     return result, int(target) if target else None
@@ -238,12 +304,33 @@ def edit_entity_quote(
     if edit:
         items, target = _apply(items, edit, form)
         items, residual, log = quote_pricing.finalize(items, target, form)
+
+        # 모델이 생각만 하고 도구를 바로 부르면 text 블록이 없다(thinking이 기본 활성이라 흔하다).
+        # 예전엔 그때 "무엇을 고칠지 조금 더 알려주세요"가 떴다 — 표는 멀쩡히 고쳐졌는데 못
+        # 알아들은 척하는 답이라 사용자가 같은 요청을 되풀이하게 만들었다(2026-08-21 사용자 신고).
+        if not reply:
+            done = []
+            if edit.get("add_items"):
+                done.append(f"{len(edit['add_items'])}개 항목을 추가")
+            if edit.get("remove_item_numbers"):
+                done.append(f"{len(edit['remove_item_numbers'])}개 항목을 삭제")
+            if edit.get("items"):
+                done.append(f"{len(edit['items'])}개 항목을 수정")
+            reply = ("요청하신 대로 " + ", ".join(done) + "했습니다.") if done else "표에 반영했습니다."
+
+        # 금액 후처리 결과는 문장 다음에 붙인다 — 위 요약보다 먼저 붙이면 reply가 비지 않게 돼
+        # 요약이 통째로 빠진다.
         if residual:
             reply += f"\n\n(격자상 목표에 {residual:+,}원 못 맞췄습니다. 화면에서 직접 고치실 수 있습니다.)"
         elif log:
             reply += "\n\n" + " / ".join(log)
+
+        # 추가된 행도 "방금 바뀐 항목"으로 표시해야 화면에서 어디가 늘었는지 보인다.
         touched = {int(c["i"]) - 1 for c in (edit.get("items") or []) if c.get("i")}
-        changed = [it for n, it in enumerate(items) if n in touched]
+        added_names = {a.get("name") for a in (edit.get("add_items") or []) if a.get("name")}
+        changed = [
+            it for n, it in enumerate(items) if n in touched or it.get("name") in added_names
+        ]
 
     # 이력에는 이번 턴의 사용자 발화와 모델 응답을 남긴다. 첨부 파일 원본은 다시 보내면
     # 매 턴 비용이 붙으므로 파일명만 남기고 뺀다.

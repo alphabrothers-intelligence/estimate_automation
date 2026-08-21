@@ -503,7 +503,17 @@ type LineItemGroup = { category: string; amount: number; items: IndexedLineItem[
 type LineItemPatch = Partial<
   Pick<
     LineItem,
-    "category" | "name" | "amount" | "unit_price" | "work_days" | "quantity" | "note" | "description" | "input_mm" | "tax_amount"
+    | "category"
+    | "mid_category"
+    | "name"
+    | "amount"
+    | "unit_price"
+    | "work_days"
+    | "quantity"
+    | "note"
+    | "description"
+    | "input_mm"
+    | "tax_amount"
   >
 >;
 
@@ -539,12 +549,15 @@ function InlineEditCell({
   display,
   align = "left",
   inputType = "text",
+  multiline = false,
   onSave,
 }: {
   value: string;
   display: string;
   align?: "left" | "right";
   inputType?: "text" | "number";
+  /** 상품구성처럼 개조식 여러 줄을 쓰는 칸. textarea로 열려 Enter가 줄바꿈이 된다. */
+  multiline?: boolean;
   onSave: (nextValue: string) => Promise<void>;
 }) {
   const [editing, setEditing] = useState(false);
@@ -601,6 +614,34 @@ function InlineEditCell({
   if (editing) {
     return (
       <div onClick={(e) => e.stopPropagation()}>
+        {multiline ? (
+          // 상품구성은 "1. ~ 2. ~ 3. ~" 개조식 여러 줄이 기본이라 한 줄짜리 input으로는 아예
+          // 쓸 수가 없었다(2026-08-21 사용자 지적). Enter는 줄바꿈이고, 저장은 ⌘/Ctrl+Enter나
+          // 칸 밖 클릭으로 한다.
+          <>
+            <textarea
+              autoFocus
+              rows={Math.min(12, Math.max(3, draft.split("\n").length + 1))}
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onBlur={commit}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                  e.preventDefault();
+                  commit();
+                }
+                if (e.key === "Escape") {
+                  committedRef.current = true;
+                  setDraft(value);
+                  e.currentTarget.blur();
+                  setEditing(false);
+                }
+              }}
+              className="w-full resize-y rounded border border-indigo-400 px-1.5 py-1 text-[13px] leading-snug focus:outline-none"
+            />
+            <p className="mt-0.5 text-[11px] text-gray-400">Enter 줄바꿈 · ⌘/Ctrl+Enter 저장 · Esc 취소</p>
+          </>
+        ) : (
         <input
           type="text"
           inputMode={inputType === "number" ? "numeric" : undefined}
@@ -628,6 +669,7 @@ function InlineEditCell({
             (align === "right" ? "text-right" : "text-left")
           }
         />
+        )}
         {errorMsg && <p className="mt-0.5 text-xs text-red-600">{errorMsg}</p>}
       </div>
     );
@@ -650,7 +692,9 @@ function InlineEditCell({
         (saving ? " text-gray-400" : "")
       }
     >
-      {saving ? pendingLabel : display}
+      {/* 값이 비면 버튼에 내용이 없어 높이가 4px로 찌그러져 클릭할 수가 없었다 — 새로 추가한
+          행의 상품구성 칸이 아예 안 눌리던 원인(2026-08-21 사용자 지적). */}
+      {saving ? pendingLabel : display || <span className="text-gray-300">입력</span>}
     </button>
   );
 }
@@ -723,12 +767,13 @@ function ItemDetailCells({
             {/* 상품구성은 개조식 10줄이 넘어가는 항목이 있어(주간 액션플랜 등) 한 행이 화면
                 절반을 잡아먹었다(2026-08-21 사용자 지적). 높이를 묶고 넘치면 그 칸만 스크롤해
                 다른 항목과 나란히 비교할 수 있게 한다. 클릭하면 편집은 그대로 된다. */}
-            <div className={isText ? "max-h-32 overflow-y-auto pr-1" : ""}>
+            <div className={isText ? "max-h-32 overflow-y-auto pr-1 focus-within:max-h-none focus-within:overflow-visible" : ""}>
             <InlineEditCell
               value={renderDetailEditValue(item, key)}
               display={renderDetailValue(item, key)}
               align={isText ? "left" : "right"}
               inputType={isText ? "text" : "number"}
+              multiline={isText}
               onSave={(v) => onEditItem({ [key]: isText ? v : Number(v) } as LineItemPatch)}
             />
             </div>
@@ -739,6 +784,34 @@ function ItemDetailCells({
   );
 }
 
+// 행 추가·삭제 버튼. 열을 새로 만들지 않고 상품명 칸 아래에 붙인다 — 표가 table-fixed라
+// 열을 추가하면 폭 합 100%가 깨져 "원"이 잘린다(2026-08-21). 행에 마우스를 올렸을 때만 보인다.
+// 새 행은 같은 구분(대)으로 바로 아래에 들어간다. 없던 구분(대)을 만드는 건 채팅으로 한다.
+function RowActions({ onAdd, onRemove }: { onAdd: () => void; onRemove: () => void }) {
+  return (
+    <span className="mt-1 flex gap-1.5 opacity-0 transition group-hover:opacity-100">
+      <button
+        type="button"
+        onClick={onAdd}
+        title="이 아래에 같은 구분으로 항목 추가"
+        aria-label="이 아래에 항목 추가"
+        className="rounded border border-slate-200 bg-white px-1.5 py-px text-[11px] font-bold leading-4 text-slate-500 hover:border-indigo-300 hover:text-indigo-600"
+      >
+        +
+      </button>
+      <button
+        type="button"
+        onClick={onRemove}
+        title="이 항목 삭제"
+        aria-label="이 항목 삭제"
+        className="rounded border border-slate-200 bg-white px-1.5 py-px text-[11px] font-bold leading-4 text-slate-500 hover:border-rose-300 hover:text-rose-600"
+      >
+        ✕
+      </button>
+    </span>
+  );
+}
+
 function CategoryRows({
   group,
   order,
@@ -746,6 +819,9 @@ function CategoryRows({
   showCategorySplit,
   highlightKeys,
   onEditItem,
+  onPatchMany,
+  onAddAfter,
+  onRemoveItem,
 }: {
   group: LineItemGroup;
   order: string[];
@@ -753,6 +829,9 @@ function CategoryRows({
   showCategorySplit: boolean;
   highlightKeys?: Set<string>;
   onEditItem: (index: number, patch: LineItemPatch) => Promise<void>;
+  onPatchMany: (indexes: number[], patch: LineItemPatch) => Promise<void>;
+  onAddAfter: (index: number) => void;
+  onRemoveItem: (index: number) => void;
 }) {
   const [expanded, setExpanded] = useState(true);
   const isFlat = group.items.length === 1 && group.items[0].name === group.category;
@@ -766,12 +845,24 @@ function CategoryRows({
   // 표가 table-fixed라 열 폭이 고정이다 — 여기에 whitespace-nowrap을 주면 긴 구분명이
   // 줄바꿈 없이 옆 칸 위로 그대로 흘러넘쳐 상품명과 겹쳐 보였다(2026-08-20 사용자 지적).
   // 넘칠 때는 줄을 바꿔 담는다.
-  const splitCells = (item?: LineItem) =>
+  const splitCells = (item?: IndexedLineItem) =>
     showCategorySplit && (
       <>
-        <td className="break-words px-3 py-2.5 text-sm text-gray-600">{group.category}</td>
         <td className="break-words px-3 py-2.5 text-sm text-gray-600">
-          {item?.mid_category ?? group.category}
+          <InlineEditCell
+            value={group.category}
+            display={group.category}
+            onSave={(v) => onPatchMany(group.items.map((it) => it._index), { category: v })}
+          />
+        </td>
+        <td className="break-words px-3 py-2.5 text-sm text-gray-600">
+          <InlineEditCell
+            value={item?.mid_category ?? group.category}
+            display={item?.mid_category ?? group.category}
+            onSave={(v) =>
+              onPatchMany(item ? [item._index] : group.items.map((it) => it._index), { mid_category: v })
+            }
+          />
         </td>
       </>
     );
@@ -820,6 +911,7 @@ function CategoryRows({
   // 반복하면 발급본과 달라 보이고, 접기 토글이 가운데 상품명 칸에 있어 어느 묶음을 접는지도
   // 헷갈렸다(2026-08-21 사용자 지적). 토글을 맨 왼쪽 구분(대) 칸으로 옮기고 그 칸을 묶음
   // 전체에 rowSpan으로 병합한다. 구분(중)도 연속으로 같은 값이면 같은 방식으로 묶는다.
+  const groupIndexes = group.items.map((it) => it._index);
   const bodyRowCount = expanded ? group.items.length : 0;
   const midRunLength = (i: number) => {
     const value = group.items[i].mid_category ?? group.category;
@@ -838,7 +930,7 @@ function CategoryRows({
           <tr
             key={item._index}
             className={
-              "border-b border-gray-200 last:border-b-0 " +
+              "group border-b border-gray-200 last:border-b-0 " +
               (isChanged(item) ? "border-l-4 border-l-amber-400 bg-amber-50" : "bg-white")
             }
           >
@@ -847,16 +939,25 @@ function CategoryRows({
                 rowSpan={group.items.length}
                 className="border-r border-gray-200 bg-slate-50/70 px-2.5 py-2 align-top text-[13px] font-semibold leading-snug text-slate-700"
               >
-                <button
-                  type="button"
-                  onClick={() => setExpanded(false)}
-                  className="flex min-w-0 items-start gap-1 break-words text-left"
-                >
-                  <svg viewBox="0 0 20 20" fill="currentColor" className="mt-1 h-3 w-3 shrink-0 rotate-90 text-gray-400">
-                    <path fillRule="evenodd" d="M6 4l8 6-8 6V4z" clipRule="evenodd" />
-                  </svg>
-                  {group.category}
-                </button>
+                {/* 접기 토글과 이름 편집을 갈라놨다 — 칸 전체가 토글이면 구분명을 고칠 수가 없다. */}
+                <div className="flex min-w-0 items-start gap-1">
+                  <button
+                    type="button"
+                    onClick={() => setExpanded(false)}
+                    title="이 묶음 접기"
+                    aria-label="이 묶음 접기"
+                    className="shrink-0"
+                  >
+                    <svg viewBox="0 0 20 20" fill="currentColor" className="mt-1 h-3 w-3 rotate-90 text-gray-400">
+                      <path fillRule="evenodd" d="M6 4l8 6-8 6V4z" clipRule="evenodd" />
+                    </svg>
+                  </button>
+                  <InlineEditCell
+                    value={group.category}
+                    display={group.category}
+                    onSave={(v) => onPatchMany(groupIndexes, { category: v })}
+                  />
+                </div>
               </td>
             )}
             {midRunLength(i) > 0 && (
@@ -864,7 +965,18 @@ function CategoryRows({
                 rowSpan={midRunLength(i)}
                 className="border-r border-gray-200 bg-slate-50/40 px-2.5 py-2 align-top text-[13px] leading-snug text-slate-600 break-words"
               >
-                {item.mid_category ?? group.category}
+                {/* 같은 값이 이어지는 구간을 한 칸으로 병합해 보여주므로, 고치면 그 구간 전체에
+                    적용한다 — 한 행만 바뀌면 병합이 쪼개져 발급본과 달라진다. */}
+                <InlineEditCell
+                  value={item.mid_category ?? group.category}
+                  display={item.mid_category ?? group.category}
+                  onSave={(v) =>
+                    onPatchMany(
+                      group.items.slice(i, i + midRunLength(i)).map((it) => it._index),
+                      { mid_category: v }
+                    )
+                  }
+                />
               </td>
             )}
             <td className="px-2.5 py-2 align-top text-[13px] text-gray-800">
@@ -872,6 +984,10 @@ function CategoryRows({
                 value={item.name}
                 display={item.name}
                 onSave={(v) => onEditItem(item._index, { name: v })}
+              />
+              <RowActions
+                onAdd={() => onAddAfter(item._index)}
+                onRemove={() => onRemoveItem(item._index)}
               />
             </td>
             <ItemDetailCells item={item} order={order} onEditItem={(patch) => onEditItem(item._index, patch)} />
@@ -964,7 +1080,7 @@ function CategoryRows({
           <tr
             key={item._index}
             className={
-              "border-b border-gray-200 last:border-b-0 " +
+              "group border-b border-gray-200 last:border-b-0 " +
               (isChanged(item) ? "border-l-4 border-l-amber-400 bg-amber-50" : "bg-gray-50")
             }
           >
@@ -981,6 +1097,10 @@ function CategoryRows({
                 value={item.name}
                 display={item.name}
                 onSave={(v) => onEditItem(item._index, { name: v })}
+              />
+              <RowActions
+                onAdd={() => onAddAfter(item._index)}
+                onRemove={() => onRemoveItem(item._index)}
               />
             </td>
             <ItemDetailCells item={item} order={order} onEditItem={(patch) => onEditItem(item._index, patch)} />
@@ -1090,6 +1210,33 @@ function LineItemTable({
     return "9%";
   }
 
+  // 새 행은 앞 항목의 구분(대)을 물려받아 바로 아래에 들어간다. 금액 0원으로 시작해
+  // 사용자가 단가를 채우면 그때 계산된다 — 임의의 금액을 넣어두면 그게 또 "마음대로 바뀐 값"이다.
+  function handleAddAfter(index: number) {
+    const base = items[index];
+    const row: LineItem = {
+      ...base,
+      name: "새 항목",
+      description: "",
+      work_days: 1,
+      quantity: 1,
+      unit_price: 0,
+      amount: 0,
+      note: undefined,
+    };
+    onSaveLineItems([...items.slice(0, index + 1), row, ...items.slice(index + 1)]);
+  }
+
+  // 병합된 구분(대)/구분(중) 칸을 고치면 그 칸이 덮는 행 전부에 같은 값을 넣는다.
+  async function handlePatchMany(indexes: number[], patch: LineItemPatch) {
+    const target = new Set(indexes);
+    onSaveLineItems(items.map((item, i) => (target.has(i) ? { ...item, ...patch } : item)));
+  }
+
+  function handleRemoveItem(index: number) {
+    onSaveLineItems(items.filter((_, i) => i !== index));
+  }
+
   async function handleEditItem(index: number, patch: LineItemPatch) {
     const merged: LineItem = { ...items[index], ...patch };
     // 단가에 곱해지는 값 — 백엔드 quote_pricing.FormSpec.divisor와 같은 식이어야 한다.
@@ -1178,6 +1325,9 @@ function LineItemTable({
               showCategorySplit={showCategorySplit}
               highlightKeys={highlightKeys}
               onEditItem={handleEditItem}
+              onPatchMany={handlePatchMany}
+              onAddAfter={handleAddAfter}
+              onRemoveItem={handleRemoveItem}
             />
           ))}
         </tbody>

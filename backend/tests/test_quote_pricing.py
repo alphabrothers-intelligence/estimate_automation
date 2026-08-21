@@ -249,3 +249,48 @@ if __name__ == "__main__":
             fn()
             print(f"ok  {name}")
     print("\n전부 통과")
+
+
+# --- 채팅 도구 적용 (chat_service._apply) ---
+# 2026-08-21: 모델이 "행을 추가했습니다"라고 답했는데 표에는 아무 일도 없던 버그.
+# 도구에 추가 수단이 없었고, 범위 밖 번호는 조용히 버려졌다.
+
+def _items():
+    return [
+        {"name": "A", "category": "기획", "description": "", "work_days": 1, "quantity": 1,
+         "unit_price": 1_000_000, "amount": 1_000_000},
+        {"name": "B", "category": "퍼포먼스", "description": "", "work_days": 1, "quantity": 2,
+         "unit_price": 2_000_000, "amount": 4_000_000},
+    ]
+
+
+def test_apply_adds_row_after_given_item():
+    from app.services import chat_service
+    form = FormSpec()
+    edit = {"add_items": [{"after": 1, "name": "결과 보고", "unit_price": 500_000}]}
+    result, target = chat_service._apply(_items(), edit, form)
+    assert [i["name"] for i in result] == ["A", "결과 보고", "B"]
+    assert target is None
+
+
+def test_apply_appends_when_after_omitted():
+    from app.services import chat_service
+    edit = {"add_items": [{"name": "결과 보고", "unit_price": 500_000}]}
+    result, _ = chat_service._apply(_items(), edit, FormSpec())
+    assert [i["name"] for i in result] == ["A", "B", "결과 보고"]
+
+
+def test_apply_treats_out_of_range_index_with_name_as_add():
+    """모델이 add_items 대신 items에 없는 번호를 쓰는 실수를 해도 행이 사라지지 않아야 한다."""
+    from app.services import chat_service
+    edit = {"items": [{"i": 3, "name": "결과 보고", "unit_price": 500_000}]}
+    result, _ = chat_service._apply(_items(), edit, FormSpec())
+    assert [i["name"] for i in result] == ["A", "B", "결과 보고"]
+
+
+def test_apply_add_position_survives_removal_in_same_call():
+    """같은 요청에서 앞 항목을 지워도 추가 위치가 밀리지 않아야 한다."""
+    from app.services import chat_service
+    edit = {"remove_item_numbers": [1], "add_items": [{"after": 2, "name": "C", "unit_price": 100_000}]}
+    result, _ = chat_service._apply(_items(), edit, FormSpec())
+    assert [i["name"] for i in result] == ["B", "C"]

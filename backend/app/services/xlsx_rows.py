@@ -251,13 +251,17 @@ def remap_cell_map(cell_map: dict, row_map: Dict[int, int]) -> dict:
         m = re.fullmatch(r"([A-Z]{1,3})(\d+)", coord)
         return f"{m.group(1)}{row_map.get(int(m.group(2)), int(m.group(2)))}" if m else coord
 
-    def walk(node):
+    def walk(node, key=None):
         if isinstance(node, dict):
-            return {k: (walk(v) if k != "rows" else [row_map.get(r, r) for r in v]) for k, v in node.items()}
+            return {k: walk(v, k) for k, v in node.items()}
         if isinstance(node, list):
-            return [walk(v) for v in node]
+            return [walk(v, key) for v in node]
         if isinstance(node, str):
             return remap_coord(node)
+        # 행 번호가 정수로 들어있는 자리도 옮긴다 — 예전엔 "rows" 리스트만 처리해서 썬데이워커
+        # totals.grand_total_row(35)가 행 삽입 후에도 35로 남았다(2026-08-21).
+        if isinstance(node, int) and not isinstance(node, bool) and (key == "rows" or str(key).endswith("_row")):
+            return row_map.get(node, node)
         return node
 
     return walk(cell_map)

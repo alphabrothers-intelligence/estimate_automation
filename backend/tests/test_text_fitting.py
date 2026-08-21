@@ -29,12 +29,24 @@ def test_merged_cell_capacity_covers_all_merged_columns():
     assert capacity("A13") > capacity("A16"), "병합된 칸이 병합 안 된 칸보다 넓어야 한다"
 
 
-def test_long_single_word_is_shrunk_not_wrapped():
+def test_shrink_only_when_it_stays_readable():
+    """글자를 얼마나 줄여야 하느냐로 판단한다.
+
+    예전엔 "칸보다 넓은 단어가 하나라도 있으면 무조건 shrinkToFit"이었다. 그러면 폭 4.7칸에
+    폭 18짜리 "퍼포먼스 광고 운영"을 한 줄로 밀어넣느라 26%(8pt→2pt)로 찌그러져 읽을 수
+    없는 글자가 나왔다(2026-08-21 사용자 신고). 조금만 줄이면 되는 경우에만 줄인다.
+    """
     capacity, _ = _capacity()
-    # 공백이 없어 줄바꿈으로는 못 담는 값 — wrapText면 단어 중간이 깨진다.
-    assert p._needs_shrink("자사몰데이터세팅운영", capacity("C13"))
     # 공백으로 끊어 담을 수 있으면 줄바꿈으로 충분하다.
-    assert not p._needs_shrink("자사몰 데이터 세팅", capacity("A13"))
+    assert p._fit_mode("자사몰 데이터 세팅", capacity("A13")) == "wrap"
+    # 한글 한 글자 폭은 2다. 칸에 딱 맞게/살짝 넘치게/크게 넘치게 만들어 세 갈래를 확인한다.
+    narrow = capacity("C13")
+    fits = "가" * int(narrow / 2)
+    assert p._fit_mode(fits, narrow) == "wrap", "안 넘치면 줄일 이유가 없다"
+    assert p._fit_mode(fits + "가", narrow) == "shrink", "살짝 넘치면 줄여서 한 줄에 담는다"
+    # 크게 넘치면 읽을 수 없는 크기가 되므로 차라리 줄바꿈한다(한글은 글자 단위로 접힌다).
+    assert p._fit_mode(fits * 3, narrow) == "wrap"
+    assert p._fit_mode("퍼포먼스 광고 운영", 4.7) == "wrap"
 
 
 def test_wrapped_line_count_counts_folded_lines_not_just_newlines():
@@ -44,7 +56,7 @@ def test_wrapped_line_count_counts_folded_lines_not_just_newlines():
     assert p._wrapped_line_count("짧은 값", 40.0) == 1
 
 
-def test_plan_marks_shrink_and_center_for_narrow_label_cells():
+def test_plan_wraps_and_centers_narrow_label_cells():
     capacity, sheet_xml = _capacity()
     with zipfile.ZipFile(TEMPLATE) as z:
         styles_xml = z.read("xl/styles.xml").decode("utf-8")
@@ -57,7 +69,8 @@ def test_plan_marks_shrink_and_center_for_narrow_label_cells():
         blocks,
         columns,
     )
-    assert plan["C13"]["shrinkToFit"] == "1" and plan["C13"]["wrapText"] == "0"
+    # 폭 11.9칸에 폭 20짜리 값 — 60%까지 줄여야 해서 읽을 수 없다. 줄바꿈으로 담는다.
+    assert plan["C13"]["wrapText"] == "1" and "shrinkToFit" not in plan["C13"]
     assert plan["E13"]["wrapText"] == "1" and "shrinkToFit" not in plan["E13"]
     # 구분(대)/구분(중)/상품명은 가운데 정렬까지 보장한다.
     for coord in ("A13", "C13", "E13"):
@@ -93,3 +106,23 @@ if __name__ == "__main__":
             fn()
             print(f"ok  {name}")
     print("모두 통과")
+
+
+def test_remap_cell_map_moves_integer_row_numbers():
+    """행 번호가 정수로 들어 있는 자리(totals.grand_total_row)도 삽입만큼 밀려야 한다.
+
+    2026-08-21: "rows" 리스트만 옮기고 정수는 통과시켜서, 썬데이워커 합계 행이 35에 머문 채
+    실제 합계는 37로 밀렸다. 그 사이 두 행이 안 지워져 0이 두 줄 남았다.
+    """
+    from app.services.xlsx_rows import remap_cell_map
+
+    cell_map = {
+        "item_blocks": [{"rows": [13, 14], "category_large_cell": "A13"}],
+        "totals": {"grand_total_row": 35, "top_display_cell": "R9"},
+        "always_clear_cells": ["B24"],
+    }
+    out = remap_cell_map(cell_map, {13: 13, 14: 14, 24: 26, 35: 37})
+    assert out["totals"]["grand_total_row"] == 37
+    assert out["totals"]["top_display_cell"] == "R9"  # 옮길 필요 없는 좌표는 그대로
+    assert out["item_blocks"][0]["rows"] == [13, 14]
+    assert out["always_clear_cells"] == ["B26"]
