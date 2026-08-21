@@ -26,7 +26,6 @@ export type LineItem = {
   tax_amount?: number;
   // 채팅에서 사용자가 금액·단가를 콕 집어 지정한 항목. 저장 시 그대로 되돌려 보내야 다음
   // 수정 때 그 금액이 10만원 단위로 다시 밀리지 않는다(2026-08-20).
-  locked?: boolean;
 };
 
 export type EntityQuote = {
@@ -52,6 +51,14 @@ export type EntityQuote = {
   detail_column_order: string[];
   // 알파브라더스처럼 항목 블록마다 구분(대)/구분(중)이 있는 양식인지 (item.task_type로 채움)
   show_category_split: boolean;
+  /** 이 양식의 공급가액 수식이 작업일/수량을 곱하는가. 화면 편집이 발급본과 같은 식을 쓴다. */
+  amount_uses_work_days: boolean;
+  amount_uses_quantity: boolean;
+  // 금액 후처리가 무엇을 움직였는지 한 문장. "안 건드린 항목이 왜 바뀌었나"를 사용자가
+  // 화면에서 바로 추적할 수 있어야 한다(2026-08-21).
+  adjustment_note: string | null;
+  // 비교견적의 인상률(1.10 = +10%). 화면에서 %를 고쳐 다시 생성할 때 쓴다.
+  markup_ratio: number | null;
 };
 
 export type ModuleItemGroup = {
@@ -102,9 +109,18 @@ export type EstimateSetSummary = {
   entity_names: string[];
 };
 
-export function getEntityQuotePdfUrl(entityQuoteId: string, options?: { inline?: boolean }): string {
-  const suffix = options?.inline ? "?inline=1" : "";
-  return `${API_BASE_URL}/api/entity-quotes/${entityQuoteId}/pdf${suffix}`;
+export function getEntityQuotePdfUrl(
+  entityQuoteId: string,
+  options?: { inline?: boolean; version?: string }
+): string {
+  // version은 견적 내용 해시다. 내용이 그대로면 URL도 그대로라 브라우저 캐시에 걸려 서버를
+  // 다시 때리지 않는다 — LibreOffice 변환이 1건에 3초 넘게 걸리고 전역 락이라, 탭을 옮길
+  // 때마다 재요청하면 그 뒤에 선 다른 요청(비교견적 생성 등)이 통째로 굶었다(2026-08-21 실측).
+  const params = new URLSearchParams();
+  if (options?.inline) params.set("inline", "1");
+  if (options?.version) params.set("v", options.version);
+  const query = params.toString();
+  return `${API_BASE_URL}/api/entity-quotes/${entityQuoteId}/pdf${query ? `?${query}` : ""}`;
 }
 
 export function getEntityQuoteXlsxUrl(entityQuoteId: string): string {
@@ -229,22 +245,50 @@ export async function generateEstimateSet(
 
 export type LineItemsUpdateResult = {
   entity_quote: EntityQuote;
-  // 본견적을 수정하면 같은 세트의 비교견적들도 서버에서 함께 재계산된다 — 세트 전체를
+  // 본견적 금액을 바꾸면 비교견적 금액도 서버에서 즉시 따라온다(AI 호출 없음) — 세트 전체를
   // 다시 조회하지 않고 이 값으로 화면을 바로 갱신한다(2026-08-17).
   synced_comparison_quotes: EntityQuote[];
+  // 본견적 항목이 추가·삭제돼 1:1 대응이 깨진 비교견적 id들. 금액만으로는 못 맞추므로
+  // 사용자에게 "비교견적 다시 생성"을 안내한다(2026-08-21).
+  comparisons_need_regeneration: string[];
 };
+
+/** 본견적 수정을 저장할 때 비교견적을 어떻게 할지. keep=그대로 / sync=금액만 즉시 반영 / regenerate=문장까지 다시 쓰기(AI) */
+export type ComparisonMode = "keep" | "sync" | "regenerate";
 
 export async function updateLineItems(
   entityQuoteId: string,
   items: LineItem[],
-  editRequestText?: string
+  editRequestText?: string,
+  comparisonMode: ComparisonMode = "sync"
 ): Promise<LineItemsUpdateResult> {
   const res = await fetch(`${API_BASE_URL}/api/entity-quotes/${entityQuoteId}/line-items`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ items, edit_request_text: editRequestText ?? null }),
+    body: JSON.stringify({ items, edit_request_text: editRequestText ?? null, comparison_mode: comparisonMode }),
   });
   return handle<LineItemsUpdateResult>(res);
+}
+
+/** 확정된 본견적을 기준으로 비교견적을 (다시) 생성한다. AI 호출이라 10~20초 걸린다. */
+export async function regenerateComparisons(id: string): Promise<EstimateSet> {
+  const res = await fetch(`${API_BASE_URL}/api/estimate-sets/${id}/regenerate-comparisons`, {
+    method: "POST",
+  });
+  return handle<EstimateSet>(res);
+}
+
+/** 비교견적의 인상률(%)만 바꾼다. 저장 후 regenerateComparisons를 부르면 그 비율로 다시 쓴다. */
+export async function updateMarkupRatio(
+  entityQuoteId: string,
+  markupRatio: number
+): Promise<EntityQuote> {
+  const res = await fetch(`${API_BASE_URL}/api/entity-quotes/${entityQuoteId}/markup-ratio`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ markup_ratio: markupRatio }),
+  });
+  return handle<EntityQuote>(res);
 }
 
 export type QuoteVersion = {
@@ -302,7 +346,12 @@ export async function updateRecipientInfo(
   return handle<EntityQuote>(res);
 }
 
+/** 채팅에 붙이는 파일. PDF는 Claude가 직접 읽고, xlsx는 서버가 표 텍스트로 펴서 넣는다. */
+export type ChatAttachment = { filename: string; data: string };
+
 export type EditResult = {
+  /** 모델이 사람에게 하는 답. 채팅창에 그대로 표시한다(2026-08-21). */
+  reply: string;
   scope: "quote_only" | "catalog_update" | "ambiguous";
   entity_quote: EntityQuote;
   changed_items: LineItem[];
@@ -310,12 +359,13 @@ export type EditResult = {
 
 export async function editEntityQuote(
   entityQuoteId: string,
-  editRequestText: string
+  editRequestText: string,
+  attachment?: ChatAttachment
 ): Promise<EditResult> {
   const res = await fetch(`${API_BASE_URL}/api/entity-quotes/${entityQuoteId}/edit`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ edit_request_text: editRequestText }),
+    body: JSON.stringify({ edit_request_text: editRequestText, attachment: attachment ?? null }),
   });
   return handle<EditResult>(res);
 }

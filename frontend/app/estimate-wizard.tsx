@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useGeneratedEstimateLayout } from "./app-shell";
 import {
   ApiError,
@@ -12,12 +12,16 @@ import {
   fetchModuleOptions,
   fetchQuoteVersions,
   generateEstimateSet,
+  regenerateComparisons,
+  updateMarkupRatio,
   getEntityQuotePdfUrl,
   getEntityQuoteXlsxUrl,
   updateLineItems,
   updateQuoteDate,
   updateRecipientInfo,
   updateServiceName,
+  type ChatAttachment,
+  type ComparisonMode,
   type CatalogModuleOptions,
   type EntityModuleOptions,
   type EntityOption,
@@ -712,10 +716,14 @@ function ItemDetailCells({
           <td
             key={key}
             className={
-              "py-2 pr-3 text-sm text-gray-600 " +
-              (isText ? "text-left" : "whitespace-nowrap text-right")
+              "py-2 pr-3 text-[13px] leading-snug text-gray-600 " +
+              (isText ? "text-left align-top" : "whitespace-nowrap text-right")
             }
           >
+            {/* 상품구성은 개조식 10줄이 넘어가는 항목이 있어(주간 액션플랜 등) 한 행이 화면
+                절반을 잡아먹었다(2026-08-21 사용자 지적). 높이를 묶고 넘치면 그 칸만 스크롤해
+                다른 항목과 나란히 비교할 수 있게 한다. 클릭하면 편집은 그대로 된다. */}
+            <div className={isText ? "max-h-32 overflow-y-auto pr-1" : ""}>
             <InlineEditCell
               value={renderDetailEditValue(item, key)}
               display={renderDetailValue(item, key)}
@@ -723,6 +731,7 @@ function ItemDetailCells({
               inputType={isText ? "text" : "number"}
               onSave={(v) => onEditItem({ [key]: isText ? v : Number(v) } as LineItemPatch)}
             />
+            </div>
           </td>
         );
       })}
@@ -807,25 +816,142 @@ function CategoryRows({
     );
   }
 
+  // 실제 발급 양식은 같은 구분(대)를 셀 하나로 병합해 보여준다 — 미리보기가 행마다 같은 값을
+  // 반복하면 발급본과 달라 보이고, 접기 토글이 가운데 상품명 칸에 있어 어느 묶음을 접는지도
+  // 헷갈렸다(2026-08-21 사용자 지적). 토글을 맨 왼쪽 구분(대) 칸으로 옮기고 그 칸을 묶음
+  // 전체에 rowSpan으로 병합한다. 구분(중)도 연속으로 같은 값이면 같은 방식으로 묶는다.
+  const bodyRowCount = expanded ? group.items.length : 0;
+  const midRunLength = (i: number) => {
+    const value = group.items[i].mid_category ?? group.category;
+    if (i > 0 && (group.items[i - 1].mid_category ?? group.category) === value) return 0; // 위 칸에 병합됨
+    let n = 1;
+    while (i + n < group.items.length && (group.items[i + n].mid_category ?? group.category) === value) n += 1;
+    return n;
+  };
+
+  // 구분(대)/구분(중) 칸이 있는 양식은 병합 셀이 곧 묶음 라벨이라 소계 행이 필요 없다.
+  // 펼친 상태에서는 항목 행만 그리고, 구분(대) 셀을 첫 항목 행에서 통째로 병합한다.
+  if (showCategorySplit && expanded) {
+    return (
+      <>
+        {group.items.map((item, i) => (
+          <tr
+            key={item._index}
+            className={
+              "border-b border-gray-200 last:border-b-0 " +
+              (isChanged(item) ? "border-l-4 border-l-amber-400 bg-amber-50" : "bg-white")
+            }
+          >
+            {i === 0 && (
+              <td
+                rowSpan={group.items.length}
+                className="border-r border-gray-200 bg-slate-50/70 px-2.5 py-2 align-top text-[13px] font-semibold leading-snug text-slate-700"
+              >
+                <button
+                  type="button"
+                  onClick={() => setExpanded(false)}
+                  className="flex min-w-0 items-start gap-1 break-words text-left"
+                >
+                  <svg viewBox="0 0 20 20" fill="currentColor" className="mt-1 h-3 w-3 shrink-0 rotate-90 text-gray-400">
+                    <path fillRule="evenodd" d="M6 4l8 6-8 6V4z" clipRule="evenodd" />
+                  </svg>
+                  {group.category}
+                </button>
+              </td>
+            )}
+            {midRunLength(i) > 0 && (
+              <td
+                rowSpan={midRunLength(i)}
+                className="border-r border-gray-200 bg-slate-50/40 px-2.5 py-2 align-top text-[13px] leading-snug text-slate-600 break-words"
+              >
+                {item.mid_category ?? group.category}
+              </td>
+            )}
+            <td className="px-2.5 py-2 align-top text-[13px] text-gray-800">
+              <InlineEditCell
+                value={item.name}
+                display={item.name}
+                onSave={(v) => onEditItem(item._index, { name: v })}
+              />
+            </td>
+            <ItemDetailCells item={item} order={order} onEditItem={(patch) => onEditItem(item._index, patch)} />
+            <td className="whitespace-nowrap py-2 pr-3 text-right align-top text-[13px] text-gray-700">
+              <InlineEditCell
+                value={String(item.amount)}
+                display={`${item.amount.toLocaleString()}원`}
+                align="right"
+                inputType="number"
+                onSave={(v) => onEditItem(item._index, { amount: Number(v) })}
+              />
+            </td>
+            {hasNote && (
+              <td className="py-2 pr-3 align-top text-[13px] text-gray-600">
+                <InlineEditCell
+                  value={item.note ?? ""}
+                  display={item.note ?? ""}
+                  onSave={(v) => onEditItem(item._index, { note: v })}
+                />
+              </td>
+            )}
+          </tr>
+        ))}
+        {/* 묶음이 끝나는 자리에 그 구분(대)의 공급가액 합계를 한 줄로 보여준다 — 항목이 길어
+            지면 이 묶음이 얼마인지 한눈에 안 보였다(2026-08-21 사용자 요청). */}
+        <tr className="border-b-2 border-gray-300 bg-slate-50/60">
+          <td className="px-2.5 py-1.5" colSpan={3 + order.length} />
+          <td className="whitespace-nowrap py-1.5 pr-3 text-right text-[13px] font-bold text-slate-700">
+            {group.amount.toLocaleString()}원
+          </td>
+          {hasNote && <td className="py-1.5" />}
+        </tr>
+      </>
+    );
+  }
+
   return (
     <>
       <tr className="border-b border-gray-200 bg-white last:border-b-0">
-        {splitCells(group.items[0])}
-        <td className="px-3 py-2.5 font-bold text-gray-900">
-          <button
-            type="button"
-            onClick={() => setExpanded((v) => !v)}
-            className="flex min-w-0 items-center gap-1.5 break-words text-left"
+        {showCategorySplit && (
+          <td
+            rowSpan={1 + bodyRowCount}
+            className="border-r border-gray-200 bg-slate-50/70 px-2.5 py-2 align-top text-[13px] font-semibold leading-snug text-slate-700"
           >
-            <svg
-              viewBox="0 0 20 20"
-              fill="currentColor"
-              className={"h-3.5 w-3.5 shrink-0 text-gray-500 transition-transform " + (expanded ? "rotate-90" : "")}
+            <button
+              type="button"
+              onClick={() => setExpanded((v) => !v)}
+              className="flex min-w-0 items-start gap-1.5 break-words text-left"
             >
-              <path fillRule="evenodd" d="M6 4l8 6-8 6V4z" clipRule="evenodd" />
-            </svg>
-            {group.category}
-          </button>
+              <svg
+                viewBox="0 0 20 20"
+                fill="currentColor"
+                className={"mt-1 h-3.5 w-3.5 shrink-0 text-gray-500 transition-transform " + (expanded ? "rotate-90" : "")}
+              >
+                <path fillRule="evenodd" d="M6 4l8 6-8 6V4z" clipRule="evenodd" />
+              </svg>
+              {group.category}
+            </button>
+          </td>
+        )}
+        {showCategorySplit && <td className="border-r border-gray-200 bg-slate-50/70 px-2.5 py-2" />}
+        <td className="px-3 py-2.5 font-bold text-gray-900">
+          {showCategorySplit ? (
+            <span className="text-sm text-gray-400">소계</span>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setExpanded((v) => !v)}
+              className="flex min-w-0 items-center gap-1.5 break-words text-left"
+            >
+              <svg
+                viewBox="0 0 20 20"
+                fill="currentColor"
+                className={"h-3.5 w-3.5 shrink-0 text-gray-500 transition-transform " + (expanded ? "rotate-90" : "")}
+              >
+                <path fillRule="evenodd" d="M6 4l8 6-8 6V4z" clipRule="evenodd" />
+              </svg>
+              {group.category}
+            </button>
+          )}
         </td>
         <td className="py-2 pr-3 text-right text-sm text-gray-400" colSpan={order.length} />
         <td className="whitespace-nowrap px-3 py-2.5 text-right font-bold text-gray-900">
@@ -834,7 +960,7 @@ function CategoryRows({
         {hasNote && <td className="px-3 py-2.5" />}
       </tr>
       {expanded &&
-        group.items.map((item) => (
+        group.items.map((item, i) => (
           <tr
             key={item._index}
             className={
@@ -842,8 +968,15 @@ function CategoryRows({
               (isChanged(item) ? "border-l-4 border-l-amber-400 bg-amber-50" : "bg-gray-50")
             }
           >
-            {splitCells(item)}
-            <td className="py-2 pl-9 pr-3 text-sm text-gray-700">
+            {showCategorySplit && midRunLength(i) > 0 && (
+              <td
+                rowSpan={midRunLength(i)}
+                className="border-r border-gray-200 bg-slate-50/40 px-2.5 py-2 align-top text-[13px] leading-snug text-slate-600 break-words"
+              >
+                {item.mid_category ?? group.category}
+              </td>
+            )}
+            <td className="px-2.5 py-2 align-top text-[13px] text-gray-800">
               <InlineEditCell
                 value={item.name}
                 display={item.name}
@@ -881,80 +1014,56 @@ function CategoryRows({
 // ponytail: JS Math.round는 절반을 항상 올림, Python round()는 은행가 반올림(.5를 짝수로) —
 // 나눗셈 결과가 정확히 .5로 떨어지는 극히 드문 금액에서 이 미리보기가 실제 발급본과 1원 차이날
 // 수 있음. 실제 발급 금액은 항상 서버(pdf_service)가 최종 계산하므로 이 화면은 참고용.
-function computeVatBreakdown(totalAmount: number, vatIncluded: boolean) {
-  const supplyAmount = vatIncluded ? Math.round(totalAmount / 1.1) : totalAmount;
-  const vatAmount = vatIncluded ? totalAmount - supplyAmount : Math.round(supplyAmount * 0.1);
-  const grandTotal = vatIncluded ? totalAmount : supplyAmount + vatAmount;
-  return { supplyAmount, vatAmount, grandTotal };
+function computeVatBreakdown(totalAmount: number) {
+  // entity_quotes.total_amount는 **언제나 부가세 포함 총액**이다 — 백엔드
+  // quote_pricing.grand_total이 vat_included와 무관하게 공급가액×1.1을 저장한다.
+  // (vat_included는 "사용자가 입력한 총액을 공급가액으로 볼지 총액으로 볼지"를 정할 뿐이라
+  // 생성 시점에만 쓰인다.)
+  //
+  // 예전엔 여기서 vat_included=false일 때 totalAmount를 공급가액으로 보고 부가세를 한 번 더
+  // 더했다. 그래서 항목 합이 1,000,000원인 견적서가 공급가액 1,100,000 / 부가세 110,000 /
+  // 총합계 1,210,000으로 표시됐다(2026-08-21 사용자 지적 — 부가세 이중 계산).
+  const supplyAmount = Math.round(totalAmount / 1.1);
+  return { supplyAmount, vatAmount: totalAmount - supplyAmount, grandTotal: totalAmount };
 }
 
 // 수정 반영하기 전 미리보기(pending) 항목들만으로 총합계를 화면에 보여줄 때 쓴다 —
 // estimate_service.update_line_items의 grand_total 계산과 동일한 식이어야 커밋 후 값과
 // 일치한다(2026-08-14).
-function computeGrandTotal(items: LineItem[], vatIncluded: boolean): number {
+function computeGrandTotal(items: LineItem[]): number {
+  // 백엔드 quote_pricing.grand_total과 같은 식. vat_included와 무관하게 공급가액×1.1이다.
   const supply = items.reduce((sum, item) => sum + item.amount, 0);
-  return vatIncluded ? Math.round(supply * 1.1) : supply + Math.round(supply * 0.1);
+  return supply + Math.round(supply * 0.1);
 }
 
 // 직접편집이든 채팅 수정이든 커밋("수정 반영하기") 전까지는 화면에서만 미리보이는 상태.
 type PendingEdit = { items: LineItem[]; editRequestText: string };
 
-// 백엔드 allocation_service.AMOUNT_UNIT과 같은 값 — 견적 금액은 1만원 단위로 떨어뜨린다
-// (2026-08-19 사용자 결정). 여기서 어긋나면 화면과 발급본의 금액이 달라진다.
-const AMOUNT_UNIT = 10_000;
 
 // 백엔드 allocation_service.reconcile_amounts의 JS 쌍둥이 — 소계/총합계를 직접 고쳤을 때
 // 항목들을 비례 배분한 뒤 1만원 단위로 떨어뜨리고, 남는 차액은 가장 큰 항목이 흡수한다.
 // 두 구현이 같은 규칙을 따라야 "수정 반영하기" 전후로 금액이 흔들리지 않는다.
-function reconcileAmounts(amounts: number[], target: number): number[] {
-  if (amounts.length === 0) return amounts;
-  const sum = (values: number[]) => values.reduce((acc, v) => acc + v, 0);
-  const absorbDiff = (values: number[]) => {
-    const out = [...values];
-    const diff = target - sum(out);
-    if (diff !== 0) {
-      let biggest = 0;
-      out.forEach((v, i) => {
-        if (v > out[biggest]) biggest = i;
-      });
-      out[biggest] += diff;
-    }
-    return out;
-  };
-
-  const current = sum(amounts);
-  const scaled =
-    current > 0 && target !== current ? amounts.map((a) => Math.round((a * target) / current)) : [...amounts];
-
-  // 단위 반올림은 "단위 × 항목수"만큼 여유가 있을 때만 — 그보다 target이 작으면 차액 흡수에서 음수가 난다.
-  if (target >= AMOUNT_UNIT * scaled.length) {
-    const rounded = absorbDiff(
-      scaled.map((a) => (a > 0 ? Math.max(AMOUNT_UNIT, Math.round(a / AMOUNT_UNIT) * AMOUNT_UNIT) : 0))
-    );
-    if (Math.min(...rounded) >= 0) return rounded;
-  }
-  return absorbDiff(scaled);
-}
-
 function LineItemTable({
   items,
   columnLabels,
   detailColumnOrder,
   totalAmount,
-  vatIncluded,
+  amountUsesWorkDays,
+  amountUsesQuantity,
   showCategorySplit = false,
   highlightKeys,
-  keepTotal,
   onSaveLineItems,
 }: {
   items: LineItem[];
   columnLabels: Record<string, string>;
   detailColumnOrder: string[];
   totalAmount: number;
-  vatIncluded: boolean;
+  // 금액 계산식은 백엔드가 내려준다(EntityQuoteOut.amount_uses_*). 화면이 "단가×수량"으로
+  // 하드코딩하면 규칙이 바뀔 때 화면과 발급본이 갈린다 — 실제로 그 사고가 났었다(2026-08-21).
+  amountUsesWorkDays: boolean;
+  amountUsesQuantity: boolean;
   showCategorySplit?: boolean;
   highlightKeys?: Set<string>;
-  keepTotal: boolean;
   onSaveLineItems: (items: LineItem[]) => void;
 }) {
   const groups = groupLineItems(items);
@@ -962,171 +1071,94 @@ function LineItemTable({
   const labelFor = (key: string) => columnLabels[key] ?? DEFAULT_COLUMN_LABELS[key] ?? key;
   const hasNote = Boolean(columnLabels.note);
   const labelColSpan = (showCategorySplit ? 2 : 0) + 1 + order.length;
-  const { supplyAmount, vatAmount, grandTotal } = computeVatBreakdown(totalAmount, vatIncluded);
-  const [allocationFeedback, setAllocationFeedback] = useState<string | null>(null);
+  const { supplyAmount, vatAmount, grandTotal } = computeVatBreakdown(totalAmount);
   const hasTextDetail = order.some((key) => TEXT_DETAIL_KEYS.has(key));
 
+  // 열 폭 합은 반드시 100%여야 한다 — table-fixed라 넘치면 마지막 열("공급가액")의 "원"이
+  // 잘리고 가로 스크롤이 생긴다(2026-08-21 사용자 지적, 합이 109%였음).
+  // 구분(대)10 + 구분(중)10 + 상품명11 + 상품구성28 + 작업일6 + 수량6 + 단가14 + 공급가액15 = 100
   function detailColumnWidth(key: string): string {
-    if (TEXT_DETAIL_KEYS.has(key)) return showCategorySplit ? "20%" : "30%";
+    if (TEXT_DETAIL_KEYS.has(key)) return showCategorySplit ? "28%" : "25%";
     if (!hasTextDetail) {
       if (key === "unit_price") return "20%";
       if (key === "work_days" || key === "quantity") return "10%";
       return "10%";
     }
-    if (key === "work_days" || key === "quantity") return "7%";
-    if (key === "unit_price") return "14%";
+    if (key === "work_days") return showCategorySplit ? "6%" : "8%";
+    if (key === "quantity") return showCategorySplit ? "6%" : "7%";
+    if (key === "unit_price") return showCategorySplit ? "14%" : "18%";
     return "9%";
   }
 
   async function handleEditItem(index: number, patch: LineItemPatch) {
-    // 화면에서 직접 친 금액은 잠근다 — 이후 채팅 수정에서 단가 10만원 스냅·카탈로그 비율
-    // 환산이 이 항목을 건드리지 않는다(2026-08-20 사용자 지적: "단가를 고쳐놔도 자꾸 다른
-    // 값이 마음대로 움직인다"). 백엔드 LineItemIn.locked 참고.
-    const pinned = "amount" in patch || "unit_price" in patch || "quantity" in patch;
-    const merged: LineItem = { ...items[index], ...patch, ...(pinned ? { locked: true } : {}) };
-    // 공급가액 = 단가×수량만으로 계산한다. 작업일은 정보성 필드로 가격에 영향을 주지 않는다
-    // (2026-08-14 사용자 결정 — 일부 원본 xlsx 시트엔 단가×작업일×수량 수식이 있지만, 그건
-    // pdf_service._compute_item_pricing이 발급 시점에 역산으로 흡수하는 별개 문제다. 여기(화면/
-    // 채팅 편집)의 amount는 항상 단가×수량이어야 한다 — edit_service.edit_entity_quote와 동일 규칙).
+    const merged: LineItem = { ...items[index], ...patch };
+    // 단가에 곱해지는 값 — 백엔드 quote_pricing.FormSpec.divisor와 같은 식이어야 한다.
+    const divisorOf = (item: LineItem) =>
+      (amountUsesWorkDays ? item.work_days ?? 1 : 1) * (amountUsesQuantity ? item.quantity ?? 1 : 1);
     if ("amount" in patch) {
-      const divisor = merged.quantity ?? 1;
-      merged.unit_price = divisor ? merged.amount / divisor : merged.amount;
+      const d = divisorOf(merged);
+      merged.unit_price = d ? merged.amount / d : merged.amount;
     } else if ("unit_price" in patch || "work_days" in patch || "quantity" in patch) {
-      merged.amount = Math.round((merged.unit_price ?? 0) * (merged.quantity ?? 1));
+      merged.amount = Math.round((merged.unit_price ?? 0) * divisorOf(merged));
     }
 
-    let next = items.map((item, i) => (i === index ? merged : item));
+    const next = items.map((item, i) => (i === index ? merged : item));
 
-    // 총액 유지 모드: 이 항목의 증감분을 나머지 항목에 (기존 비중대로) 비례 배분해 총액을 그대로 유지한다.
-    // amount 필드를 직접 바꾸든, unit_price/quantity를 바꿔서 amount가 간접적으로 바뀌든(work_days는
-    // 정보성이라 amount에 영향 없음, 939번 줄 주석 참고) 똑같이 걸려야 해서 patch 키가 아니라 실제
-    // amount 변화 여부로 판단한다.
-    let redistributedDelta: number | null = null;
-    let totalGrewInstead = false;
-    if (keepTotal && merged.amount !== items[index].amount && items.length > 1) {
-      const originalTotal = items.reduce((sum, item) => sum + item.amount, 0);
-      const delta = merged.amount - items[index].amount;
-      const othersSum = originalTotal - items[index].amount;
-      // delta가 othersSum보다 크면 나머지 항목을 아무리 깎아도(0원까지) 총액을 못 지킨다 — 예전엔
-      // 그래도 scale을 0으로 눌러 나머지 항목 전부를 0원으로 만들었는데, 그게 "가격을 바꾸니 다른
-      // 항목이 전부 사라진다"는 버그였다(2026-08-20 사용자 지적). 총액을 지킬 수 없으면 다른 항목을
-      // 건드리지 않고 총합계 유지 모드를 포기한다(= keepTotal 꺼졌을 때와 동일하게 이 항목만 바뀜).
-      if (delta > 0 && othersSum >= 0 && othersSum < delta) totalGrewInstead = true;
-      if (delta !== 0 && othersSum > 0 && othersSum >= delta) {
-        redistributedDelta = delta;
-        const scale = (othersSum - delta) / othersSum;
-        next = items.map((item, i) => {
-          if (i === index) return merged;
-          const scaledAmount = Math.round(item.amount * scale);
-          const divisor = item.quantity ?? 1;
-          // 총액 유지로 끌려온 금액은 사용자가 지정한 값이 아니므로 잠금을 푼다.
-          return {
-            ...item,
-            locked: false,
-            amount: scaledAmount,
-            unit_price: divisor ? scaledAmount / divisor : scaledAmount,
-          };
-        });
-        // 반올림 오차는 다른 항목 중 금액이 가장 큰 항목이 흡수한다(reconcileAmounts와 동일
-        // 패턴) — 예전엔 배열의 마지막 항목이 무조건 흡수했는데, 그 항목이 이미 0에 가깝게
-        // 줄어든 상태면 오차를 더하는 순간 음수로 떨어졌다(2026-08-20 사용자 지적). othersSum >=
-        // delta를 위에서 이미 보장했으므로 여기서 음수가 나올 순 없지만, Math.max(0, ...)은
-        // 안전망으로 남겨둔다.
-        const roundingDiff = originalTotal - next.reduce((sum, item) => sum + item.amount, 0);
-        if (roundingDiff !== 0) {
-          let biggestOtherIndex = -1;
-          next.forEach((item, i) => {
-            if (i === index) return;
-            if (biggestOtherIndex === -1 || item.amount > next[biggestOtherIndex].amount) biggestOtherIndex = i;
-          });
-          if (biggestOtherIndex !== -1) {
-            const item = next[biggestOtherIndex];
-            const fixedAmount = Math.max(0, item.amount + roundingDiff);
-            const divisor = item.quantity ?? 1;
-            next[biggestOtherIndex] = { ...item, amount: fixedAmount, unit_price: divisor ? fixedAmount / divisor : fixedAmount };
-          }
-        }
-      }
-    }
-
+    // 재배분 없음 — 고친 항목만 바뀌고 총합계는 그만큼 따라 움직인다.
+    // 예전엔 "총합계 유지" 모드가 나머지 항목을 비례 축소·확대했는데, 사용자가 손대지도 않은
+    // 금액이 매번 흔들리는 주된 원인이었다(2026-08-21 재설계 — 사용자가 친 값은 절대 재계산하지
+    // 않는다). 총액을 맞춰야 하면 사용자가 직접 고치거나 다시 생성한다.
     onSaveLineItems(next);
-    setAllocationFeedback(
-      redistributedDelta !== null
-        ? `차액 ${Math.abs(redistributedDelta).toLocaleString()}원을 다른 ${items.length - 1}개 항목에 자동 배분했습니다.`
-        : totalGrewInstead
-        ? "다른 항목으로는 차액을 다 흡수할 수 없어 총합계를 유지하지 못했습니다 — 총합계가 함께 늘어났습니다."
-        : null
-    );
-  }
-
-  // 공급가액 소계・총합계를 직접 고치면 그 목표에 맞춰 전 항목을 다시 배분한다(2026-08-19
-  // 사용자 요청 — "총합계도 수정할 수 있게"). 채팅으로 "소계를 1,000만원으로" 라고 말하는 것과
-  // 같은 결과가 나오도록 백엔드와 같은 배분 규칙(reconcileAmounts)을 쓴다.
-  async function handleEditSupplyTotal(nextSupplyAmount: number) {
-    if (!Number.isFinite(nextSupplyAmount) || nextSupplyAmount <= 0 || items.length === 0) return;
-    const amounts = reconcileAmounts(items.map((item) => item.amount), Math.round(nextSupplyAmount));
-    onSaveLineItems(
-      items.map((item, i) => {
-        const divisor = item.quantity ?? 1;
-        return { ...item, amount: amounts[i], unit_price: divisor ? amounts[i] / divisor : amounts[i] };
-      })
-    );
-    setAllocationFeedback(`총액에 맞춰 ${items.length}개 항목 금액을 1만원 단위로 다시 배분했습니다.`);
   }
 
   return (
     <div>
-      {allocationFeedback && (
-        <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-xl bg-indigo-50 px-3.5 py-2.5 text-xs text-indigo-800">
-          <span>{allocationFeedback}</span>
-        </div>
-      )}
       <div
         className={
           "overflow-x-auto rounded-lg border border-gray-200 bg-white " +
           (!showCategorySplit && !hasTextDetail ? "w-full max-w-[980px]" : "w-full")
         }
       >
-      <table className="w-full min-w-0 table-fixed border-collapse text-sm">
+      <table className="w-full min-w-0 table-fixed border-collapse text-[13px]">
         <colgroup>
           {showCategorySplit && (
             <>
-              <col style={{ width: "8%" }} />
-              <col style={{ width: "8%" }} />
+              <col style={{ width: "10%" }} />
+              <col style={{ width: "10%" }} />
             </>
           )}
-          <col style={{ width: showCategorySplit ? "16%" : hasTextDetail ? "35%" : "32%" }} />
+          <col style={{ width: showCategorySplit ? "11%" : hasTextDetail ? "15%" : "32%" }} />
           {order.map((key) => <col key={key} style={{ width: detailColumnWidth(key) }} />)}
-          <col style={{ width: hasTextDetail ? (showCategorySplit ? "16%" : "13%") : "28%" }} />
+          <col style={{ width: hasTextDetail ? (showCategorySplit ? "15%" : "27%") : "28%" }} />
           {hasNote && <col style={{ width: "16%" }} />}
         </colgroup>
         <thead>
           <tr className="border-b border-gray-200 bg-gray-100">
             {showCategorySplit && (
               <>
-                <th className="break-words px-3 py-2 text-left text-sm font-semibold text-gray-600">
+                <th className="break-words px-2.5 py-2 text-left text-xs font-semibold text-gray-600">
                   {columnLabels.category_large ?? "구분(대)"}
                 </th>
-                <th className="break-words px-3 py-2 text-left text-sm font-semibold text-gray-600">
+                <th className="break-words px-2.5 py-2 text-left text-xs font-semibold text-gray-600">
                   {columnLabels.category_mid ?? "구분(중)"}
                 </th>
               </>
             )}
-            <th className="px-3 py-2 text-left text-sm font-semibold text-gray-600">
+            <th className="px-2.5 py-2 text-left text-xs font-semibold text-gray-600">
               {labelFor("item_name")}
             </th>
             {order.map((key) => (
               <th
                 key={key}
                 className={
-                  "px-3 py-2 text-sm font-semibold text-gray-600 " +
+                  "px-2.5 py-2 text-xs font-semibold text-gray-600 " +
                   (TEXT_DETAIL_KEYS.has(key) ? "text-left" : "whitespace-nowrap text-right")
                 }
               >
                 {labelFor(key)}
               </th>
             ))}
-            <th className="whitespace-nowrap px-3 py-2 text-right text-sm font-semibold text-gray-600">
+            <th className="whitespace-nowrap px-2.5 py-2 text-right text-xs font-semibold text-gray-600">
               {columnLabels.supply_amount ?? columnLabels.amount ?? DEFAULT_COLUMN_LABELS.supply_amount}
             </th>
             {hasNote && (
@@ -1155,13 +1187,7 @@ function LineItemTable({
               공급가액 소계
             </td>
             <td className="whitespace-nowrap px-3 py-2 text-right text-sm text-gray-700">
-              <InlineEditCell
-                value={String(supplyAmount)}
-                display={`${supplyAmount.toLocaleString()}원`}
-                align="right"
-                inputType="number"
-                onSave={(v) => handleEditSupplyTotal(Number(v))}
-              />
+                {supplyAmount.toLocaleString()}원
             </td>
             {hasNote && <td className="px-3 py-2" />}
           </tr>
@@ -1179,15 +1205,7 @@ function LineItemTable({
               총합계
             </td>
             <td className="whitespace-nowrap px-3 py-2.5 text-right text-base font-bold text-indigo-700">
-              {/* 총합계는 항상 공급가액 소계의 1.1배다(computeVatBreakdown) — 입력받은 부가세
-                  포함 금액을 1.1로 나눠 소계 목표로 되돌린 뒤 항목을 다시 배분한다. */}
-              <InlineEditCell
-                value={String(grandTotal)}
-                display={`${grandTotal.toLocaleString()}원`}
-                align="right"
-                inputType="number"
-                onSave={(v) => handleEditSupplyTotal(Math.round(Number(v) / 1.1))}
-              />
+              {grandTotal.toLocaleString()}원
             </td>
             {hasNote && <td className="px-3 py-2.5" />}
           </tr>
@@ -1200,8 +1218,8 @@ function LineItemTable({
 
 function QuoteCard({
   quote,
-  vatIncluded,
   pending,
+  hasComparisons,
   onSaveServiceName,
   onSaveQuoteDate,
   onSaveRecipientInfo,
@@ -1212,17 +1230,50 @@ function QuoteCard({
   onRevertToPrevious,
 }: {
   quote: EntityQuote;
-  vatIncluded: boolean;
   pending: PendingEdit | null;
+  hasComparisons: boolean;
   onSaveServiceName: (value: string) => Promise<void>;
   onSaveQuoteDate: (value: string) => Promise<void>;
   onSaveRecipientInfo: (input: RecipientInfoInput) => Promise<void>;
   onStageLineItems: (items: LineItem[]) => void;
-  onCommitPending: () => Promise<void>;
+  onCommitPending: (mode: ComparisonMode) => Promise<void>;
   onDiscardPending: () => void;
   onRevertToOriginal: () => Promise<void>;
   onRevertToPrevious: () => Promise<void>;
 }) {
+  // 본견적을 고쳤을 때 비교견적을 어떻게 할지는 "무엇을 고쳤는지"를 보면 정해진다.
+  // 저장 시점에 사용자에게 세 갈래를 고르게 했더니 매번 판단해야 해서 헷갈린다는
+  // 피드백을 받았다(2026-08-21). 고른 결과를 버튼 옆에 문장으로 알려주고, 틀렸다 싶으면
+  // 비교견적 패널의 "다시 생성"으로 언제든 덮어쓸 수 있다.
+  //   문구(품명·구분·상품구성)를 고쳤다  → regenerate (비교견적 문장도 다시 씀, AI 10~20초)
+  //   금액 총액이 달라졌다              → sync      (인상률대로 금액만 따라감, 즉시)
+  //   둘 다 아니다(수량↔단가 맞바꾸기 등) → keep      (비교견적은 그대로 두면 맞다)
+  const comparisonMode: ComparisonMode = useMemo(() => {
+    if (!pending || !quote.is_primary || !hasComparisons) return "keep";
+    const saved = quote.line_items;
+    const next = pending.items;
+    const textChanged =
+      next.length !== saved.length ||
+      next.some((item, i) => {
+        const before = saved[i];
+        return (
+          !before ||
+          item.name !== before.name ||
+          item.category !== before.category ||
+          (item.description ?? "") !== (before.description ?? "")
+        );
+      });
+    if (textChanged) return "regenerate";
+    const sum = (list: LineItem[]) => list.reduce((acc, item) => acc + item.amount, 0);
+    return sum(next) === sum(saved) ? "keep" : "sync";
+  }, [pending, quote.is_primary, quote.line_items, hasComparisons]);
+
+  const comparisonNote = {
+    keep: null,
+    sync: "비교견적서 금액도 인상률에 맞춰 함께 반영됩니다.",
+    regenerate: "상품 구성이 바뀌어, 비교견적서 문구도 함께 다시 씁니다 (10~20초).",
+  }[comparisonMode];
+
   const contactRequired = RECIPIENT_CONTACT_ENTITIES.includes(quote.entity_name);
   // 수신자·용역명은 선택 입력이라 여기 없다(2026-08-20) — 비워도 발급되고, 나중에 "정보 수정"에서
   // 채우면 그때 PDF에 반영된다.
@@ -1234,11 +1285,10 @@ function QuoteCard({
   ].filter(Boolean);
   const hasMissingRequired = missingRequiredFields.length > 0;
   const [infoExpanded, setInfoExpanded] = useState(false);
-  const [keepTotal, setKeepTotal] = useState(true);
   const [busyAction, setBusyAction] = useState<"commit" | "original" | "previous" | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const displayQuote = pending
-    ? { ...quote, line_items: pending.items, total_amount: computeGrandTotal(pending.items, vatIncluded) }
+    ? { ...quote, line_items: pending.items, total_amount: computeGrandTotal(pending.items) }
     : quote;
 
   async function runAction(kind: "commit" | "original" | "previous", fn: () => Promise<void>) {
@@ -1283,7 +1333,7 @@ function QuoteCard({
               <span className="ml-0.5 text-base font-medium text-slate-400">원</span>
             </p>
             {quote.line_items.length > 0 && (
-              <div className="mt-2 flex justify-end gap-2">
+              <div className="mt-2 flex items-center justify-end gap-1.5" aria-label="파일 다운로드">
                 {/* target="_blank"이 없으면 이 링크가 현재 탭의 "이동"으로 시작돼서, 미반영 수정이
                     남아 있을 때 beforeunload 핸들러가 걸려 크롬의 "사이트에서 나가시겠습니까?"
                     경고가 뜬다(2026-08-19 사용자 지적) — 실제로는 파일만 내려받고 페이지는 그대로
@@ -1293,23 +1343,27 @@ function QuoteCard({
                   href={getEntityQuotePdfUrl(quote.id)}
                   target="_blank"
                   rel="noopener"
-                  className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white transition hover:bg-indigo-700"
+                  title="PDF 다운로드"
+                  aria-label="PDF 다운로드"
+                  className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 text-xs font-semibold text-slate-600 transition hover:border-slate-300 hover:bg-slate-50 hover:text-slate-950"
                 >
                   <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                     <path d="M12 3v12m0 0 4-4m-4 4-4-4M5 20h14" />
                   </svg>
-                  PDF 다운로드
+                  <span>PDF</span>
                 </a>
                 <a
                   href={getEntityQuoteXlsxUrl(quote.id)}
                   target="_blank"
                   rel="noopener"
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-black/10 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-700 transition hover:bg-slate-100"
+                  title="엑셀 다운로드"
+                  aria-label="엑셀 다운로드"
+                  className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 text-xs font-semibold text-slate-600 transition hover:border-slate-300 hover:bg-slate-50 hover:text-slate-950"
                 >
                   <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                     <path d="M12 3v12m0 0 4-4m-4 4-4-4M5 20h14" />
                   </svg>
-                  엑셀 다운로드
+                  <span>엑셀</span>
                 </a>
               </div>
             )}
@@ -1386,30 +1440,14 @@ function QuoteCard({
                 <h3 className="text-sm font-bold text-slate-900">견적 항목</h3>
                 <p className="mt-0.5 text-xs text-slate-400">항목을 눌러 직접 수정할 수 있습니다.</p>
               </div>
-              <label
-                className="flex cursor-pointer items-center rounded-lg border border-black/10 bg-slate-50 px-2.5 py-1.5 transition hover:bg-slate-100"
-                title={
-                  keepTotal
-                    ? "항목 금액 변경 시 차액을 다른 항목에 자동 배분합니다."
-                    : "항목 금액을 변경하면 견적 총액도 함께 변경됩니다."
-                }
-              >
-                <ToggleSwitch
-                  checked={keepTotal}
-                  onLabel={keepTotal ? "총합계 유지" : "총합계 변경"}
-                />
-                <input
-                  type="checkbox"
-                  checked={keepTotal}
-                  onChange={() => setKeepTotal((value) => !value)}
-                  className="sr-only"
-                />
-              </label>
             </div>
             <div className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-100 bg-slate-50/70 px-3.5 py-2">
               <p className="text-xs text-slate-500">
                 {pending ? (
-                  <span className="font-semibold text-amber-700">저장되지 않은 변경사항</span>
+                  <span className="inline-flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                    <span className="font-semibold text-amber-700">저장되지 않은 변경사항</span>
+                    {comparisonNote && <span className="text-slate-500">{comparisonNote}</span>}
+                  </span>
                 ) : (
                   <span className="inline-flex items-center gap-1.5"><span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />저장됨</span>
                 )}
@@ -1429,11 +1467,15 @@ function QuoteCard({
                     <button
                       type="button"
                       disabled={busyAction !== null}
-                      title="미리보기 변경사항을 실제 견적서에 저장합니다."
-                      onClick={() => runAction("commit", onCommitPending)}
+                      title={comparisonNote ?? "미리보기 변경사항을 실제 견적서에 저장합니다."}
+                      onClick={() => runAction("commit", () => onCommitPending(comparisonMode))}
                       className="rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50"
                     >
-                      {busyAction === "commit" ? "반영하는 중…" : "수정 반영하기"}
+                      {busyAction === "commit"
+                        ? comparisonMode === "regenerate"
+                          ? "비교견적서 다시 쓰는 중…"
+                          : "반영하는 중…"
+                        : "수정 반영하기"}
                     </button>
                   </>
                 )}
@@ -1475,9 +1517,9 @@ function QuoteCard({
               columnLabels={quote.column_labels}
               detailColumnOrder={quote.detail_column_order}
               totalAmount={displayQuote.total_amount}
-              vatIncluded={vatIncluded}
-              showCategorySplit={quote.show_category_split}
-              keepTotal={keepTotal}
+              amountUsesWorkDays={quote.amount_uses_work_days}
+              amountUsesQuantity={quote.amount_uses_quantity}
+              showCategorySplit={false}
               onSaveLineItems={onStageLineItems}
             />
           </div>
@@ -1504,7 +1546,29 @@ function QuotePreviewPane({ quote }: { quote: EntityQuote }) {
     date: quote.quote_date,
   });
   const [loadedKey, setLoadedKey] = useState<string | null>(null);
-  const loading = loadedKey !== previewKey;
+  // 발급이 막힌 경우(비교견적이 본견적보다 싸면 409) iframe이 서버가 준 JSON을 날것으로
+  // 보여줬다(2026-08-21 사용자 지적). 먼저 상태를 확인해 사람이 읽을 문장으로 바꾼다.
+  //
+  // 어느 previewKey에 대한 결과인지 함께 담아둔다 — effect 본문에서 setState로 초기화하면
+  // 렌더가 연쇄되어 react-hooks/set-state-in-effect 린트에 걸린다. 키가 바뀌면 저장된 값이
+  // 자동으로 무효가 되므로 초기화 자체가 필요 없다.
+  const [blockedFor, setBlockedFor] = useState<{ key: string; message: string } | null>(null);
+  const blocked = blockedFor?.key === previewKey ? blockedFor.message : null;
+  const loading = loadedKey !== previewKey && !blocked;
+
+  useEffect(() => {
+    let alive = true;
+    fetch(getEntityQuotePdfUrl(quote.id, { inline: true, version: previewKey }))
+      .then(async (res) => {
+        if (!alive || res.ok) return;
+        const body = await res.json().catch(() => null);
+        setBlockedFor({ key: previewKey, message: body?.detail ?? "미리보기를 불러오지 못했습니다." });
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [quote.id, previewKey]);
 
   return (
     <div className="rounded-2xl border border-black/10 bg-white p-3 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
@@ -1522,15 +1586,27 @@ function QuotePreviewPane({ quote }: { quote: EntityQuote }) {
             <p className="text-xs text-gray-400">실제 양식을 불러오는 중…</p>
           </div>
         )}
+        {blocked ? (
+          <div className="flex h-full flex-col items-center justify-center gap-3 bg-amber-50 px-6 text-center">
+            <span className="grid h-9 w-9 place-items-center rounded-full bg-amber-100 text-amber-700">
+              <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" />
+              </svg>
+            </span>
+            <p className="text-sm font-semibold text-amber-900">아직 발급할 수 없습니다</p>
+            <p className="max-w-xs text-xs leading-relaxed text-amber-800">{blocked}</p>
+          </div>
+        ) : (
         <iframe
           key={previewKey}
-          src={`${getEntityQuotePdfUrl(quote.id, { inline: true })}#view=FitH`}
+          src={`${getEntityQuotePdfUrl(quote.id, { inline: true, version: previewKey })}#toolbar=0&navpanes=0&view=FitH`}
           title={`${quote.entity_name} 견적서 미리보기`}
           className="h-full w-full"
           onLoad={() => {
             setLoadedKey(previewKey);
           }}
         />
+        )}
       </div>
     </div>
   );
@@ -1543,11 +1619,14 @@ function PersistentEditChat({
 }: {
   quote: EntityQuote;
   messages: ChatMessage[];
-  onSend: (text: string) => Promise<void>;
+  onSend: (text: string, attachment?: ChatAttachment) => Promise<void>;
 }) {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  // 실무자가 쓰던 방식 그대로 — 견적서 파일을 붙여넣고 대화한다. PDF는 Claude가 직접 읽고,
+  // xlsx는 서버가 표 텍스트로 펴서 넣는다(2026-08-21).
+  const [attachment, setAttachment] = useState<ChatAttachment | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -1559,9 +1638,11 @@ function PersistentEditChat({
     setSending(true);
     setErrorMsg(null);
     const text = input;
+    const file = attachment;
+    setAttachment(null);
     setInput("");
     try {
-      await onSend(text);
+      await onSend(text, file ?? undefined);
     } catch (e) {
       setErrorMsg(e instanceof ApiError ? e.message : "수정에 실패했습니다.");
     } finally {
@@ -1570,7 +1651,7 @@ function PersistentEditChat({
   }
 
   return (
-    <aside className="estimate-chat-dock flex h-[560px] flex-col overflow-hidden rounded-2xl border border-black/10 bg-white shadow-[0_1px_2px_rgba(0,0,0,0.04)] xl:sticky xl:top-6 xl:h-[calc(100vh-3rem)]">
+    <aside className="estimate-chat-dock sticky top-20 flex h-[calc(100vh-6rem)] flex-col overflow-hidden rounded-2xl border border-black/10 bg-white shadow-[0_1px_2px_rgba(0,0,0,0.04)] min-[1900px]:top-6 min-[1900px]:h-[calc(100vh-3rem)]">
           <div className="border-b border-slate-100 px-5 py-4">
             <div className="flex items-center gap-2">
               <span className="grid h-8 w-8 place-items-center rounded-lg bg-slate-100 text-slate-700">
@@ -1625,6 +1706,34 @@ function PersistentEditChat({
           {errorMsg && <p className="px-5 pb-1 text-xs text-red-600">{errorMsg}</p>}
           <div className="border-t border-slate-100 p-4">
             <div className="rounded-xl border border-slate-200 bg-white p-2 transition focus-within:border-indigo-400 focus-within:ring-4 focus-within:ring-indigo-50">
+          {attachment && (
+            <div className="mx-3 mb-2 flex items-center justify-between gap-2 rounded-lg bg-slate-100 px-2.5 py-1.5 text-xs text-slate-600">
+              <span className="truncate">{attachment.filename}</span>
+              <button type="button" onClick={() => setAttachment(null)} className="shrink-0 text-slate-400 hover:text-slate-700">
+                제거
+              </button>
+            </div>
+          )}
+          <label className="mx-3 mb-2 inline-flex w-fit cursor-pointer items-center gap-1.5 rounded-lg border border-black/10 px-2.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50">
+            <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+              <path d="m21.4 11.1-9.2 9.2a5 5 0 0 1-7-7l9.2-9.2a3.3 3.3 0 1 1 4.7 4.7l-9.2 9.2a1.7 1.7 0 1 1-2.3-2.3l8.5-8.5" />
+            </svg>
+            견적서 첨부 (PDF · xlsx)
+            <input
+              type="file"
+              accept=".pdf,.xlsx,.xlsm"
+              className="hidden"
+              onChange={async (e) => {
+                const f = e.target.files?.[0];
+                e.target.value = "";
+                if (!f) return;
+                const buf = await f.arrayBuffer();
+                let bin = "";
+                new Uint8Array(buf).forEach((b) => (bin += String.fromCharCode(b)));
+                setAttachment({ filename: f.name, data: btoa(bin) });
+              }}
+            />
+          </label>
             <textarea
               rows={2}
               value={input}
@@ -1635,7 +1744,7 @@ function PersistentEditChat({
                   handleSend();
                 }
               }}
-              placeholder="수정할 내용을 입력하세요"
+              placeholder={attachment ? `${attachment.filename} 첨부됨 — 무엇을 할지 적어주세요` : "수정할 내용을 입력하세요"}
               className="w-full resize-none px-2 py-1 text-sm text-slate-900 outline-none placeholder:text-slate-400"
             />
             <div className="flex items-center justify-between gap-2 px-1 pb-0.5">
@@ -1756,6 +1865,12 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
   const [pendingByQuote, setPendingByQuote] = useState<Record<string, PendingEdit>>({});
   const pendingByQuoteRef = useRef(pendingByQuote);
   pendingByQuoteRef.current = pendingByQuote;
+  // 비교견적을 다시 써야 하는 상태 — 본견적 항목이 추가·삭제돼 1:1 대응이 깨졌을 때
+  // 백엔드가 알려준다. 금액만 바뀐 경우는 서버가 이미 자동 반영했으므로 여기 안 담긴다.
+  const [needsRegeneration, setNeedsRegeneration] = useState<string[]>([]);
+  const [regenerating, setRegenerating] = useState(false);
+  // 인상률 입력칸의 임시값(비교견적 id -> "15"). 저장은 다시 생성 시점에 한 번에 한다.
+  const [markupDraft, setMarkupDraft] = useState<Record<string, string>>({});
 
   const [moduleOptions, setModuleOptions] = useState<EntityModuleOptions[]>([]);
   const [moduleSelections, setModuleSelections] = useState<Record<string, string[]>>({});
@@ -1769,14 +1884,14 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
         handleCommitPending(viewedQuoteId);
       }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+     
   }, [viewedQuoteId]);
 
   useEffect(() => {
     return () => {
       Object.keys(pendingByQuoteRef.current).forEach((quoteId) => handleCommitPending(quoteId));
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+     
   }, []);
 
   useEffect(() => {
@@ -2106,29 +2221,51 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
   }
 
   // "수정 반영하기" — pending을 실제로 저장한다. 직접편집이든 채팅 수정이든 같은 경로로 커밋된다.
-  async function handleCommitPending(quoteId: string) {
+  async function handleCommitPending(quoteId: string, mode: ComparisonMode = "sync") {
     const pending = pendingByQuoteRef.current[quoteId];
     if (!pending) return;
-    const { entity_quote, synced_comparison_quotes } = await updateLineItems(
-      quoteId,
-      pending.items,
-      pending.editRequestText
-    );
+    const { entity_quote, synced_comparison_quotes, comparisons_need_regeneration } =
+      await updateLineItems(quoteId, pending.items, pending.editRequestText, mode);
+    setNeedsRegeneration(comparisons_need_regeneration);
     setPendingByQuote((prev) => {
       const next = { ...prev };
       delete next[quoteId];
       return next;
     });
-    // 본견적 수정은 백엔드에서 같은 세트의 비교견적 총액도 함께 재계산해(sync_service) 응답에
-    // 실어 보내준다 — 세트 전체를 다시 조회하지 않고 그 값으로 바로 병합한다(2026-08-17,
-    // 커밋 후 불필요한 전체 재조회 제거). setResult는 함수형 업데이트라 항상 최신 상태를
-    // 기준으로 병합되므로, 화면 이탈 시 자동 flush(useEffect cleanup)에서 호출돼도 안전하다.
+    // 본견적 금액을 바꾸면 비교견적 금액도 서버가 즉시 맞춰 응답에 실어 보낸다(AI 호출 없음,
+    // 2026-08-21) — 세트 전체를 다시 조회하지 않고 그 값으로 바로 병합한다. setResult는 함수형
+    // 업데이트라 항상 최신 상태 기준으로 병합되므로, 화면 이탈 시 자동 flush(useEffect
+    // cleanup)에서 호출돼도 안전하다.
     const updatedById = new Map([entity_quote, ...synced_comparison_quotes].map((q) => [q.id, q]));
     setResult((prev) =>
       prev
         ? { ...prev, entity_quotes: prev.entity_quotes.map((q) => updatedById.get(q.id) ?? q) }
         : prev
     );
+  }
+
+  // "비교견적 생성/다시 생성" — 확정된 본견적을 기준으로 AI가 항목을 다시 쓴다(10~20초).
+  // 인상률을 고쳐뒀으면 먼저 저장한 뒤 그 비율로 생성한다.
+  async function handleRegenerateComparisons() {
+    if (!result) return;
+    setRegenerating(true);
+    setError(null);
+    try {
+      const edits = Object.entries(markupDraft);
+      for (const [quoteId, raw] of edits) {
+        const percent = Number(raw);
+        if (Number.isFinite(percent) && percent > 0) {
+          await updateMarkupRatio(quoteId, 1 + percent / 100);
+        }
+      }
+      setMarkupDraft({});
+      setResult(await regenerateComparisons(result.id));
+      setNeedsRegeneration([]);
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "비교견적 생성에 실패했습니다.");
+    } finally {
+      setRegenerating(false);
+    }
   }
 
   // "되돌아가기" — pending을 버리고 마지막으로 저장된 상태로 화면을 되돌린다.
@@ -2155,7 +2292,7 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
     }));
   }
 
-  async function handleSendEdit(quoteId: string, text: string) {
+  async function handleSendEdit(quoteId: string, text: string, attachment?: ChatAttachment) {
     setChatHistory((prev) => ({
       ...prev,
       [quoteId]: [...(prev[quoteId] ?? []), { role: "user", text }],
@@ -2163,16 +2300,18 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
 
     // 채팅 수정도 미리보기 전용(edit_service)이라 여기서 바로 저장되지 않는다 — 직접편집과 같은
     // pending 상태에 얹어서, 화면에서 확인 후 "수정 반영하기"를 눌러야 실제로 커밋된다.
-    const editResult = await editEntityQuote(quoteId, text);
+    const editResult = await editEntityQuote(quoteId, text, attachment);
     setPendingByQuote((prev) => ({
       ...prev,
       [quoteId]: { items: editResult.entity_quote.line_items as LineItem[], editRequestText: text },
     }));
 
-    const summary =
-      editResult.changed_items.length > 0
-        ? editResult.changed_items.map((i) => `• ${i.name} → ${i.amount.toLocaleString()}원`).join("\n")
-        : "요청하신 내용을 반영했습니다.";
+    // 모델이 사람에게 하는 답을 그대로 띄운다 — 예전엔 "요청하신 내용을 반영했습니다."
+    // 고정 문구라 대화가 아니라 폼 제출 같았다(2026-08-21 채팅 리뉴얼).
+    const changedLines = editResult.changed_items
+      .map((i) => `• ${i.name} → ${i.amount.toLocaleString()}원`)
+      .join("\n");
+    const summary = [editResult.reply, changedLines].filter(Boolean).join("\n\n");
 
     setChatHistory((prev) => ({
       ...prev,
@@ -2209,7 +2348,7 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
             key={viewedQuote.id}
             quote={viewedQuote}
             messages={chatHistory[viewedQuote.id] ?? []}
-            onSend={(text) => handleSendEdit(viewedQuote.id, text)}
+            onSend={(text, attachment) => handleSendEdit(viewedQuote.id, text, attachment)}
           />
         )}
         <div className="mx-auto w-full max-w-[1500px] min-w-0 space-y-4">
@@ -2347,8 +2486,10 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
                 <span className="shrink-0 text-xs font-semibold text-slate-400">견적서 {displayQuotes.length}개</span>
                 {displayQuotes.map((q) => {
                   const selected = (viewedQuote?.id ?? primaryQuote?.id) === q.id;
+                  // 아직 생성 안 된 비교견적(총액 0)은 -100%로 표시되어 오해를 샀다
+                  // (2026-08-21 사용자 지적) — 항목이 생긴 뒤에만 증감률을 보여준다.
                   const diffPercent =
-                    !q.is_primary && primaryQuote && primaryQuote.total_amount > 0
+                    !q.is_primary && q.line_items.length > 0 && primaryQuote && primaryQuote.total_amount > 0
                       ? ((q.total_amount - primaryQuote.total_amount) / primaryQuote.total_amount) * 100
                       : null;
                   return (
@@ -2415,17 +2556,93 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
               </div>
             )}
 
+            {primaryQuote && primaryQuote.line_items.length > 0 && comparisonQuotes.length > 0 && (() => {
+              // 순차 흐름(2026-08-21): 본견적을 검토·수정한 뒤 여기서 비교견적을 만든다.
+              // 아직 안 만들었거나, 본견적 항목이 바뀌어 다시 써야 하는 상태면 눈에 띄게 띄운다.
+              const notYet = comparisonQuotes.every((q) => q.line_items.length === 0);
+              const stale = needsRegeneration.length > 0;
+              const highlight = notYet || stale;
+              return (
+                <div
+                  className={
+                    "rounded-2xl border p-4 " +
+                    (highlight ? "border-amber-300 bg-amber-50" : "border-black/10 bg-white")
+                  }
+                >
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-bold text-slate-900">
+                        {notYet
+                          ? "2단계 — 비교견적서 생성"
+                          : stale
+                            ? "본견적 항목이 바뀌었습니다"
+                            : "비교견적서"}
+                      </p>
+                      <p className="mt-0.5 text-xs text-slate-500">
+                        {notYet
+                          ? "본견적서를 검토·수정한 뒤 생성하세요. 확정된 본견적을 기준으로 같은 과업을 다른 표현·다른 금액으로 다시 씁니다."
+                          : stale
+                            ? "항목이 추가·삭제되어 비교견적과 1:1로 대응하지 않습니다. 다시 생성해야 발급할 수 있습니다."
+                            : "금액만 바뀐 경우는 자동으로 반영됩니다. 항목 문장까지 다시 쓰려면 아래에서 생성하세요."}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleRegenerateComparisons}
+                      disabled={regenerating}
+                      className={
+                        "shrink-0 rounded-lg px-4 py-2 text-sm font-semibold text-white transition disabled:opacity-50 " +
+                        (highlight ? "bg-amber-600 hover:bg-amber-700" : "bg-slate-900 hover:bg-slate-800")
+                      }
+                    >
+                      {regenerating ? "생성 중… (10~20초)" : notYet ? "비교견적서 생성" : "비교견적서 다시 생성"}
+                    </button>
+                  </div>
+                  <div className="mt-3 flex flex-wrap gap-2 border-t border-black/5 pt-3">
+                    {comparisonQuotes.map((q) => {
+                      const current = Math.round(((q.markup_ratio ?? 1.1) - 1) * 100);
+                      return (
+                        <label
+                          key={q.id}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-black/10 bg-white px-2.5 py-1.5 text-xs"
+                        >
+                          <span className="font-medium text-slate-700">{q.entity_name}</span>
+                          <span className="text-slate-400">+</span>
+                          <input
+                            type="number"
+                            min={1}
+                            max={200}
+                            value={markupDraft[q.id] ?? String(current)}
+                            onChange={(e) =>
+                              setMarkupDraft((prev) => ({ ...prev, [q.id]: e.target.value }))
+                            }
+                            className="w-14 rounded border border-black/10 px-1.5 py-0.5 text-right tabular-nums outline-none focus:border-slate-900"
+                          />
+                          <span className="text-slate-400">%</span>
+                          {needsRegeneration.includes(q.id) && (
+                            <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-bold text-amber-700">
+                              재생성 필요
+                            </span>
+                          )}
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })()}
+
             {viewedQuote && (
               <QuoteCard
                 key={viewedQuote.id}
                 quote={viewedQuote}
-                vatIncluded={result.vat_included}
                 pending={pendingByQuote[viewedQuote.id] ?? null}
+                hasComparisons={comparisonQuotes.length > 0}
                 onSaveServiceName={(value) => handleSaveServiceName(viewedQuote.id, value)}
                 onSaveQuoteDate={(value) => handleSaveQuoteDate(viewedQuote.id, value)}
                 onSaveRecipientInfo={(input) => handleSaveRecipientInfo(viewedQuote.id, input)}
                 onStageLineItems={(items) => handleStageLineItems(viewedQuote.id, items)}
-                onCommitPending={() => handleCommitPending(viewedQuote.id)}
+                onCommitPending={(mode) => handleCommitPending(viewedQuote.id, mode)}
                 onDiscardPending={() => handleDiscardPending(viewedQuote.id)}
                 onRevertToOriginal={() => handleRevertToVersion(viewedQuote.id, "original")}
                 onRevertToPrevious={() => handleRevertToVersion(viewedQuote.id, "previous")}

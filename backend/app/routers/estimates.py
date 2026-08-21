@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, Response
 
@@ -12,14 +12,14 @@ from app.models.estimate import (
     GenerateRequest,
     EntityQuoteOut,
     LineItemsUpdate,
+    MarkupRatioUpdate,
     LineItemsUpdateResult,
     QuoteDateUpdate,
     QuoteVersionOut,
     RecipientInfoUpdate,
     ServiceNameUpdate,
 )
-from app.services import estimate_service, generation_service, pdf_service
-from app.services import edit_service
+from app.services import chat_service, estimate_service, generation_service, pdf_service
 
 router = APIRouter(prefix="/api/estimate-sets", tags=["estimates"])
 entity_quotes_router = APIRouter(prefix="/api/entity-quotes", tags=["entity-quotes"])
@@ -57,7 +57,9 @@ def generate_estimate_set(estimate_set_id: str, payload: GenerateRequest = Gener
 
 @entity_quotes_router.post("/{entity_quote_id}/edit", response_model=EditResult)
 def edit_entity_quote(entity_quote_id: str, payload: EditRequest):
-    return edit_service.edit_entity_quote(entity_quote_id, payload.edit_request_text)
+    return chat_service.edit_entity_quote(
+        entity_quote_id, payload.edit_request_text, payload.attachment.model_dump() if payload.attachment else None
+    )
 
 
 @entity_quotes_router.patch("/{entity_quote_id}/service-name", response_model=EntityQuoteOut)
@@ -75,11 +77,23 @@ def update_recipient_info(entity_quote_id: str, payload: RecipientInfoUpdate):
     return estimate_service.update_recipient_info(entity_quote_id, payload)
 
 
+@router.post("/{estimate_set_id}/regenerate-comparisons", response_model=EstimateSetOut)
+def regenerate_comparisons(estimate_set_id: str):
+    """확정된 본견적을 기준으로 비교견적만 다시 만든다. 본견적 저장이 비교견적을 자동으로
+    건드리지 않게 되면서(sync_service 폐기, 2026-08-21) 이 버튼이 그 유일한 경로가 됐다."""
+    return generation_service.regenerate_comparisons(estimate_set_id)
+
+
 @entity_quotes_router.put("/{entity_quote_id}/line-items", response_model=LineItemsUpdateResult)
 def update_line_items(entity_quote_id: str, payload: LineItemsUpdate):
     return estimate_service.update_line_items(
-        entity_quote_id, payload.items, payload.edit_request_text or "직접편집"
+        entity_quote_id, payload.items, payload.edit_request_text or "직접편집", payload.comparison_mode
     )
+
+
+@entity_quotes_router.put("/{entity_quote_id}/markup-ratio", response_model=EntityQuoteOut)
+def update_markup_ratio(entity_quote_id: str, payload: MarkupRatioUpdate):
+    return estimate_service.update_markup_ratio(entity_quote_id, payload.markup_ratio)
 
 
 @entity_quotes_router.get("/{entity_quote_id}/versions", response_model=List[QuoteVersionOut])
@@ -88,20 +102,27 @@ def list_quote_versions(entity_quote_id: str):
 
 
 @entity_quotes_router.get("/{entity_quote_id}/pdf")
-def download_entity_quote_pdf(entity_quote_id: str, inline: bool = False):
+def download_entity_quote_pdf(entity_quote_id: str, inline: bool = False, v: Optional[str] = None):
     # inline=True는 프론트엔드 미리보기 iframe 전용(Content-Disposition: attachment면
     # 브라우저가 iframe 안에서 PDF를 렌더링하지 않고 무시한다). 다운로드 버튼은 기본값(attachment) 그대로 쓴다.
+    estimate_service.assert_issuable(entity_quote_id)
     pdf_bytes = pdf_service.render_entity_quote_pdf(entity_quote_id)
     disposition = "inline" if inline else "attachment"
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'{disposition}; filename="quote-{entity_quote_id[:8]}.pdf"'},
+        headers={
+            "Content-Disposition": f'{disposition}; filename="quote-{entity_quote_id[:8]}.pdf"',
+            # v(견적 내용 해시)가 붙은 미리보기 요청만 캐시한다 — 내용이 바뀌면 URL이 바뀌므로
+            # 낡은 PDF가 보일 일이 없다. 다운로드 버튼(v 없음)은 항상 새로 만든다.
+            **({"Cache-Control": "private, max-age=3600"} if v else {"Cache-Control": "no-store"}),
+        },
     )
 
 
 @entity_quotes_router.get("/{entity_quote_id}/xlsx")
 def download_entity_quote_xlsx(entity_quote_id: str):
+    estimate_service.assert_issuable(entity_quote_id)
     xlsx_bytes = pdf_service.render_entity_quote_xlsx(entity_quote_id)
     return Response(
         content=xlsx_bytes,

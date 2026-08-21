@@ -1,4 +1,5 @@
 from functools import lru_cache
+import re
 from typing import List, Optional, Tuple
 
 from app.config import get_supabase
@@ -57,7 +58,8 @@ def _fetch_catalog_rows(entity_id: str, task_type: str) -> List[dict]:
         supabase.table("item_catalogs")
         .select(
             "module_name, mid_category, item_name, historical_ratio, is_required, "
-            "standard_description, sort_order, alt_group, module_weight"
+            "standard_description, sort_order, alt_group, module_weight, "
+            "work_days, quantity, unit_price"
         )
         .eq("entity_id", entity_id)
         .eq("task_type", task_type)
@@ -237,9 +239,34 @@ def get_catalog_for_generation(
             item_name=r["item_name"],
             historical_ratio=float(r["historical_ratio"]) if r["historical_ratio"] is not None else None,
             is_required=r["is_required"],
-            standard_description=r["standard_description"],
+            standard_description=normalize_description(r["standard_description"]),
+            work_days=float(r.get("work_days") or 1),
+            quantity=float(r.get("quantity") or 1),
+            unit_price=float(r["unit_price"]) if r.get("unit_price") is not None else None,
             module_weight=float(r["module_weight"]) if r.get("module_weight") is not None else None,
         )
         for r in filtered_rows
     ]
     return CatalogResult(items=items, is_borrowed=is_borrowed, source_entity_name=source_name, has_catalog=bool(rows))
+
+
+# 상품구성은 "1. A / 2. B / 3. C"처럼 슬래시로 이어 붙은 카탈로그가 있고(알파브라더스),
+# 줄바꿈으로 저장된 카탈로그가 있다(테스티파이). 발급 양식의 "상품구성" 칸은 PRD 6.2가
+# 명시한 대로 세로형 개조식이어야 하는데, 슬래시 버전은 한 줄로 죽 이어져 읽기 어려웠다
+# (2026-08-21 사용자 지적). 번호 앞에서만 줄을 나눠 두 형식을 하나로 맞춘다.
+# 번호 표기가 카탈로그마다 다르고(1. / 1)) 구분자도 다르다(슬래시 / 공백만). 뒤에 "숫자." 또는
+# "숫자)"가 오는 자리에서만 자른다 — 내용에 들어있는 슬래시("Macro/Micro")나 숫자("카페24
+# 기반", "20~40만원")는 마커가 아니라서 그대로 남는다.
+_NUMBERED_SPLIT = re.compile(r"\s*/?\s+(?=\d{1,2}[.)]\s)")
+
+
+def normalize_description(text: Optional[str]) -> Optional[str]:
+    """상품구성을 세로형 개조식(줄바꿈 구분)으로 통일한다.
+
+    "1. A / 2. B" -> "1. A\n2. B". 번호가 없는 설명("- 대행사 결제수단을 통해 …")이나 이미
+    줄바꿈으로 나뉜 설명은 건드리지 않는다 — 슬래시가 내용의 일부인 경우(예: "Macro/Micro
+    기반의 스크립트 작성")를 자르면 안 되므로, 뒤에 "숫자."가 오는 슬래시만 자른다.
+    """
+    if not text:
+        return text
+    return _NUMBERED_SPLIT.sub("\n", text)

@@ -12,9 +12,9 @@ from typing import List, Optional
 
 from pydantic import BaseModel, ValidationError
 
-from app.config import CLAUDE_MODEL, get_anthropic
+from app.config import CLAUDE_MAX_TOKENS, CLAUDE_MODEL, get_anthropic
 from app.models.catalog import ModuleGroup
-from app.services.allocation_service import extract_json
+from app.services.quote_prompts import extract_json
 
 SYSTEM_PROMPT = (
     "당신은 견적서에 어떤 항목 구성을 담을지 결정하는 담당자입니다. 카탈로그에는 두 종류의 "
@@ -67,7 +67,7 @@ def _call_claude_for_selection(
     for _ in range(2):
         message = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=1024,
+            max_tokens=CLAUDE_MAX_TOKENS,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_content}],
         )

@@ -29,7 +29,7 @@ from xml.sax.saxutils import escape
 from fastapi import HTTPException
 
 from app.config import get_supabase
-from app.services import allocation_service, catalog_service, template_storage, xlsx_rows
+from app.services import catalog_service, quote_pricing, template_storage, xlsx_rows
 
 CellUpdates = Dict[str, Any]  # 셀 좌표("H16") -> 값(str|int|float|None). None이면 값을 비운다.
 
@@ -948,40 +948,8 @@ def _formula_references_column(sheet_xml: str, coord: str, col_letter: str) -> b
     return bool(re.search(rf"\b{re.escape(col_letter)}\d+\b", f_match.group(1)))
 
 
-def _fetch_work_days_quantity_map(supabase, catalog_entity_id: str, task_type: str) -> Dict[str, List[dict]]:
-    """item_name -> 그 이름을 가진 카탈로그 행 목록(같은 이름이 여러 모듈에 있을 수 있어 리스트).
-    항목마다 Supabase에 따로 조회하면 왕복이 항목 수만큼 쌓여 눈에 띄게 느려진다(2026-08-09
-    실측 — 12개 항목 순차 조회에 약 2.4초, Claude 호출 1번과 맞먹는 시간) — 견적 1건당
-    (법인×과업종류) 카탈로그를 한 번만 통째로 가져와 메모리에서 찾는다."""
-    res = (
-        supabase.table("item_catalogs")
-        .select("module_name, item_name, work_days, quantity, unit_price")
-        .eq("entity_id", catalog_entity_id)
-        .eq("task_type", task_type)
-        .eq("is_current", True)
-        .execute()
-    )
-    by_name: Dict[str, List[dict]] = {}
-    for row in res.data:
-        by_name.setdefault(row["item_name"], []).append(row)
-    return by_name
 
 
-def _lookup_catalog_pricing(
-    catalog_map: Dict[str, List[dict]], module_name: str, item_name: str
-) -> tuple[float, float, Optional[float]]:
-    """(작업일, 수량, 표준단가) — 표준단가는 실제 발급본에서 확인된 항목만 값이 있다(043)."""
-    rows = catalog_map.get(item_name)
-    if not rows:
-        return 1.0, 1.0, None
-    exact = [r for r in rows if r["module_name"] == module_name]
-    row = exact[0] if exact else rows[0]
-    # 표준 단가는 모듈까지 정확히 맞을 때만 쓴다 — 항목명이 같아도 모듈이 다르면 완전히 다른
-    # 가격이다(통합 패키지의 "사용성 테스트"는 500만원짜리 묶음, 사용성 테스트 모듈의 같은 이름
-    # 항목은 세부 작업). 항목을 카테고리 소계 한 줄로 접는 경우(_rollup_to_category_totals)
-    # 이름이 모듈명으로 바뀌어 엉뚱한 행에 붙을 수 있다(2026-08-20 재현).
-    unit_price = row.get("unit_price") if exact else None
-    return float(row["work_days"]), float(row["quantity"]), float(unit_price) if unit_price else None
 
 
 def get_column_display(supabase, entity_id: str, task_types: List[str], selected_modules: Optional[list]) -> Dict[str, Any]:
@@ -993,8 +961,14 @@ def get_column_display(supabase, entity_id: str, task_types: List[str], selected
     try:
         template = _resolve_host_templates(supabase, entity_id, task_types, selected_modules)[0]
     except HTTPException:
-        return {"column_labels": {}, "detail_column_order": []}
+        return {
+            "column_labels": {},
+            "detail_column_order": [],
+            "amount_uses_work_days": False,
+            "amount_uses_quantity": True,
+        }
     cell_map = template["cell_map"]
+    form = resolve_form_spec(supabase, entity_id, task_types, selected_modules)
     order = list(cell_map.get("detail_column_order", []))
     columns = cell_map.get("columns", {})
     if "description" in columns and "description" not in order:
@@ -1008,7 +982,44 @@ def get_column_display(supabase, entity_id: str, task_types: List[str], selected
         "show_category_split": any(
             block.get("category_large_cell") for block in cell_map.get("item_blocks", [])
         ),
+        # 화면 편집이 발급본과 같은 식으로 금액을 계산해야 한다 — 법인마다 수식이 달라서
+        # (알파브라더스 단가×작업일×수량 / 블렌디드랩 =단가) 프론트엔드가 "단가×수량"으로
+        # 하드코딩하면 단가를 고치는 순간 화면과 발급본이 갈린다(2026-08-21 발견).
+        **{
+            "amount_uses_work_days": form.uses_work_days,
+            "amount_uses_quantity": form.uses_quantity,
+        },
     }
+
+
+def resolve_form_spec(
+    supabase, entity_id: str, task_types: List[str], selected_modules: Optional[list]
+) -> quote_pricing.FormSpec:
+    """이 견적서가 쓸 양식의 금액 규칙(FormSpec)을 마스터 xlsx에서 직접 읽어 온다.
+
+    생성 시점에 필요하다 — AI에게 "이 양식의 공급가액은 단가×수량이다"라고 알려주고, 받은
+    결과를 같은 규칙으로 검산해야 화면 총액과 발급본 총액이 갈리지 않는다(2026-08-21 재설계).
+    과업종류를 교차 선택한 견적서는 실제 배정 시점에야 어느 시트가 쓰일지 확정되므로
+    get_column_display와 같은 기준(1순위 후보)으로 근사한다 — 후보들끼리 수식이 다른 경우는
+    알파브라더스 통합 패키지뿐이고, 그건 모듈 선택으로 이미 갈린다.
+
+    템플릿을 못 찾거나 시트를 못 읽으면 기본값(단가×수량)으로 대체한다. 다섯 법인 중 넷이
+    그 규칙이라 최악의 경우에도 발급본이 깨지지 않고, 미리보기가 생성 자체를 막지 않는다.
+    """
+    try:
+        template = _resolve_host_templates(supabase, entity_id, task_types, selected_modules)[0]
+        cell_map = template["cell_map"]
+        blocks = cell_map.get("item_blocks") or []
+        source = template_storage.download(template["storage_path"])
+        sheet_xml = _read_sheet_xml(source, template["sheet_name"])
+    except (HTTPException, KeyError, IndexError, ValueError):
+        return quote_pricing.FormSpec()
+    return quote_pricing.detect_form(
+        sheet_xml,
+        cell_map.get("columns", {}),
+        blocks[0]["rows"][0],
+        labels=cell_map.get("column_labels", {}),
+    )
 
 
 def _find_quote_template(supabase, entity_id: str, task_type: str, selected_modules: Optional[list]) -> dict:
@@ -1147,7 +1158,22 @@ def _group_line_items(line_items: List[dict]) -> List[Dict[str, Any]]:
     return groups
 
 
-def _rollup_to_category_totals(groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _is_name_only_form(columns: Dict[str, str], blocks: List[dict]) -> bool:
+    """품명 한 칸에 모든 걸 담아야 하는 양식인가 (블렌디드랩·썬데이워커).
+
+    구분(대)/구분(중) 칸도, 상품구성 칸도 없으면 세부 항목을 따로 적을 자리가 없다. 이런
+    양식에 세부 항목을 행으로 늘려 담으면 "위클리 성과 리뷰 세션" 같은 낱개 이름만 죽 나열되어
+    무슨 묶음인지 알 수 없다 — 실제 발급본은 "퍼포먼스 그로스 운영 (위클리 성과 리뷰 세션 /
+    주간 실행 태스크 처리)"처럼 구분명 뒤 괄호에 세부를 넣는다(2026-08-21 사용자 지적).
+    """
+    if "description" in columns or "category_mid" in columns:
+        return False
+    return not any(b.get("category_large_cell") or b.get("category_mid_cell") for b in blocks)
+
+
+def _rollup_to_category_totals(
+    groups: List[Dict[str, Any]], inline_names: bool = False
+) -> List[Dict[str, Any]]:
     """카테고리별 세부 항목을 카테고리당 한 줄(소계)로 합친다.
 
     썬데이워커 마케팅처럼 카탈로그가 테스티파이 것을 그대로 빌려써서 세부 항목이 12개인데
@@ -1161,21 +1187,29 @@ def _rollup_to_category_totals(groups: List[Dict[str, Any]]) -> List[Dict[str, A
     description을 채워둔 경우(2026-08, 마케팅+시장검증 교차선택 등)가 있는데, 여기서 "1. 그
     항목명" 한 줄로 다시 합치면 원래 있던 더 풍부한 설명을 지워버리게 된다(2026-08-10 발견).
     "묶을 세부 항목"이 실제로 여러 개일 때만(예: 통합 패키지의 5개 하위 모듈) 합친다."""
-    return [
-        g if len(g["items"]) <= 1 else {
+    def folded(g: Dict[str, Any]) -> Dict[str, Any]:
+        names = [it["name"] for it in g["items"]]
+        # 상품구성 칸이 없는 양식은 세부를 적을 데가 여기뿐이라 품명 뒤 괄호에 넣는다.
+        # 괄호는 반드시 **다음 줄**에서 시작한다 — 품명 옆에 바로 붙으면 어디까지가 품명인지
+        # 구분이 안 됐다(2026-08-21 사용자 지적). 칸 폭을 넘치면 _plan_text_fitting이 괄호
+        # 안에서 다시 줄을 바꿔 담고 행 높이를 늘린다.
+        name = f"{g['category']}\n({' / '.join(names)})" if inline_names else g["category"]
+        return {
             "category": g["category"],
             "amount": g["amount"],
             "items": [{
                 "category": g["category"],
-                "name": g["category"],
+                "name": name,
                 "amount": g["amount"],
                 # 그룹 안 항목은 전부 같은 category(=module_name)라 같은 과업종류에 속한다.
                 "task_type": g["items"][0].get("task_type") if g["items"] else None,
-                "description": "\n".join(f"{i + 1}. {it['name']}" for i, it in enumerate(g["items"])),
+                "description": None if inline_names else "\n".join(
+                    f"{i + 1}. {it['name']}" for i, it in enumerate(g["items"])
+                ),
             }],
         }
-        for g in groups
-    ]
+
+    return [g if len(g["items"]) <= 1 else folded(g) for g in groups]
 
 
 def _try_assign_flat(groups: List[Dict[str, Any]], flat_blocks: List[dict]) -> Optional[List[tuple]]:
@@ -1231,7 +1265,12 @@ def _assign_groups_to_blocks(
         if assignments is not None:
             return assignments
         if allow_rollup:
-            assignments = _try_assign_flat(_rollup_to_category_totals(groups), flat_blocks)
+            # 품명 한 칸짜리 양식(블렌디드랩·썬데이워커)은 세부를 적을 다른 칸이 없어
+            # 품명 뒤 괄호에 넣는다: "퍼포먼스 그로스 운영 (위클리 성과 리뷰 / 주간 실행)".
+            assignments = _try_assign_flat(
+                _rollup_to_category_totals(groups, inline_names=_is_name_only_form(columns, blocks)),
+                flat_blocks,
+            )
             if assignments is not None:
                 return assignments
         total_capacity = sum(len(b["rows"]) for b in flat_blocks)
@@ -1288,39 +1327,6 @@ def _try_assign_labeled(groups: List[Dict[str, Any]], blocks: List[dict]) -> Opt
     return assignments
 
 
-def _compute_item_pricing(
-    catalog_map: Dict[str, List[dict]],
-    columns: Dict[str, str],
-    sheet_xml: str,
-    category: str,
-    item: dict,
-    row: int,
-) -> tuple:
-    if item.get("unit_price") is not None and item.get("work_days") is not None and item.get("quantity") is not None:
-        # 사용자가 화면에서 직접 입력·수정했거나 생성 시 계산해 저장해둔 값을 그대로 쓴다 —
-        # 발급 시점에 카탈로그 기준으로 다시 역산하면 화면에서 본 값과 실제 PDF가 달라질 수
-        # 있다(2026-08-09, 직접편집 대상을 단가/작업일/투입인력까지 확장하며 추가).
-        return item["unit_price"], item["work_days"], item["quantity"], None
-    work_days, quantity, standard_unit_price = _lookup_catalog_pricing(catalog_map, category, item["name"])
-    uses_work_days = "supply_amount" in columns and "work_days" in columns and _formula_references_column(
-        sheet_xml, f"{columns['supply_amount']}{row}", columns["work_days"]
-    )
-    if standard_unit_price:
-        # 표준 단가가 있는 항목(043)은 "이 항목이 다른 항목보다 얼마나 비싼가"라는 상대 중요도를
-        # 그대로 들고 있다. 총액이 달라지면 이 단가들을 통째로 같은 배율로 환산해 중요도를
-        # 유지한다 — 배율은 견적서 전체를 봐야 정해지므로 여기서는 기준값만 돌려주고, 실제
-        # 환산은 compute_line_item_pricing이 한다(2026-08-20 사용자 요구).
-        # 수량·작업일은 카탈로그가 정한 업무량이라 금액을 맞추려고 건드리지 않는다.
-        return standard_unit_price, work_days, quantity, quantity * (work_days if uses_work_days else 1)
-    divisor = quantity * (work_days if uses_work_days else 1)
-    # 반올림하면 안 된다 — 이 단가 셀 자체는 그냥 값이어도, 같은 행의 공급가액 셀은 원본에
-    # 수식(=단가*작업일*수량 등)으로 들어있어 우리가 넣은 amount를 무시하고 이 단가로 다시
-    # 계산한다(_patch_sheet_xml이 수식 셀은 캐시만 지우고 값은 안 덮어씀). round()로 단가가
-    # 살짝 어긋나면 그 오차가 공급가액→카테고리 소계→합계까지 그대로 누적돼, 화면(웹) 총액과
-    # 실제 PDF 총액이 달라지는 원인이었다(2026-08-11 확인). 나눗셈이 딱 안 떨어지면 정수가
-    # 아닌 값을 그대로 쓴다 — 셀 서식이 화면에는 반올림해 보여주므로 표시는 그대로다.
-    unit_price = item["amount"] / divisor if divisor else item["amount"]
-    return unit_price, work_days, quantity, None
 
 
 def _derive_extra_columns(columns: Dict[str, str], amount: float, work_days: float, quantity: float) -> Dict[str, float]:
@@ -1337,11 +1343,6 @@ def _derive_extra_columns(columns: Dict[str, str], amount: float, work_days: flo
     return extra
 
 
-def _build_catalog_maps(supabase, catalog_entity_id_by_task_type: Dict[str, str]) -> Dict[str, Dict[str, List[dict]]]:
-    return {
-        task_type: _fetch_work_days_quantity_map(supabase, catalog_entity_id, task_type)
-        for task_type, catalog_entity_id in catalog_entity_id_by_task_type.items()
-    }
 
 
 def _collapse_by_task_type(line_items: List[dict], task_types: List[str]) -> List[dict]:
@@ -1521,7 +1522,12 @@ def _assignment_attempts(template: dict, source_bytes: bytes, sheet_xml: str, gr
     2번을 3번보다 먼저 두는 게 핵심이다 — 순서가 반대면 자리가 모자랄 때 조용히 접혀서
     세부 항목(상품명·상품구성)이 소계 한 줄로 사라진다(2026-08-19 재현).
     """
+    columns = template["cell_map"].get("columns", {})
+    blocks = template["cell_map"].get("item_blocks", [])
     yield template, source_bytes, sheet_xml, False
+    if _is_name_only_form(columns, blocks):
+        # 품명 한 칸짜리 양식은 행을 늘리기 전에 먼저 묶는다 — 늘려봐야 낱개 이름만 나열된다.
+        yield template, source_bytes, sheet_xml, True
     grown = _grow_template(template, source_bytes, groups)
     if grown is not None:
         yield (*grown, False)
@@ -1577,183 +1583,10 @@ def _resolve_assignment(
     raise last_error or HTTPException(status_code=422, detail="이 견적서를 담을 수 있는 양식을 찾지 못했습니다.")
 
 
-def compute_line_item_pricing(
-    supabase,
-    entity_id: str,
-    task_types: List[str],
-    selected_modules: Optional[list],
-    catalog_entity_id_by_task_type: Dict[str, str],
-    line_items: List[dict],
-    unit: int = allocation_service.UNIT_PRICE_UNIT,
-    target_supply: Optional[int] = None,
-) -> List[dict]:
-    """line_items(name/amount/category, 각 항목에 task_type 포함)에 unit_price/work_days/quantity를
-    채워 반환한다.
-
-    미리보기 UI와 PDF 발급이 이 함수 하나로 계산해 서로 다른 값이 나오지 않게 한다(2026-07-10,
-    미리보기 컬럼 확장). 템플릿을 아직 못 찾거나(구형 .xls 등) 항목이 양식 행 수를 넘는 등
-    계산이 안 되는 경우엔 미리보기가 생성 자체를 막으면 안 되므로, 실패시키지 않고
-    단가=배분금액·작업일=수량=1로 대체한다 — 실제 PDF 발급 시의 엄격한 검증(_collect_item_block_updates)과는
-    다르다.
-
-    여기가 단가·공급가액을 단위(기본 10만원)로 떨어뜨리는(allocation_service.snap_unit_price) 유일한
-    지점이다 — 항목 자동생성(generation_service)과 채팅 수정(edit_service)이 둘 다 여기를
-    거치므로 한쪽만 단위가 안 맞는 일이 없다(2026-08-20). 그 대신 스냅 뒤 소계가 조금 달라지므로
-    총액은 반드시 이 함수의 결과에서 다시 합산해야 한다. 비교견적서는 호출부가
-    unit=COMPARISON_AMOUNT_UNIT(100만원)을 넘겨 더 굵은 단위로 스냅한다(2026-08-20 사용자 요구
-    — 비교견적서에 만원/1000원/100원/1원 단위 금액이 나오면 안 됨).
-
-    target_supply를 주면 스냅으로 벌어진 차액을 다시 목표 공급가액으로 되돌린다
-    (allocation_service.reconcile_snapped_items) — 최초 생성처럼 "사용자가 입력한 총액"이라는
-    기준이 있는 경우엔 반드시 넘겨야 한다. 채팅/직접 편집은 총액이 바뀌는 게 정상이라 안 넘긴다.
-    """
-    try:
-        _template, _source_bytes, sheet_xml, columns, assignments = _resolve_assignment(
-            supabase, entity_id, task_types, selected_modules, line_items
-        )
-    except HTTPException:
-        columns, assignments = {}, None
-
-    plans: List[tuple] = []  # (항목, 단가, 작업일, 수량, 표준단가 배수(None이면 표준단가 아님))
-    if assignments is None:
-        plans = [(item, item["amount"], 1.0, 1.0, None) for item in line_items]
-    else:
-        catalog_maps = _build_catalog_maps(supabase, catalog_entity_id_by_task_type)
-        for block, group, row_offset in assignments:
-            rows = block["rows"]
-            for i, item in enumerate(group["items"]):
-                row_index = row_offset + i
-                if row_index >= len(rows):
-                    plans.append((item, item["amount"], 1.0, 1.0, None))
-                    continue
-                catalog_map = catalog_maps.get(item.get("task_type"), {})
-                plans.append(
-                    (item,)
-                    + _compute_item_pricing(
-                        catalog_map, columns, sheet_xml, group["category"], item, rows[row_index]
-                    )
-                )
-
-    plans = _scale_standard_unit_prices(plans)
-    if any(plan[4] for plan in plans):
-        # 표준 단가(043)가 섞인 견적서는 비교견적서라도 10만원 단위로 다룬다 — 100만원 단위로
-        # 밀면 실제 발급본의 단가 구성(자사몰 구축 300만 : 마케팅 전략안 10만)이 통째로
-        # 무너진다(2026-08-20 확인). 100만원 단위 규칙의 목적(만원·천원 단위 방지)은 표준 단가가
-        # 이미 10만원 배수라 그대로 달성된다.
-        unit = allocation_service.UNIT_PRICE_UNIT
-    enriched = [
-        _snapped(item, unit_price, work_days, quantity, columns, unit, span)
-        for item, unit_price, work_days, quantity, span in plans
-    ]
-
-    if target_supply:
-        enriched = allocation_service.reconcile_snapped_items(enriched, target_supply, unit)
-        # tax_amount/input_mm는 공급가액에서 파생되므로 금액이 조정된 뒤 다시 계산한다.
-        for item in enriched:
-            item.update(_derive_extra_columns(columns, item["amount"], item["work_days"], item["quantity"]))
-    return enriched
 
 
-def _scale_standard_unit_prices(plans: List[tuple]) -> List[tuple]:
-    """표준 단가(043) 항목들의 단가를 목표 금액에 맞춰 통째로 같은 배율로 환산한다.
-
-    2026-08-20 사용자 요구 — "아무리 총 금액이 달라져도 세부 항목의 단가를 비율로 환산해서
-    중요도를 유지해야 한다(자사몰 구축은 원래 다른 항목보다 비싸다)". 카탈로그의 표준 단가
-    세트가 그 중요도 자체이므로, 항목별로 따로 반올림하지 않고 세트 전체에 배율 하나를 곱한다.
-
-    배율 = (이 항목들에 배분된 금액의 합) ÷ (표준 단가 기준 금액의 합).
-    분자는 AI가 정한 모듈 간 배분을 존중하고, 분모는 카탈로그의 상대 중요도를 담고 있다 —
-    결과적으로 모듈 간 비중은 AI가, 모듈 안의 항목 간 비중은 카탈로그가 정한다.
-    환산 후 단가는 10만원 단위로 떨어뜨린다(실제 발급본의 모든 단가가 10만원의 배수다).
-
-    그 10만원 반올림 때문에 합계가 목표에서 조금 벗어나는데, 그 잔액을 뒤에서 항목별로
-    메우면(reconcile_snapped_items) 작은 항목이 통째로 3배가 되어 중요도가 깨진다
-    (100,000원짜리 마케팅 전략안이 300,000원이 됨 — 2026-08-20 확인). 그래서 잔액을 나중에
-    메우는 대신, 반올림까지 끝낸 합계가 목표와 정확히 맞는 배율을 이분 탐색으로 찾는다.
-    배율이 커지면 합계는 계단식으로 단조 증가하므로 탐색이 성립한다.
-    """
-    # locked(사용자가 직접 지정한 금액) 항목은 배율 대상에서 뺀다 — 카탈로그 비율로 환산하면
-    # 사용자가 말한 금액이 사라진다(2026-08-20).
-    standard = [p for p in plans if p[4] and not p[0].get("locked")]
-    if not standard:
-        return plans
-    base = sum(unit_price * span for _item, unit_price, _wd, _qty, span in standard)
-    target = sum(item["amount"] for item, *_rest in standard)
-    if base <= 0 or target <= 0:
-        return plans
-
-    def snapped(unit_price: float, factor: float) -> int:
-        # 스냅 단위는 기준 단가 자신에게서 가져온다 — 실제 발급본 단가가 10만원 배수면(테스티파이
-        # 마케팅 등) 10만원 단위를 지키고, 만원 배수면(알파브라더스 시장검증의 150,000·210,000)
-        # 만원 단위를 지킨다. 일괄로 10만원에 맞추면 후자의 원본 구성이 통째로 깨진다.
-        unit = allocation_service.UNIT_PRICE_UNIT
-        if unit_price % unit:
-            unit //= 10
-        return max(unit, round(unit_price * factor / unit) * unit)
-
-    def total_at(factor: float) -> int:
-        return sum(snapped(unit_price, factor) * span for _i, unit_price, _wd, _q, span in standard)
-
-    factor = target / base
-    if total_at(factor) != target:
-        # lo는 항상 "목표 이하", hi는 "목표 초과". 딱 맞는 배율을 못 찾으면 lo를 쓴다 —
-        # 모자란 쪽으로 끝내야 남은 잔액을 reconcile이 채우는 방향이 되어 총액이 안 넘친다.
-        lo, hi, found = 0.0, max(factor * 4, 1.0), None
-        for _ in range(80):
-            mid = (lo + hi) / 2
-            total = total_at(mid)
-            if total == target:
-                found = mid
-                break
-            if total < target:
-                lo = mid
-            else:
-                hi = mid
-        # lo가 0이면 단가를 전부 하한(10만원)까지 내려도 목표를 넘는다는 뜻 — 그때는 최소 구성
-        # 대신 원래 비율을 쓰고 넘치는 만큼은 그대로 둔다(reconcile이 마저 줄인다).
-        factor = found if found is not None else (lo or factor)
-
-    return [
-        plan
-        if not plan[4] or plan[0].get("locked")
-        else (plan[0], snapped(plan[1], factor), plan[2], plan[3], plan[4])
-        for plan in plans
-    ]
 
 
-def _snapped(
-    item: dict,
-    unit_price,
-    work_days: float,
-    quantity: float,
-    columns: Dict[str, str],
-    unit: int,
-    span: Optional[float] = None,
-) -> dict:
-    """공급가액을 단가에 맞춰 다시 세운 항목을 만든다.
-
-    span(수량×작업일)이 있으면 표준 단가(043) 항목이라 공급가액은 단가×span으로 그냥 떨어진다.
-    없으면 예전처럼 배분금액에서 단가를 역산한 뒤 unit 배수로 스냅한다.
-
-    locked=True면 사용자가 직접 지정한 금액이라 스냅하지 않고 그대로 쓴다 — 10만원 격자는
-    사용자가 값을 안 준 항목에만 적용하는 기본값이지, 사용자가 말한 금액을 덮어쓸 규칙이
-    아니다(2026-08-20 사용자 결정).
-    """
-    if item.get("locked"):
-        amount, unit_price = item["amount"], item.get("unit_price") or unit_price
-    elif span:
-        amount = round(unit_price * span)
-    else:
-        amount, unit_price = allocation_service.snap_unit_price(item["amount"], unit_price, unit)
-    extra = _derive_extra_columns(columns, amount, work_days, quantity)
-    return {
-        **item,
-        "amount": amount,
-        "unit_price": unit_price,
-        "work_days": work_days,
-        "quantity": quantity,
-        **extra,
-    }
 
 
 def _collect_item_block_updates(
@@ -1761,13 +1594,11 @@ def _collect_item_block_updates(
     item_blocks: List[dict],
     columns: Dict[str, str],
     assignments: list,
-    catalog_entity_id_by_task_type: Dict[str, str],
     sheet_xml: str,
 ) -> tuple[CellUpdates, set]:
     blocks = [b for b in item_blocks if b.get("role") != "labor_fte"]
     updates: CellUpdates = {}
     hidden_rows: set = set()
-    catalog_maps = _build_catalog_maps(supabase, catalog_entity_id_by_task_type)
 
     # "인건비" 전용 블록(role=labor_fte)은 지금 카탈로그 데이터 모델에 없는 항목이라 채우지
     # 않지만, 마스터 원본 파일에는 예전 실제 고객의 인건비 실수치가 그대로 남아있어 그냥 두면
@@ -1843,12 +1674,13 @@ def _collect_item_block_updates(
             if row_index >= len(rows):
                 continue
             row = rows[row_index]
-            catalog_map = catalog_maps.get(item.get("task_type"), {})
-            # 발급 시점엔 line_items에 단가·작업일·수량이 이미 저장돼 있어 첫 분기로 빠진다
-            # (표준 단가 환산은 생성/수정 시점에 compute_line_item_pricing이 이미 끝냈다).
-            unit_price, work_days, quantity, _span = _compute_item_pricing(
-                catalog_map, columns, sheet_xml, group["category"], item, row
-            )
+            # 저장된 값을 그대로 쓴다. 생성·수정 시점에 quote_pricing.finalize가 양식 수식으로
+            # 금액을 확정하고 저장 관문(assert_storable)이 검사하므로, 발급 시점에 카탈로그를
+            # 다시 뒤져 역산할 이유가 없다 — 그렇게 하면 화면에서 본 값과 발급본이 갈린다
+            # (2026-08-21 재설계로 구 경로 삭제).
+            unit_price = item.get("unit_price") or 0
+            work_days = item.get("work_days") or 1
+            quantity = item.get("quantity") or 1
 
             if "category_mid" in columns:
                 # 구분(중)은 같은 값이 이어지는 행끼리 아래에서 병합하므로(_plan_mid_category_merges)
@@ -1861,7 +1693,11 @@ def _collect_item_block_updates(
             # 아예 표시하지 않는다(2026-08-14 사용자 결정 — 원본 양식에 없는 칸이면 괄호로도
             # 만들어 넣지 않는다).
             if "description" in columns and item.get("description"):
-                updates[f"{columns['description']}{row}"] = item["description"]
+                # 카탈로그마다 "1. A / 2. B"(알파브라더스)와 줄바꿈형(테스티파이)이 섞여 있어
+                # 여기서 세로형 개조식으로 통일한다(PRD 6.2, 2026-08-21 사용자 지적).
+                updates[f"{columns['description']}{row}"] = catalog_service.normalize_description(
+                    item["description"]
+                )
             if "unit_price" in columns:
                 updates[f"{columns['unit_price']}{row}"] = unit_price
             if "work_days" in columns:
@@ -1953,10 +1789,6 @@ def _build_filled_xlsx_from_quote(quote: dict, filled_path: Path) -> None:
 
     entity_name = quote["entity_templates"]["name"]
     task_types = quote["task_types"]
-    catalog_entity_id_by_task_type = {
-        task_type: resolve_catalog_entity_id(supabase, quote["entity_id"], entity_name, task_type)
-        for task_type in task_types
-    }
 
     # 과업종류를 교차 선택한 견적서는 시트 후보·항목 축약 단계가 여러 개일 수 있다 — 1순위가
     # 칸 수를 넘으면(_assign_groups_to_blocks의 422) 다음 후보/축약 단계로 넘어간다(_resolve_assignment).
@@ -1970,18 +1802,22 @@ def _build_filled_xlsx_from_quote(quote: dict, filled_path: Path) -> None:
         cell_map.get("item_blocks", []),
         columns,
         assignments,
-        catalog_entity_id_by_task_type,
         sheet_xml,
     )
 
     # 항목 행의 "입력" 칸(상품명·상품구성·단가·작업일·수량·구분(중))에 수식이 남아 있으면
     # _patch_sheet_xml이 "수식 셀은 값을 덮어쓰지 않는다"는 규칙 때문에 우리가 계산한 값을
     # 무시한다. 실제로 테스티파이 신양식 마스터의 단가 칸 하나(Meta 광고 운영 = 실비의 10%)에
-    # 견적별 수식이 남아 있어 총액이 1,100원 어긋났다(2026-08-19). 공급가액 칸의 =단가×수량
-    # 수식은 단가 역산 로직이 의존하므로 그대로 둔다.
+    # 견적별 수식이 남아 있어 총액이 1,100원 어긋났다(2026-08-19).
+    # 공급가액 칸도 여기 포함한다(2026-08-21). 금액 규칙을 "단가 × 수량"으로 통일했는데
+    # 마스터 원본 수식은 양식마다 다르다 — 알파브라더스 모듈 시트 SUM(작업일×수량×단가),
+    # 블렌디드랩 =단가. 수식을 그대로 두면 엑셀이 우리 값을 무시하고 자기 식으로 다시 계산해
+    # 화면과 발급본이 갈린다. 원본 파일을 고치는 대신 이 칸의 수식만 지우고 값을 쓴다.
+    # 합계·부가세 수식은 이 칸들을 SUM하므로 그대로 두어도 맞는다.
     input_columns = [
         columns[key]
-        for key in ("category_mid", "item_name", "description", "unit_price", "work_days", "quantity")
+        for key in ("category_mid", "item_name", "description", "unit_price", "work_days",
+                    "quantity", "supply_amount", "amount")
         if key in columns
     ]
     item_input_cells = [

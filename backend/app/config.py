@@ -9,7 +9,12 @@ from supabase import Client, ClientOptions, create_client
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
 
-CLAUDE_MODEL = "claude-sonnet-4-6"  # CLAUDE.md 2장 고정 — 임의 변경 금지
+CLAUDE_MODEL = "claude-sonnet-5"  # CLAUDE.md 2장 고정 — 임의 변경 금지 (2026-08-21 사용자 승인)
+
+# Sonnet 5는 thinking이 기본으로 켜지고 max_tokens가 thinking+응답을 합쳐 제한한다.
+# 4-6 시절의 1024·2048을 그대로 쓰면 추론에 예산을 다 쓰고 응답이 잘려 JSON 파싱이
+# 실패한다. 모든 호출부가 이 값을 기준으로 잡는다(2026-08-21 모델 교체와 함께 상향).
+CLAUDE_MAX_TOKENS = 16000
 
 
 @lru_cache

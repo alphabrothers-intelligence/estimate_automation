@@ -17,8 +17,16 @@ class CatalogItem(BaseModel):
     historical_ratio: Optional[float] = None
     is_required: bool
     standard_description: Optional[str] = None
-    # 이 모듈이 참고 견적서에서 차지한 실제 공급가액 — 모듈이 여럿 조합될 때 그 사이의 배분
-    # 비중으로 쓰인다(allocation_service._split_amount_weighted). null이면 균등분배 (2026-08-19).
+    # 표준 업무량·단가 — 본견적 프롬프트가 "이 항목의 기본값은 이것"이라고 알려주는 근거이자,
+    # 항목 간 상대 가격의 원본이다(마이그레이션 043·044, 실제 발급본에서 뽑은 값).
+    # 예전엔 pdf_service._fetch_work_days_quantity_map이 발급 시점에 따로 조회했는데,
+    # 생성 시점에 AI에게 넘겨야 해서 카탈로그 조회 한 번에 같이 싣는다(2026-08-21).
+    work_days: float = 1.0
+    quantity: float = 1.0
+    unit_price: Optional[float] = None
+    # 이 모듈이 참고 견적서에서 차지한 실제 공급가액. 모듈 간 배분 비중으로 쓰였으나
+    # (2026-08-21 재설계 후) 항목별 표준 단가가 그 비중을 이미 담고 있어 생성 경로에서는
+    # 쓰지 않는다. 카탈로그 참고값으로 남겨둔다.
     module_weight: Optional[float] = None
 
 

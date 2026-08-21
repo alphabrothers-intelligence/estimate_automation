@@ -6,10 +6,9 @@ from fastapi import HTTPException
 from app.config import get_supabase
 from app.models.catalog import EntityModuleOptions
 from app.models.estimate import EntityQuoteOut, EstimateSetCreate, EstimateSetOut, EstimateSetSummary, LineItemIn, LineItemsUpdateResult, QuoteVersionOut, RecipientInfoUpdate
-from app.services import allocation_service, catalog_service, pdf_service
+from app.services import catalog_service, pdf_service, quote_pricing
 from app.services.catalog_service import EXCLUDED_ENTITIES_BY_TASK_TYPE
 from app.services.generation_service import _save_version
-from app.services import sync_service
 
 TESTIFY_NAME = "테스티파이"  # service_name(용역명) 필드는 이 법인 템플릿에만 존재 (010_seed_quote_templates.sql)
 
@@ -137,6 +136,8 @@ def create_estimate_set(payload: EstimateSetCreate) -> EstimateSetOut:
             recipient_contact=row["recipient_contact"],
             recipient_phone=row["recipient_phone"],
             recipient_email=row["recipient_email"],
+            adjustment_note=row.get("adjustment_note"),
+            markup_ratio=float(row["markup_ratio"]) if row.get("markup_ratio") is not None else None,
             **pdf_service.get_column_display(supabase, row["entity_id"], row["task_types"], None),
         )
         for row in quotes_res.data
@@ -164,6 +165,7 @@ def get_estimate_set(estimate_set_id: str) -> EstimateSetOut:
         supabase.table("entity_quotes")
         .select(
             "id, entity_id, is_primary, task_type, task_types, total_amount, line_items, selected_modules, "
+            "adjustment_note, markup_ratio, "
             "is_catalog_borrowed, catalog_source_entity_name, service_name, quote_date, "
             "recipient_name, recipient_contact, recipient_phone, recipient_email, entity_templates(name)"
         )
@@ -188,6 +190,8 @@ def get_estimate_set(estimate_set_id: str) -> EstimateSetOut:
             recipient_contact=row["recipient_contact"],
             recipient_phone=row["recipient_phone"],
             recipient_email=row["recipient_email"],
+            adjustment_note=row.get("adjustment_note"),
+            markup_ratio=float(row["markup_ratio"]) if row.get("markup_ratio") is not None else None,
             **pdf_service.get_column_display(
                 supabase, row["entity_id"], row["task_types"], row.get("selected_modules")
             ),
@@ -248,6 +252,7 @@ def update_service_name(entity_quote_id: str, service_name: str) -> EntityQuoteO
         supabase.table("entity_quotes")
         .select(
             "id, entity_id, is_primary, task_type, task_types, total_amount, line_items, selected_modules, "
+            "adjustment_note, markup_ratio, "
             "is_catalog_borrowed, catalog_source_entity_name, quote_date, "
             "recipient_name, recipient_contact, recipient_phone, recipient_email, entity_templates(name)"
         )
@@ -280,6 +285,8 @@ def update_service_name(entity_quote_id: str, service_name: str) -> EntityQuoteO
         recipient_contact=quote["recipient_contact"],
         recipient_phone=quote["recipient_phone"],
         recipient_email=quote["recipient_email"],
+        adjustment_note=quote.get("adjustment_note"),
+        markup_ratio=float(quote["markup_ratio"]) if quote.get("markup_ratio") is not None else None,
         **pdf_service.get_column_display(
             supabase, quote["entity_id"], quote["task_types"], quote.get("selected_modules")
         ),
@@ -294,6 +301,7 @@ def update_quote_date(entity_quote_id: str, quote_date: date) -> EntityQuoteOut:
         supabase.table("entity_quotes")
         .select(
             "id, entity_id, is_primary, task_type, task_types, total_amount, line_items, selected_modules, "
+            "adjustment_note, markup_ratio, "
             "is_catalog_borrowed, catalog_source_entity_name, service_name, "
             "recipient_name, recipient_contact, recipient_phone, recipient_email, entity_templates(name)"
         )
@@ -324,6 +332,8 @@ def update_quote_date(entity_quote_id: str, quote_date: date) -> EntityQuoteOut:
         recipient_contact=quote["recipient_contact"],
         recipient_phone=quote["recipient_phone"],
         recipient_email=quote["recipient_email"],
+        adjustment_note=quote.get("adjustment_note"),
+        markup_ratio=float(quote["markup_ratio"]) if quote.get("markup_ratio") is not None else None,
         **pdf_service.get_column_display(
             supabase, quote["entity_id"], quote["task_types"], quote.get("selected_modules")
         ),
@@ -338,6 +348,7 @@ def update_recipient_info(entity_quote_id: str, payload: RecipientInfoUpdate) ->
         supabase.table("entity_quotes")
         .select(
             "id, entity_id, is_primary, task_type, task_types, total_amount, line_items, selected_modules, "
+            "adjustment_note, markup_ratio, "
             "is_catalog_borrowed, catalog_source_entity_name, service_name, quote_date, "
             "recipient_name, recipient_contact, recipient_phone, recipient_email, entity_templates(name)"
         )
@@ -369,13 +380,20 @@ def update_recipient_info(entity_quote_id: str, payload: RecipientInfoUpdate) ->
         recipient_contact=quote["recipient_contact"],
         recipient_phone=quote["recipient_phone"],
         recipient_email=quote["recipient_email"],
+        adjustment_note=quote.get("adjustment_note"),
+        markup_ratio=float(quote["markup_ratio"]) if quote.get("markup_ratio") is not None else None,
         **pdf_service.get_column_display(
             supabase, quote["entity_id"], quote["task_types"], quote.get("selected_modules")
         ),
     )
 
 
-def update_line_items(entity_quote_id: str, items: List[LineItemIn], edit_request_text: str = "직접편집") -> LineItemsUpdateResult:
+def update_line_items(
+    entity_quote_id: str,
+    items: List[LineItemIn],
+    edit_request_text: str = "직접편집",
+    comparison_mode: str = "sync",
+) -> LineItemsUpdateResult:
     """화면에서 항목명・금액・단가・작업일・투입인력・비고를 직접 클릭해 고친 뒤 저장한다
     (PRD 4.4 "직접 편집" — 2026-08-09 사용자 결정으로 편집 대상을 단가/작업일/투입인력/비고까지
     확장). 프론트엔드가 단가/수량 중 하나를 고치면 나머지로 금액(단가×수량, 작업일은 무관)을
@@ -401,10 +419,10 @@ def update_line_items(entity_quote_id: str, items: List[LineItemIn], edit_reques
         supabase.table("estimate_sets").select("vat_included").eq("id", quote["estimate_set_id"]).execute()
     ).data[0]["vat_included"]
 
-    # 직접 편집은 사용자가 친 금액을 그대로 저장한다 — 10만원 단위 스냅은 자동생성·채팅 수정
-    # (compute_line_item_pricing)에서만 하고, 여기서 다시 건드리면 "이 항목만 1,234,567원으로"
-    # 같은 의도적인 값을 되돌려버린다.
-    total = allocation_service.grand_total(sum(item.amount for item in items), vat_included)
+    # 사용자가 친 금액은 그대로 저장한다. 어떤 재계산·스냅·재배분도 여기서 일어나지 않는다 —
+    # 이게 2026-08-21 재설계의 최상위 규칙이다. 예전엔 저장할 때마다 코드가 값을 되돌려서
+    # "고쳐놔도 자꾸 마음대로 바뀐다"는 문제의 절반이 여기서 나왔다.
+    total = quote_pricing.grand_total(sum(item.amount for item in items), vat_included)
 
     new_line_items = [item.model_dump() for item in items]
     supabase.table("entity_quotes").update(
@@ -413,13 +431,29 @@ def update_line_items(entity_quote_id: str, items: List[LineItemIn], edit_reques
 
     _save_version(entity_quote_id, edit_request_text, new_line_items)
 
-    synced_comparison_quotes = []
-    if quote["is_primary"]:
-        synced_comparison_quotes = sync_service.sync_comparisons_from_primary(
-            quote["estimate_set_id"], total, vat_included
-        )
-    else:
-        sync_service.update_ratio_from_comparison(entity_quote_id, quote["estimate_set_id"], total)
+    # 본견적 금액이 바뀌면 비교견적 금액도 즉시 따라간다 — 항목 구성이 그대로라면 문장을
+    # 다시 쓸 이유가 없어 AI를 부르지 않고 단가에 배율만 곱한다(0원·즉시). 항목이 추가·삭제돼
+    # 1:1 대응이 깨진 비교견적만 손대지 않고 화면에 재생성을 안내한다(2026-08-21).
+    synced_comparison_quotes: List[EntityQuoteOut] = []
+    needs_regeneration: List[str] = []
+    if quote["is_primary"] and comparison_mode != "keep":
+        from app.services import generation_service  # 순환 참조 회피
+
+        if comparison_mode == "regenerate":
+            # 항목 문장까지 새 본견적 기준으로 다시 쓴다(AI 호출).
+            refreshed = generation_service.regenerate_comparisons(quote["estimate_set_id"])
+            synced_comparison_quotes = [q for q in refreshed.entity_quotes if not q.is_primary]
+            outcome = {"rescaled": [], "needs_regeneration": []}
+        else:
+            outcome = generation_service.rescale_comparisons(
+                quote["estimate_set_id"], sum(item.amount for item in items), vat_included
+            )
+        needs_regeneration = outcome["needs_regeneration"]
+        if outcome["rescaled"]:
+            refreshed = get_estimate_set(quote["estimate_set_id"])
+            synced_comparison_quotes = [
+                q for q in refreshed.entity_quotes if q.id in set(outcome["rescaled"])
+            ]
 
     entity_quote_out = EntityQuoteOut(
         id=quote["id"],
@@ -438,13 +472,17 @@ def update_line_items(entity_quote_id: str, items: List[LineItemIn], edit_reques
         recipient_contact=quote["recipient_contact"],
         recipient_phone=quote["recipient_phone"],
         recipient_email=quote["recipient_email"],
+        adjustment_note=quote.get("adjustment_note"),
+        markup_ratio=float(quote["markup_ratio"]) if quote.get("markup_ratio") is not None else None,
         **pdf_service.get_column_display(
             supabase, quote["entity_id"], quote["task_types"], quote.get("selected_modules")
         ),
     )
 
     return LineItemsUpdateResult(
-        entity_quote=entity_quote_out, synced_comparison_quotes=synced_comparison_quotes
+        entity_quote=entity_quote_out,
+        synced_comparison_quotes=synced_comparison_quotes,
+        comparisons_need_regeneration=needs_regeneration,
     )
 
 
@@ -469,3 +507,98 @@ def list_quote_versions(entity_quote_id: str) -> List[QuoteVersionOut]:
         )
         for v in versions.data
     ]
+
+
+def update_markup_ratio(entity_quote_id: str, markup_ratio: float) -> EntityQuoteOut:
+    """비교견적의 인상률만 바꾼다. 금액은 여기서 건드리지 않는다 — 사용자가 %를 입력한 뒤
+    "비교견적 다시 생성"을 눌러야 그 비율로 항목이 다시 쓰인다(2026-08-21)."""
+    supabase = get_supabase()
+    supabase.table("entity_quotes").update({"markup_ratio": round(markup_ratio, 4)}).eq(
+        "id", entity_quote_id
+    ).execute()
+    return _load_entity_quote(entity_quote_id)
+
+
+def _load_entity_quote(entity_quote_id: str) -> EntityQuoteOut:
+    """단건 조회 — 인상률 변경처럼 line_items를 건드리지 않는 갱신 뒤에 쓴다."""
+    supabase = get_supabase()
+    quote = (
+        supabase.table("entity_quotes")
+        .select(
+            "id, entity_id, is_primary, task_type, task_types, total_amount, line_items, selected_modules, "
+            "adjustment_note, markup_ratio, is_catalog_borrowed, catalog_source_entity_name, service_name, "
+            "quote_date, recipient_name, recipient_contact, recipient_phone, recipient_email, "
+            "entity_templates(name)"
+        )
+        .eq("id", entity_quote_id)
+        .execute()
+    ).data
+    if not quote:
+        raise HTTPException(status_code=404, detail="견적서를 찾을 수 없습니다.")
+    quote = quote[0]
+    return EntityQuoteOut(
+        id=quote["id"],
+        entity_id=quote["entity_id"],
+        entity_name=quote["entity_templates"]["name"],
+        is_primary=quote["is_primary"],
+        task_type=quote["task_type"],
+        task_types=quote["task_types"],
+        total_amount=float(quote["total_amount"] or 0),
+        line_items=quote["line_items"] or [],
+        is_catalog_borrowed=quote["is_catalog_borrowed"],
+        catalog_source_entity_name=quote["catalog_source_entity_name"],
+        service_name=quote["service_name"],
+        quote_date=quote["quote_date"],
+        recipient_name=quote["recipient_name"],
+        recipient_contact=quote["recipient_contact"],
+        recipient_phone=quote["recipient_phone"],
+        recipient_email=quote["recipient_email"],
+        adjustment_note=quote.get("adjustment_note"),
+        markup_ratio=float(quote["markup_ratio"]) if quote.get("markup_ratio") is not None else None,
+        **pdf_service.get_column_display(
+            supabase, quote["entity_id"], quote["task_types"], quote.get("selected_modules")
+        ),
+    )
+
+
+def assert_issuable(entity_quote_id: str) -> None:
+    """발급 직전 마지막 안전망 — 비교견적이 본견적보다 싸면 막는다.
+
+    비교견적서의 존재 이유가 "본견적보다 비싼 대안"이라, 역전된 문서가 고객에게 나가면
+    그 자리에서 협상이 끝난다. 본견적을 고친 뒤 비교견적을 다시 만들지 않고 그대로 내려받는
+    경로가 실제로 존재하므로(수정·재발급 반복이 이 시스템의 기본 사용 패턴, CLAUDE.md 1장)
+    되돌릴 수 없는 이 지점 한 곳에서만 검사한다. 상태값이나 플래그 없이 숫자 두 개 비교다.
+    """
+    supabase = get_supabase()
+    quote = (
+        supabase.table("entity_quotes")
+        .select("estimate_set_id, is_primary, total_amount, entity_templates(name)")
+        .eq("id", entity_quote_id)
+        .execute()
+    ).data
+    if not quote or quote[0]["is_primary"]:
+        return
+    quote = quote[0]
+
+    primary = (
+        supabase.table("entity_quotes")
+        .select("total_amount")
+        .eq("estimate_set_id", quote["estimate_set_id"])
+        .eq("is_primary", True)
+        .execute()
+    ).data
+    if not primary or not primary[0]["total_amount"]:
+        return  # 본견적 없이 비교견적만 발행하는 세트 — 비교 기준이 없다
+
+    comparison_total = float(quote["total_amount"] or 0)
+    primary_total = float(primary[0]["total_amount"])
+    if comparison_total > primary_total:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"{quote['entity_templates']['name']} 비교견적({comparison_total:,.0f}원)이 "
+            f"본견적({primary_total:,.0f}원)보다 높지 않습니다. "
+            "본견적을 수정한 뒤 비교견적을 다시 생성해 주세요."
+        ),
+    )
