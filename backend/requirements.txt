@@ -1,8 +1,10 @@
-psycopg2-binary
-python-dotenv
-supabase
-fastapi
-uvicorn[standard]
-anthropic
-python-multipart
-openpyxl
+# 버전은 2026-08-23 컨테이너 검증(5개 법인 발급본 대조)을 통과한 이미지의 pip freeze 값이다.
+# 고정하지 않으면 Render가 재빌드할 때마다 그날 최신 버전이 깔려, 검증한 것과 다른 게 배포된다.
+anthropic==1.0.0
+fastapi==0.141.1
+openpyxl==3.1.5
+psycopg2-binary==2.9.12
+python-dotenv==1.2.3
+python-multipart==0.0.32
+supabase==2.31.0
+uvicorn[standard]==0.52.4
