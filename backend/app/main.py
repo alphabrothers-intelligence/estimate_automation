@@ -1,8 +1,10 @@
+import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.routers import catalog, estimates
 from app.services import pdf_service
@@ -21,6 +23,21 @@ app = FastAPI(title="견적서 자동화 API", lifespan=lifespan)
 # 코드에 박지 않고 환경변수로 받는다. 쉼표로 여러 개 넣을 수 있다.
 # 예: FRONTEND_ORIGINS=https://estimate-automation.vercel.app,https://견적.내도메인.com
 FRONTEND_ORIGINS = [o.strip() for o in os.getenv("FRONTEND_ORIGINS", "").split(",") if o.strip()]
+
+
+# Starlette는 처리되지 않은 예외를 CORS 미들웨어보다 바깥에서 500으로 바꾼다. 그 응답에는
+# CORS 헤더가 없어서 브라우저가 응답을 통째로 막고, fetch는 네트워크 에러로 실패한다. 그래서
+# 배포 환경에서는 원인이 사라진 "실패했습니다" 문구만 남는다(2026-08-24 확인). CORS보다
+# 안쪽에서 먼저 잡아 JSON으로 돌려주면 에러 원문이 화면까지 도달한다.
+# add_middleware는 나중에 등록한 것이 바깥이므로 이 순서(에러 핸들러 → CORS)를 바꾸지 않는다.
+@app.middleware("http")
+async def surface_errors(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except Exception as exc:
+        logging.exception("unhandled error: %s %s", request.method, request.url.path)
+        return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})
+
 
 app.add_middleware(
     CORSMiddleware,
