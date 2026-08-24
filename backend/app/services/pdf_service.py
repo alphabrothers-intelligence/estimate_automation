@@ -1290,6 +1290,13 @@ def _rollup_to_category_totals(
                 "category": g["category"],
                 "name": name,
                 "amount": g["amount"],
+                # 묶음 한 줄에는 대표 단가가 없지만, 양식의 공급가액 칸은 대부분 수식이라
+                # (블렌디드랩 AB=+W, 썬데이워커 R=N*K, 알파브라더스 AA=SUM(T*V*X)) 단가를
+                # 비워두면 LibreOffice 재계산에서 금액도 합계도 0으로 나간다(2026-08-21 신고).
+                # 작업일·수량 1, 단가=묶음 총액이면 위 세 수식 모두 정확히 총액이 된다.
+                "unit_price": g["amount"],
+                "work_days": 1,
+                "quantity": 1,
                 # 그룹 안 항목은 전부 같은 category(=module_name)라 같은 과업종류에 속한다.
                 "task_type": g["items"][0].get("task_type") if g["items"] else None,
                 "description": None if inline_names else "\n".join(
@@ -1340,6 +1347,11 @@ def _assign_groups_to_blocks(
             g if any(it.get("description") for it in g["items"]) else _rollup_to_category_totals([g])[0]
             for g in groups
         ]
+    elif _is_name_only_form(columns, blocks):
+        # 품명 한 칸짜리 양식(블렌디드랩·썬데이워커)도 자리가 모자랄 때만 쓰는 최후 수단이 아니라
+        # 이게 기본 표시 방식이다 — "그로스마케팅 운영\n(주간 성과 리포트 / 주간 실행과제)".
+        # 행을 늘려 낱개로 나열하면 무슨 묶음인지 알 수 없다(2026-08-24 사용자 재지적).
+        groups = _rollup_to_category_totals(groups, inline_names=True)
 
     # 카테고리 전용 블록 — 카테고리 라벨 칸이든 구분(대) 칸이든, 그 블록이 카테고리 하나를
     # 통째로 담는다는 뜻이라 똑같이 "그룹 1개 = 블록 1개"로 배정한다. 구분(대)에 모듈명을 넣게
@@ -1614,10 +1626,11 @@ def _assignment_attempts(template: dict, source_bytes: bytes, sheet_xml: str, gr
     columns = template["cell_map"].get("columns", {})
     blocks = template["cell_map"].get("item_blocks", [])
     yield template, source_bytes, sheet_xml, False
-    # 예전엔 품명 한 칸짜리 양식(썬데이워커·블렌디드랩)만 행을 늘리기 전에 먼저 묶었다.
-    # 그런데 묶으면 품명이 "기술성 테스트\n(설계 / 모집 / 운영 / 리포트)"처럼 길어져 좁은
-    # 품명 칸에서 두 글자씩 접히고, 단가·투입MM은 항목마다 달라 대표값을 못 정해 0으로 나갔다
-    # (2026-08-21 사용자 신고). 행을 늘리면 항목마다 제 단가·수량이 그대로 찍힌다.
+    # 품명 한 칸짜리 양식은 _assign_groups_to_blocks가 항상 카테고리당 한 줄로 묶으므로,
+    # 행을 늘려야 할 때도 늘릴 줄 수는 "카테고리 수" 기준이다 — 낱개 항목 수로 늘리면
+    # 쓰지도 않을 행만 잔뜩 끼워 넣고 숨기게 된다.
+    if _is_name_only_form(columns, blocks):
+        groups = _rollup_to_category_totals(groups, inline_names=True)
     grown = _grow_template(template, source_bytes, groups)
     if grown is not None:
         yield (*grown, False)
