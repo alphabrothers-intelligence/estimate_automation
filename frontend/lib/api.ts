@@ -59,6 +59,10 @@ export type EntityQuote = {
   adjustment_note: string | null;
   // 비교견적의 인상률(1.10 = +10%). 화면에서 %를 고쳐 다시 생성할 때 쓴다.
   markup_ratio: number | null;
+  /** 비교견적 품명을 AI가 다시 쓸지. false면 본견적 문구 그대로. */
+  rename_items: boolean;
+  /** 머리글의 업무/제작 기간 표기("약 60일"). 그 칸이 있는 양식에서만 쓰인다. */
+  duration_text: string | null;
 };
 
 export type ModuleItemGroup = {
@@ -125,6 +129,35 @@ export function getEntityQuotePdfUrl(
 
 export function getEntityQuoteXlsxUrl(entityQuoteId: string): string {
   return `${API_BASE_URL}/api/entity-quotes/${entityQuoteId}/xlsx`;
+}
+
+/** 파일명에 못 쓰는 글자만 걷어낸다. 한글·공백·괄호는 그대로 둔다. */
+function safeFileName(name: string): string {
+  return name.replace(/[\\/:*?"<>|]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * 발급 파일을 blob으로 받아 내려받는다. 절대 그 URL로 탭을 이동시키지 않는다.
+ *
+ * 예전엔 `<a href={pdfUrl} target="_blank">`였다. 백엔드(Render)가 잠들어 있으면 그 새 탭이
+ * PDF가 아니라 Render의 "Application loading" 대기 페이지를 띄우는데, 그 페이지가 앱이 깰
+ * 때까지 같은 URL을 계속 다시 부른다. 앱이 깬 뒤로는 부를 때마다 attachment 응답이 와서
+ * quote-xxxx (1).pdf, (2), (3)… 이 끝없이 저장됐다(2026-08-24 사용자 신고, 15개까지 확인).
+ * fetch로 받으면 요청은 우리가 한 번만 보내고, 콜드스타트 동안에는 버튼이 대기 상태로 남는다.
+ */
+export async function downloadQuoteFile(url: string, filename: string): Promise<void> {
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new ApiError(detailToMessage(body?.detail, res.status));
+  }
+  const blob = await res.blob();
+  const href = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = href;
+  link.download = safeFileName(filename);
+  link.click();
+  URL.revokeObjectURL(href);
 }
 
 export class ApiError extends Error {}
@@ -279,6 +312,18 @@ export async function regenerateComparisons(id: string): Promise<EstimateSet> {
 }
 
 /** 비교견적의 인상률(%)만 바꾼다. 저장 후 regenerateComparisons를 부르면 그 비율로 다시 쓴다. */
+export async function updateRenameItems(
+  entityQuoteId: string,
+  renameItems: boolean
+): Promise<EntityQuote> {
+  const res = await fetch(`${API_BASE_URL}/api/entity-quotes/${entityQuoteId}/rename-items`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ rename_items: renameItems }),
+  });
+  return handle<EntityQuote>(res);
+}
+
 export async function updateMarkupRatio(
   entityQuoteId: string,
   markupRatio: number
@@ -332,7 +377,8 @@ export type RecipientInfoInput = {
   recipient_contact?: string;
   recipient_phone?: string;
   recipient_email?: string;
-};
+
+  duration_text?: string;};
 
 export async function updateRecipientInfo(
   entityQuoteId: string,
@@ -360,12 +406,19 @@ export type EditResult = {
 export async function editEntityQuote(
   entityQuoteId: string,
   editRequestText: string,
-  attachment?: ChatAttachment
+  attachment?: ChatAttachment,
+  // 화면이 지금 보여주는 항목들(아직 "수정 반영하기" 전이면 저장본과 다르다). 안 보내면
+  // 서버가 저장본을 기준으로 고쳐서 반영 전 수정이 통째로 날아간다 — api 쪽 주석 참고.
+  currentItems?: LineItem[]
 ): Promise<EditResult> {
   const res = await fetch(`${API_BASE_URL}/api/entity-quotes/${entityQuoteId}/edit`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ edit_request_text: editRequestText, attachment: attachment ?? null }),
+    body: JSON.stringify({
+      edit_request_text: editRequestText,
+      attachment: attachment ?? null,
+      current_items: currentItems ?? null,
+    }),
   });
   return handle<EditResult>(res);
 }

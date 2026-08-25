@@ -14,6 +14,8 @@ import {
   generateEstimateSet,
   regenerateComparisons,
   updateMarkupRatio,
+  updateRenameItems,
+  downloadQuoteFile,
   getEntityQuotePdfUrl,
   getEntityQuoteXlsxUrl,
   updateLineItems,
@@ -274,7 +276,13 @@ function ServiceNameField({
 // 양식에 대응 칸이 있어 공통으로 보여준다.
 // 견적서 상단에 담당자/연락처/이메일 칸이 있는 양식들. 테스티파이는 039 마이그레이션으로
 // 알파브라더스형 신양식으로 갈아타면서 이 칸들이 생겼다(2026-08-19).
-const RECIPIENT_CONTACT_ENTITIES = ["ABBG", "알파브라더스", "테스티파이"];
+const RECIPIENT_CONTACT_ENTITIES = ["ABBG", "알파브라더스", "테스티파이", "안르"];
+
+// 머리글에 "업무 기간 / 제작기간" 칸이 있는 양식. 이 칸을 안 채우면 마스터에 남아 있는
+// 남의 견적 건 값("약 60일", "1.5개월 예상")이 그대로 발급된다(2026-08-25).
+// 어느 양식에 그 칸이 있는지는 cell_map.header_fields가 정하는데 화면까지 내려오지 않아서,
+// RECIPIENT_CONTACT_ENTITIES와 같은 방식으로 여기에 적어 둔다.
+const DURATION_ENTITIES = ["위드앤코", "테키"];
 
 function RecipientInfoFields({
   quote,
@@ -291,6 +299,14 @@ function RecipientInfoFields({
         placeholder="예: 주식회사 미구"
         onSave={(value) => onSave({ recipient_name: value })}
       />
+      {DURATION_ENTITIES.includes(quote.entity_name) && (
+        <LabeledInlineField
+          label="업무 기간"
+          value={quote.duration_text ?? ""}
+          placeholder="예: 약 60일"
+          onSave={(value) => onSave({ duration_text: value })}
+        />
+      )}
       {RECIPIENT_CONTACT_ENTITIES.includes(quote.entity_name) && (
         <>
           <LabeledInlineField
@@ -1157,7 +1173,13 @@ function computeGrandTotal(items: LineItem[]): number {
 }
 
 // 직접편집이든 채팅 수정이든 커밋("수정 반영하기") 전까지는 화면에서만 미리보이는 상태.
-type PendingEdit = { items: LineItem[]; editRequestText: string };
+// 마지막 입력 뒤 이만큼 조용하면 자동 저장한다. 한 글자 칠 때마다 버전이 쌓이지 않게 하는
+// 최소 간격 — 셀 하나 고치고 다음 셀로 넘어가는 데 보통 이보다 오래 걸린다.
+const AUTOSAVE_DELAY_MS = 1500;
+
+type PendingEdit = { items: LineItem[]; editRequestText: string;
+  // 버전 버튼으로 불러온 경우에만 채워진다 — 지금 화면이 몇 번 버전인지 배너에 띄운다.
+  versionLabel?: string };
 
 
 // 백엔드 allocation_service.reconcile_amounts의 JS 쌍둥이 — 소계/총합계를 직접 고쳤을 때
@@ -1437,6 +1459,7 @@ function QuoteCard({
   const [infoExpanded, setInfoExpanded] = useState(false);
   const [busyAction, setBusyAction] = useState<"commit" | "original" | "previous" | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [downloading, setDownloading] = useState<"pdf" | "xlsx" | null>(null);
   const displayQuote = pending
     ? { ...quote, line_items: pending.items, total_amount: computeGrandTotal(pending.items) }
     : quote;
@@ -1450,6 +1473,26 @@ function QuoteCard({
       setActionError(e instanceof ApiError ? e.message : "처리에 실패했습니다.");
     } finally {
       setBusyAction(null);
+    }
+  }
+
+  // 파일명은 서버 헤더 대신 여기서 만든다 — 실무자가 폴더에서 바로 알아볼 수 있게
+  // "견적서_(테스티파이) 한양대학교 시장검증.pdf" 꼴로 붙인다.
+  async function runDownload(kind: "pdf" | "xlsx") {
+    setDownloading(kind);
+    setActionError(null);
+    try {
+      const label = [quote.is_primary ? "견적서" : "비교견적서", `(${quote.entity_name})`, quote.service_name]
+        .filter(Boolean)
+        .join("_");
+      await downloadQuoteFile(
+        kind === "pdf" ? getEntityQuotePdfUrl(quote.id) : getEntityQuoteXlsxUrl(quote.id),
+        `${label}.${kind}`
+      );
+    } catch (e) {
+      setActionError(e instanceof ApiError ? e.message : "파일을 내려받지 못했습니다.");
+    } finally {
+      setDownloading(null);
     }
   }
 
@@ -1484,37 +1527,35 @@ function QuoteCard({
             </p>
             {quote.line_items.length > 0 && (
               <div className="mt-2 flex items-center justify-end gap-1.5" aria-label="파일 다운로드">
-                {/* target="_blank"이 없으면 이 링크가 현재 탭의 "이동"으로 시작돼서, 미반영 수정이
-                    남아 있을 때 beforeunload 핸들러가 걸려 크롬의 "사이트에서 나가시겠습니까?"
-                    경고가 뜬다(2026-08-19 사용자 지적) — 실제로는 파일만 내려받고 페이지는 그대로
-                    있는데도 뜨는 오해성 경고다. 새 탭으로 시작하면 현재 문서는 이탈 대상이 아니라
-                    경고가 뜨지 않고, 첨부파일 응답이라 그 탭은 곧바로 닫힌다. */}
-                <a
-                  href={getEntityQuotePdfUrl(quote.id)}
-                  target="_blank"
-                  rel="noopener"
+                {/* 링크(<a href>)가 아니라 버튼이다 — 링크로 두면 백엔드 콜드스타트 때 그 탭이
+                    Render 대기 페이지에 잡혀 같은 URL을 반복 호출하고, 앱이 깨는 순간부터
+                    파일이 무한히 저장된다. 자세한 건 api.downloadQuoteFile. */}
+                <button
+                  type="button"
+                  disabled={downloading !== null}
+                  onClick={() => runDownload("pdf")}
                   title="PDF 다운로드"
                   aria-label="PDF 다운로드"
-                  className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 text-xs font-semibold text-slate-600 transition hover:border-slate-300 hover:bg-slate-50 hover:text-slate-950"
+                  className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 text-xs font-semibold text-slate-600 transition hover:border-slate-300 hover:bg-slate-50 hover:text-slate-950 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                     <path d="M12 3v12m0 0 4-4m-4 4-4-4M5 20h14" />
                   </svg>
-                  <span>PDF</span>
-                </a>
-                <a
-                  href={getEntityQuoteXlsxUrl(quote.id)}
-                  target="_blank"
-                  rel="noopener"
+                  <span>{downloading === "pdf" ? "내려받는 중…" : "PDF"}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={downloading !== null}
+                  onClick={() => runDownload("xlsx")}
                   title="엑셀 다운로드"
                   aria-label="엑셀 다운로드"
-                  className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 text-xs font-semibold text-slate-600 transition hover:border-slate-300 hover:bg-slate-50 hover:text-slate-950"
+                  className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 text-xs font-semibold text-slate-600 transition hover:border-slate-300 hover:bg-slate-50 hover:text-slate-950 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                     <path d="M12 3v12m0 0 4-4m-4 4-4-4M5 20h14" />
                   </svg>
-                  <span>엑셀</span>
-                </a>
+                  <span>{downloading === "xlsx" ? "내려받는 중…" : "엑셀"}</span>
+                </button>
               </div>
             )}
           </div>
@@ -1595,7 +1636,18 @@ function QuoteCard({
               <p className="text-xs text-slate-500">
                 {pending ? (
                   <span className="inline-flex flex-wrap items-center gap-x-2 gap-y-0.5">
-                    <span className="font-semibold text-amber-700">저장되지 않은 변경사항</span>
+                    {/* 자동 저장이 생긴 뒤로 "저장되지 않은 변경사항"은 버전 미리보기일 때만
+                        맞는 말이다. 그냥 고친 상태는 잠시 뒤 알아서 저장된다(2026-08-25). */}
+                    <span className="font-semibold text-amber-700">
+                      {pending.versionLabel ? "반영 대기 중" : "자동 저장 중…"}
+                    </span>
+                    {/* 버전 버튼으로 불러온 경우 어느 버전을 보고 있는지 밝힌다 — 예전엔 화면이
+                        바뀌기만 하고 무엇이 올라온 건지 알 수 없었다(2026-08-24 실무자 지적). */}
+                    {pending.versionLabel && (
+                      <span className="rounded bg-slate-200/70 px-1.5 py-0.5 font-medium text-slate-600">
+                        {pending.versionLabel} 불러옴
+                      </span>
+                    )}
                     {comparisonNote && <span className="text-slate-500">{comparisonNote}</span>}
                   </span>
                 ) : (
@@ -2013,6 +2065,10 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
   const [chatHistory, setChatHistory] = useState<Record<string, ChatMessage[]>>({});
   // 직접편집·채팅 수정 모두 여기 쌓였다가 "수정 반영하기"를 눌러야 실제 저장된다(2026-08-14).
   const [pendingByQuote, setPendingByQuote] = useState<Record<string, PendingEdit>>({});
+  // 뒤로 가기를 누른 횟수(견적서별). 예전엔 이 값이 없어서 몇 번을 눌러도 늘 "마지막에서 두
+  // 번째" 버전만 나왔고, 되돌린 걸 반영하면 그것도 새 버전이 되어 두 상태를 왕복했다 —
+  // 실무자 1차 피드백 "뒤로 가기를 누르면 이전 내역이 잘 나오지 않는다"(2026-08-24).
+  const [versionStepByQuote, setVersionStepByQuote] = useState<Record<string, number>>({});
   const pendingByQuoteRef = useRef(pendingByQuote);
   pendingByQuoteRef.current = pendingByQuote;
   // 비교견적을 다시 써야 하는 상태 — 본견적 항목이 추가·삭제돼 1:1 대응이 깨졌을 때
@@ -2084,9 +2140,14 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
   useEffect(() => {
     Promise.all(FIXED_TASK_TYPES.map((t) => fetchEntities(t)))
       .then(([marketingEntities, marketVerificationEntities]) => {
+        // 서버가 이미 순서를 정해서 준다(catalog_service.list_entities_for_task_type — 직인이
+        // 없어 날인 요청이 필요한 법인은 맨 뒤로 보낸다). 여기서 가나다순으로 다시 정렬하면
+        // 그 순서가 지워지므로, 두 응답을 합칠 때 **먼저 등장한 순서**를 그대로 유지한다.
         const byId = new Map<string, EntityOption>();
-        for (const e of [...marketingEntities, ...marketVerificationEntities]) byId.set(e.id, e);
-        const all = Array.from(byId.values()).sort((a, b) => a.name.localeCompare(b.name));
+        for (const e of [...marketingEntities, ...marketVerificationEntities]) {
+          if (!byId.has(e.id)) byId.set(e.id, e);
+        }
+        const all = Array.from(byId.values());
         setEntities(all);
         setExcludedByTask({
           마케팅: new Set(all.map((e) => e.id).filter((id) => !marketingEntities.some((e) => e.id === id))),
@@ -2370,7 +2431,33 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
     setPendingByQuote((prev) => ({ ...prev, [quoteId]: { items, editRequestText: "직접편집" } }));
   }
 
+  // 자동 저장 — 한글·구글 독스처럼 고치면 그냥 반영된다(2026-08-25 요청). 예전엔 매번
+  // "수정 반영하기"를 눌러야 해서 번거로웠다. 되돌리기는 버전 목록(뒤로 가기)이 담당한다.
+  //
+  // 버전 불러오기(versionLabel이 있는 pending)는 자동 저장하지 않는다 — 그건 편집이 아니라
+  // "이 버전 어때요?" 하는 미리보기라, 자동 커밋하면 훑어보기만 해도 버전이 쌓인다.
+  //
+  // 비교견적 동기화 모드는 총액이 실제로 달라졌을 때만 sync다. 문구만 고쳤는데 sync를 걸면
+  // 배율 1.0으로 아무것도 안 바뀌면서 비교견적마다 버전 행만 하나씩 쌓인다. 문구까지 다시
+  // 쓰는 regenerate는 AI를 10~20초 부르므로 자동 저장이 임의로 하지 않는다 — 화면의
+  // "비교견적서 다시 생성" 버튼이 그 유일한 경로다.
+  useEffect(() => {
+    if (!viewedQuoteId) return;
+    const pending = pendingByQuote[viewedQuoteId];
+    if (!pending || pending.versionLabel) return;
+    const saved = result?.entity_quotes.find((q) => q.id === viewedQuoteId);
+    const sum = (list: { amount: number }[]) => list.reduce((acc, i) => acc + i.amount, 0);
+    const mode: ComparisonMode =
+      saved && sum(pending.items) !== sum(saved.line_items) ? "sync" : "keep";
+    const timer = setTimeout(() => {
+      void handleCommitPending(viewedQuoteId, mode);
+    }, AUTOSAVE_DELAY_MS);
+    return () => clearTimeout(timer);
+     
+  }, [viewedQuoteId, pendingByQuote, result]);
+
   // "수정 반영하기" — pending을 실제로 저장한다. 직접편집이든 채팅 수정이든 같은 경로로 커밋된다.
+  // 자동 저장이 생긴 뒤로는 "지금 당장, 비교견적까지 맞춰서" 저장하는 버튼이다.
   async function handleCommitPending(quoteId: string, mode: ComparisonMode = "sync") {
     const pending = pendingByQuoteRef.current[quoteId];
     if (!pending) return;
@@ -2378,6 +2465,13 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
       await updateLineItems(quoteId, pending.items, pending.editRequestText, mode);
     setNeedsRegeneration(comparisons_need_regeneration);
     setPendingByQuote((prev) => {
+      const next = { ...prev };
+      delete next[quoteId];
+      return next;
+    });
+    // 반영하면 그게 새 마지막 버전이 되므로 뒤로 가기 커서도 처음으로 돌린다 — 안 돌리면
+    // 다음 뒤로 가기가 방금 떠나온 상태를 다시 불러와 두 버전을 왕복한다.
+    setVersionStepByQuote((prev) => {
       const next = { ...prev };
       delete next[quoteId];
       return next;
@@ -2392,6 +2486,22 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
         ? { ...prev, entity_quotes: prev.entity_quotes.map((q) => updatedById.get(q.id) ?? q) }
         : prev
     );
+  }
+
+  // "품명 다시 쓰기" 체크박스 — 설정만 바꾼다. 실제로 반영되려면 아래 "다시 생성"을 눌러야
+  // 하고, 그건 화면 문구(안내문)로 알린다.
+  async function handleToggleRenameItems(quoteId: string, renameItems: boolean) {
+    setError(null);
+    try {
+      const updated = await updateRenameItems(quoteId, renameItems);
+      setResult((prev) =>
+        prev
+          ? { ...prev, entity_quotes: prev.entity_quotes.map((q) => (q.id === quoteId ? updated : q)) }
+          : prev
+      );
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "설정을 저장하지 못했습니다.");
+    }
   }
 
   // "비교견적 생성/다시 생성" — 확정된 본견적을 기준으로 AI가 항목을 다시 쓴다(10~20초).
@@ -2425,19 +2535,36 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
       delete next[quoteId];
       return next;
     });
+    setVersionStepByQuote((prev) => {
+      const next = { ...prev };
+      delete next[quoteId];
+      return next;
+    });
   }
 
   // "원본으로 되돌리기"/"뒤로 가기" — 과거 버전의 항목들을 pending에 올려 미리 보여준다. 여기서도
   // 바로 저장하지 않고 "수정 반영하기"를 눌러야 커밋된다(되돌리기도 직접편집과 같은 경로 공유).
+  //
+  // versions는 오래된 순이고, 마지막 원소가 지금 저장된 상태다. 뒤로 가기는 그 끝에서부터
+  // 한 칸씩 거슬러 올라간다(1번 누르면 직전, 2번 누르면 그 전) — 커서를 두지 않으면 몇 번을
+  // 눌러도 같은 버전만 나온다. 커서는 반영/취소할 때 0으로 돌아간다(handleCommitPending,
+  // handleDiscardPending).
   async function handleRevertToVersion(quoteId: string, which: "original" | "previous") {
     const versions = await fetchQuoteVersions(quoteId);
     if (versions.length === 0) return;
-    const target = which === "original" ? versions[0] : versions[Math.max(0, versions.length - 2)];
+    const step =
+      which === "original" ? versions.length - 1 : (versionStepByQuote[quoteId] ?? 0) + 1;
+    const index = Math.max(0, versions.length - 1 - step);
+    const target = versions[index];
+    setVersionStepByQuote((prev) => ({ ...prev, [quoteId]: versions.length - 1 - index }));
     setPendingByQuote((prev) => ({
       ...prev,
       [quoteId]: {
         items: target.line_items as LineItem[],
         editRequestText: which === "original" ? "원본으로 되돌리기" : "이전 버전으로 되돌리기",
+        versionLabel: `v${target.version_no}${
+          index === 0 ? " (최초 생성)" : ""
+        } · ${target.edit_request_text ?? "수정"}`,
       },
     }));
   }
@@ -2450,7 +2577,14 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
 
     // 채팅 수정도 미리보기 전용(edit_service)이라 여기서 바로 저장되지 않는다 — 직접편집과 같은
     // pending 상태에 얹어서, 화면에서 확인 후 "수정 반영하기"를 눌러야 실제로 커밋된다.
-    const editResult = await editEntityQuote(quoteId, text, attachment);
+    //
+    // 그래서 "지금 화면에 뭐가 떠 있는지"를 같이 보내야 한다. 안 보내면 서버가 저장본을 읽어
+    // 고치므로, 반영을 안 누른 채 두 번 연달아 채팅하면 첫 번째 수정이 사라진다(2026-08-24
+    // 실무자 신고 "채팅으로 추가는 되지만 때때로 롤백됨").
+    const currentItems =
+      pendingByQuoteRef.current[quoteId]?.items ??
+      result?.entity_quotes.find((q) => q.id === quoteId)?.line_items;
+    const editResult = await editEntityQuote(quoteId, text, attachment, currentItems as LineItem[] | undefined);
     setPendingByQuote((prev) => ({
       ...prev,
       [quoteId]: { items: editResult.entity_quote.line_items as LineItem[], editRequestText: text },
@@ -2733,7 +2867,7 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
                           ? "본견적서를 검토·수정한 뒤 생성하세요. 확정된 본견적을 기준으로 같은 과업을 다른 표현·다른 금액으로 다시 씁니다."
                           : stale
                             ? "항목이 추가·삭제되어 비교견적과 1:1로 대응하지 않습니다. 다시 생성해야 발급할 수 있습니다."
-                            : "금액만 바뀐 경우는 자동으로 반영됩니다. 항목 문장까지 다시 쓰려면 아래에서 생성하세요."}
+                            : "금액만 바뀐 경우는 자동으로 반영됩니다. 항목 문장까지 다시 쓰려면 아래에서 생성하세요. \"품명 다시 쓰기\"를 끄면 본견적 문구를 그대로 두고 금액만 맞춥니다."}
                       </p>
                     </div>
                     <button
@@ -2745,7 +2879,13 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
                         (highlight ? "bg-amber-600 hover:bg-amber-700" : "bg-slate-900 hover:bg-slate-800")
                       }
                     >
-                      {regenerating ? "생성 중… (10~20초)" : notYet ? "비교견적서 생성" : "비교견적서 다시 생성"}
+                      {regenerating
+                        ? comparisonQuotes.some((q) => q.rename_items)
+                          ? "생성 중… (10~20초)"
+                          : "금액 맞추는 중…"
+                        : notYet
+                          ? "비교견적서 생성"
+                          : "비교견적서 다시 생성"}
                     </button>
                   </div>
                   <div className="mt-3 flex flex-wrap gap-2 border-t border-black/5 pt-3">
@@ -2769,6 +2909,35 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
                             className="w-14 rounded border border-black/10 px-1.5 py-0.5 text-right tabular-nums outline-none focus:border-slate-900"
                           />
                           <span className="text-slate-400">%</span>
+                          {/* 품명을 AI가 다시 쓸지 건별로 고른다 — 다시 쓴 결과에 "보고서 발건"
+                              같은 어색한 말이 섞이는 경우가 있고, 반대로 본견적과 품명이 완전히
+                              같아야 하는 건도 있다(2026-08-25 실무자 의견). 끄면 AI를 아예 안
+                              불러서 즉시 끝난다. */}
+                          <span
+                            role="separator"
+                            aria-orientation="vertical"
+                            className="mx-0.5 h-3.5 w-px bg-slate-200"
+                          />
+                          <span
+                            className={
+                              "inline-flex items-center gap-1 " +
+                              (q.rename_items ? "text-slate-700" : "text-slate-400")
+                            }
+                            title={
+                              q.rename_items
+                                ? "품명·구분·상품구성을 다른 표현으로 다시 씁니다."
+                                : "본견적 문구를 그대로 두고 금액만 다시 잡습니다 (AI 호출 없음)."
+                            }
+                          >
+                            <input
+                              type="checkbox"
+                              checked={q.rename_items}
+                              disabled={regenerating}
+                              onChange={(e) => handleToggleRenameItems(q.id, e.target.checked)}
+                              className="h-3.5 w-3.5 accent-slate-900"
+                            />
+                            <span className="font-medium">품명 다시 쓰기</span>
+                          </span>
                           {needsRegeneration.includes(q.id) && (
                             <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-bold text-amber-700">
                               재생성 필요
