@@ -821,7 +821,13 @@ def _unused_rows_before_totals(cell_map: dict, item_updates: CellUpdates) -> set
     return {row for row in range(max(block_rows) + 1, totals_row) if row not in written}
 
 
-def _plan_item_name_merges(sheet_xml: str, columns: Dict[str, str], assignments: list) -> List[tuple]:
+def _plan_item_name_merges(
+    sheet_xml: str,
+    columns: Dict[str, str],
+    assignments: list,
+    end_col_override: Optional[str] = None,
+    key: str = "item_name",
+) -> List[tuple]:
     """품명 칸을 같은 열의 다른 행들이 쓰는 병합 폭에 맞춘다.
 
     썬데이워커 마스터는 머리글(B12:F12)과 아래 투입 리소스 블록(B20:F20)은 B~F로 병합돼
@@ -830,13 +836,18 @@ def _plan_item_name_merges(sheet_xml: str, columns: Dict[str, str], assignments:
     원본이 의도한 폭은 그 열에서 가장 흔한 병합 폭이라고 보고 그걸 그대로 쓴다.
     이미 같은 폭으로 병합된 양식(알파브라더스 E13:H13 등)에서는 같은 범위를 다시 만들 뿐이다.
     """
-    col = columns.get("item_name")
+    col = columns.get(key)
     if not col:
         return []
-    ends = Counter(re.findall(rf'<mergeCell ref="{col}\d+:([A-Z]+)\d+"/>', sheet_xml))
-    if not ends:
-        return []
-    end_col = ends.most_common(1)[0][0]
+    # 자동 추정은 "그 열에서 가장 흔한 병합 폭"이라, 항목표 밖의 넓은 병합(FLES의 C14:F14,
+    # C22:F22 등)이 더 많으면 세부 내용 칸까지 삼킨다. 그런 양식은 cell_map이 폭을 지정한다.
+    if end_col_override:
+        end_col = end_col_override
+    else:
+        ends = Counter(re.findall(rf'<mergeCell ref="{col}\d+:([A-Z]+)\d+"/>', sheet_xml))
+        if not ends:
+            return []
+        end_col = ends.most_common(1)[0][0]
     if _col_index(end_col) <= _col_index(col):
         return []
     rows = {row for block, _g, _o in assignments for row in (block.get("rows") or [])}
@@ -923,6 +934,29 @@ def _apply_merge_ranges(sheet_xml: str, ranges: List[tuple]) -> str:
     )
 
 
+def _remove_merges(sheet_xml: str, refs: List[str]) -> str:
+    """지정한 병합을 통째로 걷어낸다.
+
+    FLES 마스터처럼 항목 칸이 C15:D21 / I15:I21 / J15:J21로 **세로 7행 한 덩어리**인 양식이
+    있다. 그대로 두면 첫 행에 쓴 값만 보이고 두 번째 항목부터는 병합에 먹혀 사라진다
+    (2026-08-25 렌더링으로 확인). 행 삽입으로도 못 푼다 — 병합은 그대로 따라 늘어난다.
+    그래서 발급 시점에 해제하고, 항목 행마다 가로로 다시 묶는다(_plan_item_name_merges).
+    원본 파일은 손대지 않으므로 "마스터를 그대로 쓴다"는 원칙은 유지된다.
+
+    _apply_merge_ranges도 병합을 지우지만 "새로 만들 범위의 시작 셀"에 걸린 것만 지운다 —
+    1×1로는 다시 만들 수 없는 금액·메모 칸(I·J)은 여기서 명시적으로 지워야 한다.
+    """
+    if not refs:
+        return sheet_xml
+    wanted = {ref.replace(" ", "") for ref in refs}
+    sheet_xml = re.sub(
+        r'<mergeCell ref="([A-Z]+\d+:[A-Z]+\d+)"/>',
+        lambda m: "" if m.group(1) in wanted else m.group(0),
+        sheet_xml,
+    )
+    return _renumber_merge_count(sheet_xml)
+
+
 def _add_merge_refs(sheet_xml: str, refs: List[str]) -> str:
     m = re.search(r'<mergeCells[^>]*>', sheet_xml)
     if not m:
@@ -958,6 +992,7 @@ def _patch_xlsx(
     drop_formula_cells: Optional[List[str]] = None,
     merge_ranges: Optional[List[tuple]] = None,
     columns: Optional[Dict[str, str]] = None,
+    unmerge_cells: Optional[List[str]] = None,
 ) -> None:
     with zipfile.ZipFile(io.BytesIO(source_bytes), "r") as zin:
         sheet_path = _sheet_internal_path(zin, sheet_name)
@@ -967,6 +1002,7 @@ def _patch_xlsx(
         styles_xml = _patch_font_substitution(styles_xml)
         styles_xml = _patch_hyperlink_style_bleed(styles_xml)
         sheet_xml = _drop_formulas(sheet_xml, drop_formula_cells or [])
+        sheet_xml = _remove_merges(sheet_xml, unmerge_cells or [])
         sheet_xml = _apply_merge_ranges(sheet_xml, merge_ranges or [])
         patched_sheet_xml = _patch_sheet_xml(sheet_xml, updates)
         if strip_background:
@@ -1184,8 +1220,21 @@ def _resolve_host_templates(supabase, entity_id: str, task_types: List[str], sel
     return candidates
 
 
-def _collect_header_updates(header_fields: Dict[str, str], quote: dict) -> CellUpdates:
+def _collect_header_updates(
+    header_fields: Dict[str, str], quote: dict, header_labels: Optional[Dict[str, str]] = None
+) -> CellUpdates:
+    """머리글 칸을 채운다.
+
+    header_labels는 "라벨이 셀 안에 같이 박혀 있는" 양식용이다(2026-08-25). 예를 들어 안르
+    양식의 C10은 셀 하나에 "연 락 처 : 010-7646-7146"이 통째로 들어 있어서, 값만 쓰면 라벨이
+    지워지고 매핑을 빼면 남의 예시 전화번호가 발급본에 그대로 찍힌다. cell_map에
+    {"client_phone": "연 락 처 : "}를 주면 그 접두사를 붙여서 쓴다.
+
+    아래에서 라벨을 코드로 박아 넣는 필드(recipient_name의 "귀하", service_name의 "용역명: ")
+    에는 header_labels를 주지 말 것 — 라벨이 두 번 붙는다.
+    """
     updates: CellUpdates = {}
+    header_labels = header_labels or {}
     quote_date = quote.get("quote_date")
     if isinstance(quote_date, str):
         quote_date = date.fromisoformat(quote_date)
@@ -1226,13 +1275,24 @@ def _collect_header_updates(header_fields: Dict[str, str], quote: dict) -> CellU
             # 테스티파이 마스터는 이 셀 자체가 "용역명: " 라벨이다(recipient_name의 "귀하"와 같은
             # 패턴) — 값만 쓰면 라벨이 지워진다(2026-08-13 사용자 발견). 용역명도 선택 입력이라
             # 비어 있으면 라벨만 덩그러니 남기지 않고 칸을 비운다.
-            updates[coord] = f"용역명: {quote['service_name']}" if quote.get("service_name") else ""
+            # 라벨이 옆 칸에 따로 있는 양식(위드앤코의 "프로젝트 명")은 cell_map에서
+            # header_labels: {"service_name": ""} 로 접두사를 지울 수 있다(2026-08-25).
+            prefix = header_labels.get("service_name", "용역명: ")
+            updates[coord] = f"{prefix}{quote['service_name']}" if quote.get("service_name") else ""
+        elif field == "duration_text":
+            # 값이 없으면 칸을 비운다 — 안 건드리면 마스터에 남아 있는 남의 견적 건 기간
+            # ("약 60일", "1.5개월 예상")이 그대로 발급된다(2026-08-25 발견).
+            updates[coord] = quote.get("duration_text") or ""
         elif field == "recipient_block":
             updates[coord] = (
                 f"수신자 : {quote.get('recipient_name') or ''}\n\n아래와 같이 견적서를 발송합니다.\n\n"
                 f"{quote_date.year}년 {quote_date.month}월 {quote_date.day}일"
             )
         # validity_text 등 우리 데이터에 대응 값이 없는 필드는 건드리지 않는다(원본 값 유지)
+
+        # 값이 비어도 라벨은 남긴다 — 라벨까지 지우면 양식에 정체불명의 빈 칸이 생긴다.
+        if field in header_labels and field != "service_name" and coord in updates:
+            updates[coord] = f"{header_labels[field]}{updates[coord]}"
     return updates
 
 
@@ -1854,6 +1914,10 @@ def _collect_item_block_updates(
                 updates[f"{columns[extra_key]}{row}"] = extra_value
             if "note" in columns and item.get("note"):
                 updates[f"{columns['note']}{row}"] = item["note"]
+            # 기술수준(스프린트) — quote_pricing.assign_grades가 금액 순으로 초안을 넣고,
+            # 실무자가 표에서 고치면 그 값이 그대로 온다.
+            if "grade" in columns and item.get("grade"):
+                updates[f"{columns['grade']}{row}"] = item["grade"]
     return updates, hidden_rows
 
 
@@ -1969,7 +2033,9 @@ def _build_filled_xlsx_from_quote(quote: dict, filled_path: Path) -> None:
     ]
 
     updates: CellUpdates = {}
-    updates.update(_collect_header_updates(cell_map.get("header_fields", {}), quote))
+    updates.update(_collect_header_updates(
+            cell_map.get("header_fields", {}), quote, cell_map.get("header_labels")
+        ))
     updates.update(item_updates)
     updates.update(_collect_totals_updates(cell_map.get("totals", {}), grand_total, vat_amount, supply_amount))
     for coord in cell_map.get("always_clear_cells", []):
@@ -1984,10 +2050,18 @@ def _build_filled_xlsx_from_quote(quote: dict, filled_path: Path) -> None:
         item_blocks=[b for b in cell_map.get("item_blocks", []) if b.get("role") != "labor_fte"],
         strip_background=(entity_name == "ABBG"),
         drop_formula_cells=list(cell_map.get("drop_formula_cells") or []) + item_input_cells,
+        # column_merge_end_cols: 항목 행에서 어느 컬럼을 어디까지 가로 병합할지 양식이 직접
+        # 지정한다. 세로 병합을 걷어낸 양식(FLES)은 자동 추정이 항목표 밖의 넓은 병합을
+        # 골라 세부 내용 칸까지 삼키므로 반드시 지정해야 한다(2026-08-25).
         merge_ranges=_plan_category_merges(sheet_xml, assignments)
-        + _plan_item_name_merges(sheet_xml, columns, assignments)
+        + [
+            span
+            for key, end_col in (cell_map.get("column_merge_end_cols") or {"item_name": None}).items()
+            for span in _plan_item_name_merges(sheet_xml, columns, assignments, end_col, key)
+        ]
         + _plan_mid_category_merges(sheet_xml, columns, assignments),
         columns=columns,
+        unmerge_cells=cell_map.get("unmerge_cells"),
     )
 
 
