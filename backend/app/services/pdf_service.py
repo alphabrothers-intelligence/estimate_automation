@@ -1308,6 +1308,44 @@ def _rollup_to_category_totals(
     return [g if len(g["items"]) <= 1 else folded(g) for g in groups]
 
 
+def _description_parts(text: Optional[str]) -> List[str]:
+    """상품구성("1. A\n2. B")을 괄호 안에 슬래시로 이어 붙일 조각으로 쪼갠다. 번호는 뗀다."""
+    if not text:
+        return []
+    return [
+        stripped
+        for line in text.splitlines()
+        if (stripped := re.sub(r"^\s*\d{1,2}[.)]\s*", "", line).strip())
+    ]
+
+
+def _fold_name_only(groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """품명 한 칸짜리 양식(블렌디드랩·썬데이워커)의 기본 표시 방식.
+
+    항목에 상품구성이 있으면 **항목마다 한 줄**을 쓰고 그 항목의 상품구성을 괄호에 넣는다:
+    "MVP 제작\n(MVP 상세페이지 디자인 작업 / MVP별 랜딩페이지 구축 / GA 등 분석 Tool 구축)".
+    본견적(테스티파이)의 상품명이 이 양식의 품명이 되고, 상품구성이 그 아래 괄호에 들어간다
+    — 2026-08-24 실무자 지적("품목이 안 쪼개지고 하나에 다 들어감").
+
+    상품구성이 없는 카탈로그(마케팅류)는 괄호에 넣을 게 없으니 예전처럼 카테고리당 한 줄로
+    묶고 항목명을 괄호에 넣는다. 낱개 이름만 죽 나열하면 무슨 묶음인지 안 보이기 때문이다.
+
+    항목마다 한 줄이면 각 줄이 자기 단가·수량을 그대로 들고 가므로, 묶음 줄에 단가가 없어
+    양식 수식이 금액을 0으로 재계산하던 문제(2026-08-21)는 애초에 생기지 않는다.
+    """
+    folded: List[Dict[str, Any]] = []
+    for group in groups:
+        if not any(item.get("description") for item in group["items"]):
+            folded.append(_rollup_to_category_totals([group], inline_names=True)[0])
+            continue
+        items = []
+        for item in group["items"]:
+            parts = _description_parts(item.get("description"))
+            items.append(dict(item, name=f"{item['name']}\n({' / '.join(parts)})" if parts else item["name"]))
+        folded.append({**group, "items": items})
+    return folded
+
+
 def _try_assign_flat(groups: List[Dict[str, Any]], flat_blocks: List[dict]) -> Optional[List[tuple]]:
     assignments: List[tuple] = []
     block_idx = 0
@@ -1348,10 +1386,10 @@ def _assign_groups_to_blocks(
             for g in groups
         ]
     elif _is_name_only_form(columns, blocks):
-        # 품명 한 칸짜리 양식(블렌디드랩·썬데이워커)도 자리가 모자랄 때만 쓰는 최후 수단이 아니라
-        # 이게 기본 표시 방식이다 — "그로스마케팅 운영\n(주간 성과 리포트 / 주간 실행과제)".
-        # 행을 늘려 낱개로 나열하면 무슨 묶음인지 알 수 없다(2026-08-24 사용자 재지적).
-        groups = _rollup_to_category_totals(groups, inline_names=True)
+        # 품명 한 칸짜리 양식(블렌디드랩·썬데이워커)은 세부를 적을 다른 칸이 없어 품명 아래
+        # 괄호에 넣는 게 기본 표시 방식이다. 상품구성이 있으면 항목당 한 줄, 없으면 카테고리당
+        # 한 줄로 묶는다 — 자세한 건 _fold_name_only.
+        groups = _fold_name_only(groups)
 
     # 카테고리 전용 블록 — 카테고리 라벨 칸이든 구분(대) 칸이든, 그 블록이 카테고리 하나를
     # 통째로 담는다는 뜻이라 똑같이 "그룹 1개 = 블록 1개"로 배정한다. 구분(대)에 모듈명을 넣게
@@ -1626,11 +1664,10 @@ def _assignment_attempts(template: dict, source_bytes: bytes, sheet_xml: str, gr
     columns = template["cell_map"].get("columns", {})
     blocks = template["cell_map"].get("item_blocks", [])
     yield template, source_bytes, sheet_xml, False
-    # 품명 한 칸짜리 양식은 _assign_groups_to_blocks가 항상 카테고리당 한 줄로 묶으므로,
-    # 행을 늘려야 할 때도 늘릴 줄 수는 "카테고리 수" 기준이다 — 낱개 항목 수로 늘리면
-    # 쓰지도 않을 행만 잔뜩 끼워 넣고 숨기게 된다.
+    # 품명 한 칸짜리 양식은 _assign_groups_to_blocks가 같은 방식으로 묶으므로, 늘릴 줄 수도
+    # 묶은 뒤의 줄 수를 기준으로 센다 — 안 그러면 쓰지도 않을 행만 끼워 넣고 숨기게 된다.
     if _is_name_only_form(columns, blocks):
-        groups = _rollup_to_category_totals(groups, inline_names=True)
+        groups = _fold_name_only(groups)
     grown = _grow_template(template, source_bytes, groups)
     if grown is not None:
         yield (*grown, False)

@@ -37,6 +37,21 @@ def _items():
     ]
 
 
+def _items_with_description():
+    """테스티파이 시장성 테스트 카탈로그의 모양 — 상품명마다 상품구성이 붙어 있다."""
+    return [
+        {"category": "시장성 테스트", "name": "BM 진단 및 고도화", "amount": 2_000_000,
+         "unit_price": 2_000_000, "work_days": 1, "quantity": 1,
+         "description": "1. Business Model 9 Canvas 작성 및 분석\n2. Value Curve 작성 및 분석"},
+        {"category": "시장성 테스트", "name": "MVP 제작", "amount": 9_000_000,
+         "unit_price": 3_000_000, "work_days": 10, "quantity": 3,
+         "description": "1. MVP 상세페이지 디자인 작업\n2. MVP별 랜딩페이지 구축"},
+        {"category": "시장성 테스트", "name": "결과 리포트 제공", "amount": 1_500_000,
+         "unit_price": 1_500_000, "work_days": 1, "quantity": 1,
+         "description": "1. 시장성 데이터 분석 리포트 제작\n2. 분석 결과 보고"},
+    ]
+
+
 def test_name_only_form_detection():
     assert p._is_name_only_form(BLENDEDLAB_COLUMNS, BLENDEDLAB_BLOCKS)
     assert not p._is_name_only_form(ALPHA_COLUMNS, ALPHA_BLOCKS)
@@ -69,6 +84,38 @@ def test_grouped_row_carries_unit_price_so_form_formula_survives():
         assert item["work_days"] * item["quantity"] * item["unit_price"] == item["amount"]  # AA = SUM(T*V*X)
 
     assert sum(g["amount"] for _, g, _ in assignments) == sum(i["amount"] for i in _items())
+
+
+def test_blendedlab_splits_one_row_per_product_when_description_exists():
+    """실무자 지적(2026-08-24): 테스티파이 상품명이 블렌디드랩 품명, 상품구성이 그 아래 괄호."""
+    groups = p._group_line_items(_items_with_description())
+    assignments = p._assign_groups_to_blocks(groups, BLENDEDLAB_BLOCKS, BLENDEDLAB_COLUMNS)
+
+    names = [item["name"] for _, group, _ in assignments for item in group["items"]]
+    assert names == [
+        "BM 진단 및 고도화\n(Business Model 9 Canvas 작성 및 분석 / Value Curve 작성 및 분석)",
+        "MVP 제작\n(MVP 상세페이지 디자인 작업 / MVP별 랜딩페이지 구축)",
+        "결과 리포트 제공\n(시장성 데이터 분석 리포트 제작 / 분석 결과 보고)",
+    ], names
+
+
+def test_split_rows_keep_their_own_unit_price_and_quantity():
+    """항목당 한 줄이면 각 줄이 자기 단가·수량을 그대로 들고 가야 양식 수식이 맞는다."""
+    groups = p._group_line_items(_items_with_description())
+    assignments = p._assign_groups_to_blocks(groups, BLENDEDLAB_BLOCKS, BLENDEDLAB_COLUMNS)
+    rows = [item for _, group, _ in assignments for item in group["items"]]
+
+    for row, src in zip(rows, _items_with_description()):
+        assert (row["unit_price"], row["quantity"], row["work_days"], row["amount"]) == (
+            src["unit_price"], src["quantity"], src["work_days"], src["amount"]
+        ), row
+    assert sum(r["amount"] for r in rows) == sum(i["amount"] for i in _items_with_description())
+
+
+def test_row_growth_counts_split_rows_not_categories():
+    """상품구성이 있으면 카테고리 1개라도 항목 수만큼 행을 늘려야 한다(예전엔 1줄로 셌다)."""
+    groups = p._fold_name_only(p._group_line_items(_items_with_description()))
+    assert sum(len(g["items"]) for g in groups) == 3
 
 
 def test_description_form_keeps_vertical_list_not_parentheses():
