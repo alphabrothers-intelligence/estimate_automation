@@ -255,14 +255,17 @@ def _apply(items: List[dict], edit: dict, form: quote_pricing.FormSpec) -> Tuple
 
 
 def edit_entity_quote(
-    entity_quote_id: str, edit_request_text: str, attachment: Optional[Dict[str, str]] = None
+    entity_quote_id: str,
+    edit_request_text: str,
+    attachment: Optional[Dict[str, str]] = None,
+    current_items: Optional[List[dict]] = None,
 ) -> EditResult:
     supabase = get_supabase()
     quote_res = (
         supabase.table("entity_quotes")
         .select(
             "id, entity_id, is_primary, task_type, task_types, line_items, estimate_set_id, selected_modules, "
-            "chat_history, adjustment_note, markup_ratio, is_catalog_borrowed, catalog_source_entity_name, "
+            "chat_history, adjustment_note, markup_ratio, rename_items, duration_text, is_catalog_borrowed, catalog_source_entity_name, "
             "service_name, quote_date, recipient_name, recipient_contact, recipient_phone, recipient_email, "
             "entity_templates(name)"
         )
@@ -272,6 +275,10 @@ def edit_entity_quote(
     if not quote_res.data:
         raise HTTPException(status_code=404, detail="견적서를 찾을 수 없습니다.")
     quote = quote_res.data[0]
+    # 화면에 떠 있는(아직 반영 안 한) 항목이 있으면 그걸 기준으로 고친다. DB 항목으로 고치면
+    # 반영 전에 두 번 연달아 채팅한 경우 첫 번째 수정이 사라진다(2026-08-24 롤백 신고).
+    if current_items is not None:
+        quote["line_items"] = current_items
     vat_included = (
         supabase.table("estimate_sets").select("vat_included").eq("id", quote["estimate_set_id"]).execute()
     ).data[0]["vat_included"]
@@ -286,6 +293,11 @@ def edit_entity_quote(
     message = get_anthropic().messages.create(
         model=CLAUDE_MODEL,
         max_tokens=CLAUDE_MAX_TOKENS,
+        # 실무자 1차 피드백 "AI 채팅 답변이 너무 느림"(2026-08-24). 기본값은 effort=high라
+        # 항목 한 줄 고쳐달라는 요청에도 깊게 추론하고 앉아 있다. thinking은 끄지 않는다 —
+        # 끄면 Sonnet 5가 도구(apply_quote_edit)를 덜 부르고, 이 화면은 도구를 불러야 표가
+        # 바뀐다. 답변 품질이 떨어지면 "high"로 되돌린다.
+        output_config={"effort": "medium"},
         # 견적서 전체가 들어가는 시스템 프롬프트라 매 턴 다시 처리하면 비싸다 — 캐시에 태운다.
         system=[{
             "type": "text",
@@ -366,6 +378,8 @@ def edit_entity_quote(
             recipient_email=quote["recipient_email"],
             adjustment_note=quote.get("adjustment_note"),
             markup_ratio=float(quote["markup_ratio"]) if quote.get("markup_ratio") is not None else None,
+        rename_items=bool(quote.get("rename_items", True)),
+        duration_text=quote.get("duration_text"),
             **pdf_service.get_column_display(
                 supabase, quote["entity_id"], quote["task_types"], quote.get("selected_modules")
             ),

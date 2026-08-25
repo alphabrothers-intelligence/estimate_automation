@@ -69,6 +69,11 @@ def _call_claude_for_selection(
             model=CLAUDE_MODEL,
             max_tokens=CLAUDE_MAX_TOKENS,
             system=SYSTEM_PROMPT,
+            # 목록에서 하나 고르는 분류 작업이라 추론이 필요 없다. 기본값(effort=high +
+            # adaptive thinking)으로 두면 견적 생성이 시작되기도 전에 이 호출 하나가 수십 초를
+            # 먹는다 — 실무자 1차 피드백 "생성 결과가 너무 느림"의 첫 구간(2026-08-24).
+            output_config={"effort": "low"},
+            thinking={"type": "disabled"},
             messages=[{"role": "user", "content": user_content}],
         )
         text = next((b.text for b in message.content if b.type == "text"), "")

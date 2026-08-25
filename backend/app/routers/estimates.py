@@ -13,6 +13,7 @@ from app.models.estimate import (
     EntityQuoteOut,
     LineItemsUpdate,
     MarkupRatioUpdate,
+    RenameItemsUpdate,
     LineItemsUpdateResult,
     QuoteDateUpdate,
     QuoteVersionOut,
@@ -58,7 +59,10 @@ def generate_estimate_set(estimate_set_id: str, payload: GenerateRequest = Gener
 @entity_quotes_router.post("/{entity_quote_id}/edit", response_model=EditResult)
 def edit_entity_quote(entity_quote_id: str, payload: EditRequest):
     return chat_service.edit_entity_quote(
-        entity_quote_id, payload.edit_request_text, payload.attachment.model_dump() if payload.attachment else None
+        entity_quote_id,
+        payload.edit_request_text,
+        payload.attachment.model_dump() if payload.attachment else None,
+        [item.model_dump() for item in payload.current_items] if payload.current_items else None,
     )
 
 
@@ -89,6 +93,11 @@ def update_line_items(entity_quote_id: str, payload: LineItemsUpdate):
     return estimate_service.update_line_items(
         entity_quote_id, payload.items, payload.edit_request_text or "직접편집", payload.comparison_mode
     )
+
+
+@entity_quotes_router.put("/{entity_quote_id}/rename-items", response_model=EntityQuoteOut)
+def update_rename_items(entity_quote_id: str, payload: RenameItemsUpdate):
+    return estimate_service.update_rename_items(entity_quote_id, payload.rename_items)
 
 
 @entity_quotes_router.put("/{entity_quote_id}/markup-ratio", response_model=EntityQuoteOut)
