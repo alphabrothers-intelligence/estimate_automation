@@ -21,6 +21,25 @@ FALLBACK_SOURCE_BY_TASK_TYPE = {
 # 테스티파이 카탈로그를 자리채움으로 빌려쓰던 게 오해를 낳아 제외했었음 — 2026-07-10 결정, 이제 해제).
 EXCLUDED_ENTITIES_BY_TASK_TYPE: dict = {}
 
+# 법인 선택 목록의 순서 (2026-08-25 사용자 지정).
+#
+# 앞: 본견적서로 자주 쓰는 순서 그대로 고정한다. 가나다순으로 두면 자주 쓰는 법인이 흩어져
+#     매번 눈으로 찾아야 한다.
+# 뒤: 썬데이워커. 마스터 양식에 직인이 찍혀 있지 않아 고를 때마다 날인을 따로 요청해야 한다 —
+#     그 번거로움을 없애려고 직인이 박힌 타사 양식들을 새로 받아 등록했다(마이그레이션 052).
+#     숨기지는 않는다. 필요하면 여전히 쓸 수 있어야 한다.
+# 가운데: 나머지(비교견적 전용 타사 양식들). 순서는 상관없어서 가나다순으로 둔다.
+PRIMARY_ENTITY_ORDER = ("알파브라더스", "테스티파이", "블렌디드랩", "ABBG")
+DEPRIORITIZED_ENTITIES = frozenset({"썬데이워커"})
+
+
+def _entity_sort_key(name: str) -> tuple:
+    if name in PRIMARY_ENTITY_ORDER:
+        return (0, PRIMARY_ENTITY_ORDER.index(name), "")
+    if name in DEPRIORITIZED_ENTITIES:
+        return (2, 0, name)
+    return (1, 0, name)
+
 
 def list_task_types() -> List[str]:
     """item_catalogs에 실제로 존재하는 과업종류만 후보로 노출 (PRD 3.2, 7.1-2)."""
@@ -49,7 +68,7 @@ def list_entities_for_task_type(task_type: str) -> List[EntityOption]:
         for entity_id, name in _fetch_all_entity_rows()
         if name not in excluded_names
     ]
-    return sorted(entities, key=lambda e: e.name)
+    return sorted(entities, key=lambda e: _entity_sort_key(e.name))
 
 
 def _fetch_catalog_rows(entity_id: str, task_type: str) -> List[dict]:
