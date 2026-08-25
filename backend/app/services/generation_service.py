@@ -133,6 +133,19 @@ def _load_catalog(quote: dict, entity_name: str, selected_modules: Optional[List
     return rows, borrowed
 
 
+def draft_duration_text(items: List[dict]) -> Optional[str]:
+    """확정된 항목의 작업일에서 "업무 기간" 초안을 만든다 (마이그레이션 053).
+
+    과업은 대체로 병행하므로 작업일의 **합이 아니라 최대값**이 전체 기간이다 — 위드앤코
+    원본도 항목 소요기간이 20/14/60/20일인데 업무 기간은 "약 60일"이라고 적혀 있다.
+    작업일이 아예 없거나 전부 1이면(그 양식에 작업일 개념이 없다는 뜻) 초안을 만들지 않는다.
+    실무자가 화면에서 언제든 고쳐 쓰는 값이라 여기서 정교할 필요는 없다.
+    """
+    days = [int(i["work_days"]) for i in items if i.get("work_days")]
+    longest = max(days, default=0)
+    return f"약 {longest}일" if longest > 1 else None
+
+
 def _store(quote: dict, items: List[dict], vat_included: bool, extra: dict, label: str,
            form: Optional[FormSpec] = None) -> List[dict]:
     # 저장 직전 마지막 관문 — 구조적 위반이 있으면 저장하지 않고 실패시킨다.
@@ -140,11 +153,14 @@ def _store(quote: dict, items: List[dict], vat_included: bool, extra: dict, labe
     if form is not None:
         assert_storable(items, form, f"{quote['entity_templates']['name']} {label}")
     supply = sum(i["amount"] for i in items)
+    # 업무 기간은 "초안만" 넣는다 — 이미 값이 있으면(=실무자가 고쳤으면) 덮지 않는다.
+    duration = quote.get("duration_text") or draft_duration_text(items)
     get_supabase().table("entity_quotes").update(
         {
             "total_amount": grand_total(supply, vat_included),
             "line_items": items,
             "adjustment_note": label,
+            **({"duration_text": duration} if duration else {}),
             **extra,
         }
     ).eq("id", quote["id"]).execute()
@@ -222,12 +238,34 @@ def _merge_with_catalog(ai_items: List[dict], catalog_rows: List[dict], form: Fo
 def _generate_comparison(
     quote: dict, primary_entity: str, primary_items: List[dict], primary_supply: int, vat_included: bool
 ) -> List[dict]:
-    """확정된 본견적을 입력으로 같은 과업을 다른 업체 어투로 다시 쓴다."""
+    """확정된 본견적을 입력으로 같은 과업을 다른 업체 어투로 다시 쓴다.
+
+    rename_items=False면 문구를 그대로 두고 금액만 다시 잡는다 — AI를 부를 이유가 없어서
+    0원·즉시로 끝난다(마이그레이션 051, 2026-08-25 요청).
+    """
     supabase = get_supabase()
     entity_name = quote["entity_templates"]["name"]
     markup = float(quote.get("markup_ratio") or (1 + DEFAULT_COMPARISON_MARKUP)) - 1
     selected_modules = quote.get("selected_modules")
     form = pdf_service.resolve_form_spec(supabase, quote["entity_id"], quote["task_types"], selected_modules)
+    target_supply = round(primary_supply * (1 + markup))
+
+    if not quote.get("rename_items", True):
+        # 품명 유지 — 본견적 항목을 그대로 복사하고 단가에 배율만 곱한다. finalize가 이 양식의
+        # 수식·단가 단위로 목표에 맞춘다(rescale_comparisons와 같은 계산).
+        items = [
+            dict(src, unit_price=(src.get("unit_price") or 0) * (1 + markup), amount=0)
+            for src in primary_items
+        ]
+        items, residual, log = finalize(items, target_supply, form)
+        return _store(
+            quote,
+            items,
+            vat_included,
+            {"markup_ratio": round(1 + markup, 4), "selected_modules": selected_modules},
+            _label(f"비교견적 생성 (품명 유지, 마크업 +{round(markup * 100)}%)", residual, log),
+            form,
+        )
 
     result = _call_claude(
         quote_prompts.COMPARISON_SYSTEM,
@@ -262,7 +300,6 @@ def _generate_comparison(
                 "mid_category": src.get("mid_category"),
             }
         )
-    target_supply = round(primary_supply * (1 + markup))
     items, residual, log = finalize(items, target_supply, form)
 
     return _store(
@@ -301,7 +338,7 @@ def generate_estimate_set(
         supabase.table("entity_quotes")
         .select(
             "id, entity_id, is_primary, task_type, task_types, service_name, markup_ratio, "
-            "selected_modules, entity_templates(name)"
+            "selected_modules, rename_items, duration_text, entity_templates(name)"
         )
         .eq("estimate_set_id", estimate_set_id)
         .execute()
@@ -361,7 +398,7 @@ def regenerate_comparisons(estimate_set_id: str) -> EstimateSetOut:
         supabase.table("entity_quotes")
         .select(
             "id, entity_id, is_primary, task_type, task_types, service_name, markup_ratio, "
-            "selected_modules, line_items, entity_templates(name)"
+            "selected_modules, line_items, rename_items, duration_text, entity_templates(name)"
         )
         .eq("estimate_set_id", estimate_set_id)
         .execute()

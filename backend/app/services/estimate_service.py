@@ -138,6 +138,8 @@ def create_estimate_set(payload: EstimateSetCreate) -> EstimateSetOut:
             recipient_email=row["recipient_email"],
             adjustment_note=row.get("adjustment_note"),
             markup_ratio=float(row["markup_ratio"]) if row.get("markup_ratio") is not None else None,
+            rename_items=bool(row.get("rename_items", True)),
+            duration_text=row.get("duration_text"),
             **pdf_service.get_column_display(supabase, row["entity_id"], row["task_types"], None),
         )
         for row in quotes_res.data
@@ -165,7 +167,7 @@ def get_estimate_set(estimate_set_id: str) -> EstimateSetOut:
         supabase.table("entity_quotes")
         .select(
             "id, entity_id, is_primary, task_type, task_types, total_amount, line_items, selected_modules, "
-            "adjustment_note, markup_ratio, "
+            "adjustment_note, markup_ratio, rename_items, duration_text, "
             "is_catalog_borrowed, catalog_source_entity_name, service_name, quote_date, "
             "recipient_name, recipient_contact, recipient_phone, recipient_email, entity_templates(name)"
         )
@@ -192,6 +194,8 @@ def get_estimate_set(estimate_set_id: str) -> EstimateSetOut:
             recipient_email=row["recipient_email"],
             adjustment_note=row.get("adjustment_note"),
             markup_ratio=float(row["markup_ratio"]) if row.get("markup_ratio") is not None else None,
+            rename_items=bool(row.get("rename_items", True)),
+            duration_text=row.get("duration_text"),
             **pdf_service.get_column_display(
                 supabase, row["entity_id"], row["task_types"], row.get("selected_modules")
             ),
@@ -252,7 +256,7 @@ def update_service_name(entity_quote_id: str, service_name: str) -> EntityQuoteO
         supabase.table("entity_quotes")
         .select(
             "id, entity_id, is_primary, task_type, task_types, total_amount, line_items, selected_modules, "
-            "adjustment_note, markup_ratio, "
+            "adjustment_note, markup_ratio, rename_items, duration_text, "
             "is_catalog_borrowed, catalog_source_entity_name, quote_date, "
             "recipient_name, recipient_contact, recipient_phone, recipient_email, entity_templates(name)"
         )
@@ -287,6 +291,8 @@ def update_service_name(entity_quote_id: str, service_name: str) -> EntityQuoteO
         recipient_email=quote["recipient_email"],
         adjustment_note=quote.get("adjustment_note"),
         markup_ratio=float(quote["markup_ratio"]) if quote.get("markup_ratio") is not None else None,
+        rename_items=bool(quote.get("rename_items", True)),
+        duration_text=quote.get("duration_text"),
         **pdf_service.get_column_display(
             supabase, quote["entity_id"], quote["task_types"], quote.get("selected_modules")
         ),
@@ -301,7 +307,7 @@ def update_quote_date(entity_quote_id: str, quote_date: date) -> EntityQuoteOut:
         supabase.table("entity_quotes")
         .select(
             "id, entity_id, is_primary, task_type, task_types, total_amount, line_items, selected_modules, "
-            "adjustment_note, markup_ratio, "
+            "adjustment_note, markup_ratio, rename_items, duration_text, "
             "is_catalog_borrowed, catalog_source_entity_name, service_name, "
             "recipient_name, recipient_contact, recipient_phone, recipient_email, entity_templates(name)"
         )
@@ -334,6 +340,8 @@ def update_quote_date(entity_quote_id: str, quote_date: date) -> EntityQuoteOut:
         recipient_email=quote["recipient_email"],
         adjustment_note=quote.get("adjustment_note"),
         markup_ratio=float(quote["markup_ratio"]) if quote.get("markup_ratio") is not None else None,
+        rename_items=bool(quote.get("rename_items", True)),
+        duration_text=quote.get("duration_text"),
         **pdf_service.get_column_display(
             supabase, quote["entity_id"], quote["task_types"], quote.get("selected_modules")
         ),
@@ -348,7 +356,7 @@ def update_recipient_info(entity_quote_id: str, payload: RecipientInfoUpdate) ->
         supabase.table("entity_quotes")
         .select(
             "id, entity_id, is_primary, task_type, task_types, total_amount, line_items, selected_modules, "
-            "adjustment_note, markup_ratio, "
+            "adjustment_note, markup_ratio, rename_items, duration_text, "
             "is_catalog_borrowed, catalog_source_entity_name, service_name, quote_date, "
             "recipient_name, recipient_contact, recipient_phone, recipient_email, entity_templates(name)"
         )
@@ -382,6 +390,8 @@ def update_recipient_info(entity_quote_id: str, payload: RecipientInfoUpdate) ->
         recipient_email=quote["recipient_email"],
         adjustment_note=quote.get("adjustment_note"),
         markup_ratio=float(quote["markup_ratio"]) if quote.get("markup_ratio") is not None else None,
+        rename_items=bool(quote.get("rename_items", True)),
+        duration_text=quote.get("duration_text"),
         **pdf_service.get_column_display(
             supabase, quote["entity_id"], quote["task_types"], quote.get("selected_modules")
         ),
@@ -474,6 +484,8 @@ def update_line_items(
         recipient_email=quote["recipient_email"],
         adjustment_note=quote.get("adjustment_note"),
         markup_ratio=float(quote["markup_ratio"]) if quote.get("markup_ratio") is not None else None,
+        rename_items=bool(quote.get("rename_items", True)),
+        duration_text=quote.get("duration_text"),
         **pdf_service.get_column_display(
             supabase, quote["entity_id"], quote["task_types"], quote.get("selected_modules")
         ),
@@ -509,6 +521,15 @@ def list_quote_versions(entity_quote_id: str) -> List[QuoteVersionOut]:
     ]
 
 
+def update_rename_items(entity_quote_id: str, rename_items: bool) -> EntityQuoteOut:
+    """비교견적 품명을 AI가 다시 쓸지 켜고 끈다. 금액·항목은 여기서 건드리지 않는다 —
+    "비교견적 다시 생성"을 눌러야 그 설정대로 다시 만들어진다(마이그레이션 051)."""
+    get_supabase().table("entity_quotes").update({"rename_items": rename_items}).eq(
+        "id", entity_quote_id
+    ).execute()
+    return _load_entity_quote(entity_quote_id)
+
+
 def update_markup_ratio(entity_quote_id: str, markup_ratio: float) -> EntityQuoteOut:
     """비교견적의 인상률만 바꾼다. 금액은 여기서 건드리지 않는다 — 사용자가 %를 입력한 뒤
     "비교견적 다시 생성"을 눌러야 그 비율로 항목이 다시 쓰인다(2026-08-21)."""
@@ -526,7 +547,7 @@ def _load_entity_quote(entity_quote_id: str) -> EntityQuoteOut:
         supabase.table("entity_quotes")
         .select(
             "id, entity_id, is_primary, task_type, task_types, total_amount, line_items, selected_modules, "
-            "adjustment_note, markup_ratio, is_catalog_borrowed, catalog_source_entity_name, service_name, "
+            "adjustment_note, markup_ratio, rename_items, duration_text, is_catalog_borrowed, catalog_source_entity_name, service_name, "
             "quote_date, recipient_name, recipient_contact, recipient_phone, recipient_email, "
             "entity_templates(name)"
         )
@@ -555,6 +576,8 @@ def _load_entity_quote(entity_quote_id: str) -> EntityQuoteOut:
         recipient_email=quote["recipient_email"],
         adjustment_note=quote.get("adjustment_note"),
         markup_ratio=float(quote["markup_ratio"]) if quote.get("markup_ratio") is not None else None,
+        rename_items=bool(quote.get("rename_items", True)),
+        duration_text=quote.get("duration_text"),
         **pdf_service.get_column_display(
             supabase, quote["entity_id"], quote["task_types"], quote.get("selected_modules")
         ),

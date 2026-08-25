@@ -82,6 +82,10 @@ class EntityQuoteOut(BaseModel):
     adjustment_note: Optional[str] = None
     # 비교견적의 인상률(1.10 = +10%). 화면에서 %를 고쳐 다시 생성할 때 현재 값이 필요하다.
     markup_ratio: Optional[float] = None
+    # 비교견적서 품명을 AI가 다시 쓸지(마이그레이션 051). 본견적서에서는 의미 없다.
+    rename_items: bool = True
+    # 머리글의 업무/제작 기간 표기. 그 칸이 있는 양식에서만 쓰인다(마이그레이션 053).
+    duration_text: Optional[str] = None
 
 
 class GenerateRequest(BaseModel):
@@ -101,6 +105,8 @@ class RecipientInfoUpdate(BaseModel):
     recipient_contact: Optional[str] = None
     recipient_phone: Optional[str] = None
     recipient_email: Optional[str] = None
+    # 업무/제작 기간 표기(마이그레이션 053). 생성 시 초안이 들어가고 여기서 고친다.
+    duration_text: Optional[str] = None
 
 
 class EstimateSetOut(BaseModel):
@@ -132,6 +138,11 @@ class ChatAttachment(BaseModel):
 class EditRequest(BaseModel):
     edit_request_text: str = Field(min_length=1)
     attachment: Optional[ChatAttachment] = None
+    # 화면이 지금 보여주고 있는 항목들. "수정 반영하기"를 아직 안 눌렀으면 DB와 다르다.
+    # 이걸 안 받으면 채팅이 매번 DB 상태를 기준으로 고쳐서, 반영 전에 두 번 연달아 요청하면
+    # 첫 번째 수정이 통째로 사라진다 — 실무자 신고 "채팅으로 추가는 되지만 때때로 롤백됨"
+    # (2026-08-24). 안 보내면(구버전 프론트) 예전처럼 DB 항목을 쓴다.
+    current_items: Optional[List["LineItemIn"]] = None
 
 
 
@@ -156,6 +167,9 @@ class LineItemIn(BaseModel):
     description: Optional[str] = None
     # 구분(중) — description과 같은 이유로 여기 없으면 저장할 때마다 지워진다(2026-08-19).
     mid_category: Optional[str] = None
+    # 기술수준(특급/고급/중급/초급). 그 칸이 있는 양식에서만 쓰인다 — line_items가 jsonb라
+    # 마이그레이션 없이 붙는다.
+    grade: Optional[str] = None
 
 
 class LineItemsUpdate(BaseModel):
@@ -178,6 +192,10 @@ class EditResult(BaseModel):
     reply: str = ""
     entity_quote: EntityQuoteOut
     changed_items: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class RenameItemsUpdate(BaseModel):
+    rename_items: bool
 
 
 class MarkupRatioUpdate(BaseModel):
