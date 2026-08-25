@@ -74,7 +74,28 @@ def cmd_status():
         print(f"{mark} {path.name}")
 
 
+# 이 스크립트가 컨테이너 시작 시 자동 실행되면서(Dockerfile CMD, 2026-08-25) 인스턴스 두 개가
+# 동시에 같은 마이그레이션을 잡을 수 있게 됐다 — Render는 배포 중 새 인스턴스와 기존 인스턴스를
+# 잠깐 겹쳐 띄운다. 마이그레이션 1건은 원자적이지만(적용+기록이 한 트랜잭션), 둘이 같이 달리면
+# 한쪽은 schema_migrations 기본키 충돌이나 "이미 있는 컬럼" 에러로 죽고 그 컨테이너는 안 뜬다.
+# 세션 수명 동안 유지되는 Postgres 권고 락으로 한 번에 하나만 돌게 한다.
+_MIGRATION_LOCK_KEY = 8_240_825  # 이 프로젝트 전용 임의 상수
+
+
 def cmd_up(target: Optional[str] = None):
+    # 락 전용 연결. 아래 루프가 마이그레이션마다 별도 연결을 열기 때문에, 락은 그것들보다
+    # 오래 살아남는 연결이 들고 있어야 한다(권고 락은 연결이 닫히면 자동 해제된다).
+    lock_conn = get_connection()
+    try:
+        with lock_conn.cursor() as lock_cur:
+            lock_cur.execute("select pg_advisory_lock(%s)", (_MIGRATION_LOCK_KEY,))
+            lock_conn.commit()
+        _run_up(target)
+    finally:
+        lock_conn.close()
+
+
+def _run_up(target: Optional[str] = None):
     with get_connection() as conn, conn.cursor() as cur:
         ensure_migrations_table(cur)
         conn.commit()

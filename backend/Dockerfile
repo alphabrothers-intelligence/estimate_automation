@@ -71,4 +71,19 @@ USER app
 # 플랫폼(Render/Railway/Fly)이 $PORT를 넣어준다. 없으면 8001.
 ENV PORT=8001
 EXPOSE 8001
-CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT}"]
+# 앱을 띄우기 전에 DB 마이그레이션을 먼저 적용한다 (2026-08-25).
+#
+# 예전엔 손으로 돌려야 했고, 실제로 그걸 빠뜨려서 사고가 났다 — 코드가 새 컬럼
+# (rename_items, duration_text)을 SELECT 목록에 넣어 조회하는데 DB에는 그 컬럼이 없어서
+# 견적서 조회·수정 API가 통째로 실패했다. 앱은 멀쩡히 떠 있는데 기능만 조용히 깨진,
+# 알아채기 가장 어려운 형태였다.
+#
+# 이제 마이그레이션이 실패하면 앱이 아예 안 뜬다. 반쯤 깨진 채로 서비스되는 것보다 낫다 —
+# Render가 배포 실패로 표시하고 이전 버전이 계속 돈다.
+#
+# 동시 실행은 migrate.py의 pg_advisory_lock이 막는다(배포 중 인스턴스가 잠깐 겹친다).
+# 이미 적용된 마이그레이션은 건너뛰므로 재시작할 때마다 돌아도 안전하다.
+#
+# 마스터 양식(templates/)은 여기서 동기화하지 않는다 — Storage에 올리는 건 별도 스크립트
+# (scripts/upload_templates.py)다. 이유는 그 파일 상단 주석 참고.
+CMD ["sh", "-c", "python scripts/migrate.py up && exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT}"]
