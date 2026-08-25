@@ -40,6 +40,34 @@ MAX_MOVED_ITEMS = 2
 # AI 합계가 목표에서 이 비율 넘게 벗어나면 미세 조정 대신 전체 배율로 먼저 맞춘다.
 _RESCALE_THRESHOLD = 0.02
 
+# 용역 사업 견적서의 간접비(마이그레이션 050). 직접비 항목처럼 다루면 안 되는 두 가지가 있다:
+#
+#  1) 만원 단위로 안 떨어져도 된다. 이 값들은 "얼마짜리 상품"이 아니라 직접비 합계에 요율을
+#     곱한 파생값이라 349,364원 같은 숫자가 정상이다. 스냅하면 요율이 깨진다.
+#  2) 이윤은 잔액을 먹는 자리다. 실제 발급본의 이윤 요율이 2.629365%라는 소수점 여섯 자리인
+#     이유가 이것 — 총액을 15,000,000원에 정확히 떨어뜨리려고 역산한 값이다. 잔액을 여기에
+#     실으면 직접비 단가를 하나도 안 건드리고 목표에 정확히 닿는다(사용자 목적: "각 과업의
+#     단가를 낮추고, 딱 떨어지게 맞추기 위함", 2026-08-24).
+#
+# 이름으로 알아본다. 원가계산 표준 항목명이라 법인이 달라도 같은 단어를 쓰고, 비교견적
+# 리라이팅도 이 이름만은 그대로 두게 프롬프트로 막아 두었다(quote_prompts COMPARISON_SYSTEM).
+# 기술수준 칸이 있는 양식(스프린트)의 등급. 높은 쪽부터.
+#
+# 이 등급을 정하는 기준은 아직 없다 — 스프린트 양식은 마케팅·시장검증 과업을 담는 자리이고
+# 우리 카탈로그에는 인력 등급 개념이 없다. 그래서 **금액 순**으로 1차 배정만 한다(2026-08-25
+# 사용자 결정): 금액이 큰 과업이 곧 비중이 큰 과업이고, 어차피 견적서에 컬럼으로 찍혀서
+# 실무자가 보고 고친다. 사람이 한 번 고른 값은 다시 덮지 않는다.
+GRADES = ("특급", "고급", "중급", "초급")
+
+RATE_BASED_ITEMS = frozenset({"일반관리비", "이윤"})
+BALANCER_ITEM = "이윤"
+
+# 같은 모듈의 나머지 항목(교통비·회의비)은 요율이 아니라 **실비**다. 3만원짜리 교통비를
+# 10만원 격자에 스냅하면 7만원으로 부풀고(2026-08-25 재현), 그 바람에 합계가 목표를 넘겨
+# 이윤이 음수가 돼야 하니 잔액 흡수까지 통째로 실패한다. 실비는 만원 단위까지만 정리한다.
+# category(=module_name)로 알아본다 — 이 모듈명도 비교견적 리라이팅에서 제외해 두었다.
+OVERHEAD_MODULE = "경비 및 간접비"
+
 
 @dataclass(frozen=True)
 class FormSpec:
@@ -112,8 +140,51 @@ def detect_form(
     return FormSpec(labels=labels or {})
 
 
+def assign_grades(items: List[dict], form: FormSpec) -> None:
+    """기술수준 칸이 있는 양식에서 금액 순으로 등급 초안을 매긴다(제자리 수정).
+
+    금액 내림차순으로 줄 세운 뒤 4등분한다 — 항목이 3개면 특급/고급/중급, 12개면 3개씩
+    특급·고급·중급·초급이 된다. 이미 등급이 적힌 항목은 사람이 고른 값이므로 건드리지 않는다.
+    """
+    if "grade" not in (form.labels or {}) or not items:
+        return
+    ranked = sorted(range(len(items)), key=lambda i: -(items[i].get("amount") or 0))
+    for rank, index in enumerate(ranked):
+        if not items[index].get("grade"):
+            items[index]["grade"] = GRADES[min(len(GRADES) - 1, rank * len(GRADES) // len(ranked))]
+
+
+def _is_rate_based(item: dict) -> bool:
+    return (item.get("name") or "").strip() in RATE_BASED_ITEMS
+
+
+def _snap_unit_for(item: dict, form: FormSpec) -> int:
+    """이 항목의 단가를 어느 격자에 맞출지. 실비는 만원, 나머지는 양식의 단가 단위."""
+    if (item.get("category") or "").strip() == OVERHEAD_MODULE:
+        return CLEAN_UNIT
+    return form.unit_price_unit
+
+
 def _is_ugly(item: dict) -> bool:
+    if _is_rate_based(item):
+        return False  # 요율로 나온 값은 잔돈이 있는 게 정상이다
     return (item.get("unit_price") or 0) % CLEAN_UNIT != 0 or item["amount"] % CLEAN_UNIT != 0
+
+
+def _absorb_into_balancer(items: List[dict], diff: int, form: FormSpec, log: List[str]) -> bool:
+    """잔액을 이윤 한 줄에 통째로 싣는다. 직접비 단가는 하나도 건드리지 않는다."""
+    item = next((it for it in items if (it.get("name") or "").strip() == BALANCER_ITEM), None)
+    if item is None:
+        return False
+    divisor = form.divisor(item) or 1
+    before = item.get("unit_price") or 0
+    after = round(before + diff / divisor)
+    if after <= 0:
+        return False  # 이윤이 음수가 되는 목표면 손대지 않고 일반 흡수로 넘긴다
+    item["unit_price"] = after
+    item["amount"] = form.amount_of(item)
+    log.append(f"이윤으로 잔액 흡수: 단가 {int(before):,} → {after:,}")
+    return True
 
 
 def _absorb(items: List[dict], diff: int, form: FormSpec, log: List[str]) -> List[str]:
@@ -227,10 +298,17 @@ def finalize(
             log.append(f"전체 배율 조정 ×{factor:.3f} (AI 산정 {current:,}원 → 목표 {target_supply:,}원)")
 
     for it in items:
+        if _is_rate_based(it):
+            # 만원 단위로는 안 밀지만 원 단위 정수로는 떨어뜨린다 — 0단계 배율 조정이
+            # 783,400.788원 같은 소수를 남기고, 그대로 두면 저장 관문에서 걸린다.
+            it["unit_price"] = round(it.get("unit_price") or 0)
+            it["amount"] = form.amount_of(it)
+            continue
         if not _is_ugly(it):
             continue
         before = it.get("unit_price") or 0
-        snapped = max(form.unit_price_unit, round(before / form.unit_price_unit) * form.unit_price_unit)
+        unit = _snap_unit_for(it, form)
+        snapped = max(unit, round(before / unit) * unit)
         it["unit_price"] = snapped
         it["amount"] = form.amount_of(it)
         if snapped != before:
@@ -239,13 +317,17 @@ def finalize(
     if target_supply is None:
         for it in items:
             it.update(form.derived(it))
+        assign_grades(items, form)
         return items, 0, log
 
     diff = target_supply - sum(it["amount"] for it in items)
     if diff and items:
-        _absorb(items, diff, form, log)
+        # 이윤 항목이 있으면 거기서 끝난다 — 격자 탐색(_absorb)은 이윤이 없는 견적서용이다.
+        if not _absorb_into_balancer(items, diff, form, log):
+            _absorb(items, diff, form, log)
     for it in items:
         it.update(form.derived(it))
+    assign_grades(items, form)
     residual = target_supply - sum(it["amount"] for it in items)
     if residual:
         log.append(f"격자상 도달 불가 잔액 {residual:+,}원 — 자동 흡수하지 않고 그대로 표시")
@@ -277,7 +359,12 @@ def structural_violations(items: List[dict], form: FormSpec) -> List[str]:
         name = it.get("name", "?")
         if form.amount_of(it) != it.get("amount"):
             bad.append(f"{name}: 금액 {it.get('amount'):,}이 양식 수식({form.formula_text}) 결과 {form.amount_of(it):,}와 다름")
-        if (it.get("unit_price") or 0) % CLEAN_UNIT or (it.get("amount") or 0) % CLEAN_UNIT:
+        # 간접비(일반관리비·이윤)는 요율에서 나온 파생값이라 만원 단위가 아닌 게 정상이다.
+        # 대신 원 단위 정수여야 한다 — 소수점이 남으면 양식 수식 결과와 어긋난다.
+        if _is_rate_based(it):
+            if float(it.get("unit_price") or 0) != int(it.get("unit_price") or 0):
+                bad.append(f"{name}: 단가가 정수가 아님 ({it.get('unit_price')})")
+        elif (it.get("unit_price") or 0) % CLEAN_UNIT or (it.get("amount") or 0) % CLEAN_UNIT:
             bad.append(f"{name}: 단가/금액이 만원 단위가 아님 ({it.get('unit_price')}, {it.get('amount')})")
         for key in ("work_days", "quantity"):
             v = it.get(key)

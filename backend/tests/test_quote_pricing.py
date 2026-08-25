@@ -243,6 +243,92 @@ def test_storage_guard_actually_rejects_bad_data():
         assert "수식" in str(e)
 
 
+# ── 용역 사업 간접비 (마이그레이션 050) ──────────────────────────────────────────
+
+OVERHEAD = "경비 및 간접비"
+
+
+def _service_quote():
+    """직접비 3줄 + 일반관리비 + 이윤. 실제 발급본(한양대 시장검증)의 모양."""
+    return [
+        {"category": "시장성 테스트", "name": "비즈니스 모델 진단", "unit_price": 300_000, "quantity": 3, "work_days": 1, "amount": 0},
+        {"category": "시장성 테스트", "name": "시장검증 디자인 제작", "unit_price": 700_000, "quantity": 3, "work_days": 1, "amount": 0},
+        {"category": "시장성 테스트", "name": "시장검증 보고서 제작", "unit_price": 600_000, "quantity": 3, "work_days": 1, "amount": 0},
+        {"category": OVERHEAD, "name": "일반관리비", "unit_price": 387_000, "quantity": 1, "work_days": 1, "amount": 0},
+        {"category": OVERHEAD, "name": "이윤", "unit_price": 349_364, "quantity": 1, "work_days": 1, "amount": 0},
+    ]
+
+
+def test_expense_items_keep_real_cost_unit_prices():
+    """교통비 3만원은 실비다. 10만원 격자에 스냅하면 7만원으로 부풀고 이윤 흡수까지 깨진다."""
+    items = [
+        {"category": "시장성 테스트", "name": "비즈니스 모델 진단", "unit_price": 300_000, "quantity": 3, "work_days": 1, "amount": 0},
+        {"category": OVERHEAD, "name": "교통비 (수요처별 방문 기준)", "unit_price": 30_000, "quantity": 12, "work_days": 1, "amount": 0},
+        {"category": OVERHEAD, "name": "회의 및 기타경비", "unit_price": 20_000, "quantity": 12, "work_days": 1, "amount": 0},
+        {"category": OVERHEAD, "name": "일반관리비", "unit_price": 387_000, "quantity": 1, "work_days": 1, "amount": 0},
+        {"category": OVERHEAD, "name": "이윤", "unit_price": 349_364, "quantity": 1, "work_days": 1, "amount": 0},
+    ]
+    result, residual, log = finalize(items, 3_000_000, FormSpec())
+    by_name = {i["name"]: i for i in result}
+
+    # 실비는 만원 단위로만 정리된다 — 10만원 미만이어야 실비답다.
+    assert by_name["교통비 (수요처별 방문 기준)"]["unit_price"] < 100_000, log
+    assert by_name["회의 및 기타경비"]["unit_price"] < 100_000, log
+    for row in result:
+        assert row["unit_price"] % CLEAN_UNIT == 0 or row["name"] in ("일반관리비", "이윤"), row
+    # 실비가 안 부푸니 이윤이 잔액을 정상적으로 먹는다.
+    assert residual == 0, (residual, log)
+
+
+def test_profit_line_absorbs_the_whole_residual():
+    """이윤이 있으면 잔액 0으로 정확히 떨어지고, 직접비 단가는 하나도 안 움직인다."""
+    target = 5_500_000
+    items, residual, log = finalize(_service_quote(), target, FormSpec())
+
+    assert residual == 0, (residual, log)
+    assert sum(i["amount"] for i in items) == target
+    for row, before in zip(items[:3], _service_quote()[:3]):
+        assert row["unit_price"] == before["unit_price"], row
+    assert any("이윤으로 잔액 흡수" in line for line in log), log
+
+
+def test_rate_based_items_are_not_snapped_to_clean_units():
+    """349,364원은 요율에서 나온 정상값이다 — 만원 단위로 밀면 요율이 깨진다."""
+    items, _residual, log = finalize(_service_quote(), None, FormSpec())
+    by_name = {i["name"]: i for i in items}
+
+    assert by_name["이윤"]["unit_price"] == 349_364
+    assert by_name["일반관리비"]["unit_price"] == 387_000
+    assert not any("단가 정리" in line and ("이윤" in line or "일반관리비" in line) for line in log), log
+
+
+def test_vat_derived_target_still_passes_the_storage_guard():
+    """VAT 포함 15,000,000원 → 공급가액 13,636,364원. 만원 배수가 아니라 잔돈이 반드시 남는다.
+
+    이 잔돈을 이윤이 먹는데, 저장 관문(structural_violations)이 만원 단위를 강제하면 발급이
+    통째로 실패한다 — 관문에도 같은 예외가 있어야 한다(구현 중 실제로 걸렸다).
+    """
+    target = 13_636_364
+    items, residual, _log = finalize(_service_quote(), target, FormSpec())
+
+    assert residual == 0
+    assert sum(i["amount"] for i in items) == target
+    assert structural_violations(items, FormSpec()) == []
+    # 직접비는 전부 만원 단위로 떨어지고, 잔돈은 이윤 한 줄에만 남는다.
+    for row in items[:3]:
+        assert row["amount"] % CLEAN_UNIT == 0, row
+
+
+def test_direct_cost_items_are_still_snapped():
+    """간접비 예외가 직접비까지 풀어주면 안 된다."""
+    items = _service_quote()
+    items[0]["unit_price"] = 266_250  # 실무자가 못 견디던 잔돈
+    result, _residual, log = finalize(items, None, FormSpec())
+
+    assert result[0]["unit_price"] % CLEAN_UNIT == 0, result[0]
+    assert any("단가 정리" in line for line in log), log
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
