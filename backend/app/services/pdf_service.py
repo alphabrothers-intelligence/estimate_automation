@@ -20,7 +20,7 @@ import subprocess
 import tempfile
 import threading
 import zipfile
-from collections import Counter
+from collections import Counter, OrderedDict
 from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -1320,6 +1320,19 @@ def _is_name_only_form(columns: Dict[str, str], blocks: List[dict]) -> bool:
     return not any(b.get("category_large_cell") or b.get("category_mid_cell") for b in blocks)
 
 
+def _keeps_own_rows(group: Dict[str, Any]) -> bool:
+    """카테고리 소계 한 줄로 접지 않고 항목마다 한 줄을 유지해야 하는 그룹인가.
+
+    - 항목에 이미 개별 상품구성이 있으면 그게 곧 한 줄씩 쓰겠다는 뜻이다.
+    - 간접비(경비·일반관리비·이윤)는 각각 독립된 원가 항목이라 상품구성이 비어도 접으면 안 된다.
+      개발 중 간접비 상품구성을 잠깐 비웠더니 네 항목이 "경비 및 간접비" 소계 한 줄로 접혀
+      교통비·이윤이 통째로 사라졌다(2026-08-25). 화면에서 설명을 지워도 같은 일이 생긴다.
+    """
+    return group["category"] == quote_pricing.OVERHEAD_MODULE or any(
+        it.get("description") for it in group["items"]
+    )
+
+
 def _rollup_to_category_totals(
     groups: List[Dict[str, Any]], inline_names: bool = False
 ) -> List[Dict[str, Any]]:
@@ -1374,7 +1387,8 @@ def _description_parts(text: Optional[str]) -> List[str]:
         return []
     return [
         stripped
-        for line in text.splitlines()
+        # 리터럴 "\n"이 섞여 있어도 여기서 줄로 쪼개지도록 먼저 정규화한다(2026-08-25).
+        for line in catalog_service.normalize_description(text).splitlines()
         if (stripped := re.sub(r"^\s*\d{1,2}[.)]\s*", "", line).strip())
     ]
 
@@ -1395,7 +1409,7 @@ def _fold_name_only(groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     folded: List[Dict[str, Any]] = []
     for group in groups:
-        if not any(item.get("description") for item in group["items"]):
+        if not _keeps_own_rows(group):
             folded.append(_rollup_to_category_totals([group], inline_names=True)[0])
             continue
         items = []
@@ -1442,7 +1456,7 @@ def _assign_groups_to_blocks(
         # 마이그레이션 008/032)은 접지 않고 그대로 여러 줄로 배정한다 — 롤업은 항목에
         # description이 없는 마케팅류 카탈로그(PRD 6.2)에만 적용되는 최후 수단이다.
         groups = [
-            g if any(it.get("description") for it in g["items"]) else _rollup_to_category_totals([g])[0]
+            g if _keeps_own_rows(g) else _rollup_to_category_totals([g])[0]
             for g in groups
         ]
     elif _is_name_only_form(columns, blocks):
@@ -2090,6 +2104,14 @@ _PROFILE_DIR = Path(tempfile.gettempdir()) / "estimate_automation_lo_profile"
 
 _lo_listener: Optional[subprocess.Popen] = None
 
+# 상주 LibreOffice는 변환한 문서를 처리할수록 메모리를 계속 물고 늘어난다(문서 모델·폰트 캐시가
+# 프로세스 안에 쌓인다). 편집 화면이 미리보기를 매 수정마다 다시 그리므로 한 세션에서 수십 번
+# 변환이 도는데, 그대로 두면 Render 인스턴스가 메모리 한도를 넘겨 자동 재시작된다(2026-08-26
+# 메일 알림). N번마다 리스너를 죽였다 다시 띄워 쌓인 메모리를 OS에 돌려준다 — 재기동 직후
+# 한 번은 콜드 스타트라 몇 초 느리지만, 그 외에는 그대로 웜 상태를 쓴다.
+_LO_RESTART_EVERY = 20
+_conversions_since_restart = 0
+
 
 def start_lo_listener() -> None:
     """LibreOffice를 서버 기동 시 미리 백그라운드로 띄워둔다.
@@ -2123,6 +2145,20 @@ def start_lo_listener() -> None:
         _lo_listener = None
 
 
+def _recycle_lo_listener_if_needed() -> None:
+    """변환 _LO_RESTART_EVERY회마다 상주 LibreOffice를 재기동해 누적 메모리를 회수한다.
+
+    호출자는 _LIBREOFFICE_LOCK을 잡고 있어야 한다(다른 변환이 도는 중에 죽이면 안 된다).
+    """
+    global _conversions_since_restart
+    _conversions_since_restart += 1
+    if _conversions_since_restart < _LO_RESTART_EVERY:
+        return
+    _conversions_since_restart = 0
+    stop_lo_listener()
+    start_lo_listener()
+
+
 def stop_lo_listener() -> None:
     global _lo_listener
     if _lo_listener is None:
@@ -2140,7 +2176,17 @@ def stop_lo_listener() -> None:
 # LibreOffice 변환(5~6초)을 매 조회마다 반복할 이유가 없다 — quote row 전체를 해시해 키로 쓰므로
 # 채팅 수정이든 직접편집이든 내용이 실제로 바뀐 시점에만 자동으로 캐시가 무효화된다. 프로세스
 # 재시작 시 비워지는 건 의도된 동작(사용자 1인·단일 프로세스라 별도 저장소 불필요).
-_pdf_cache: Dict[str, tuple[str, bytes]] = {}
+# ponytail: 메모리 상한만 두고 최근 것부터 버린다(LRU). 1인 사용이라 8건이면 편집 중인
+# 견적과 그 비교견적들이 전부 들어간다 — 그 이상 필요해지면 그때 늘린다.
+_pdf_cache: "OrderedDict[str, tuple[str, bytes]]" = OrderedDict()
+_PDF_CACHE_MAX = 8
+
+
+def _cache_pdf(entity_quote_id: str, content_hash: str, pdf_bytes: bytes) -> None:
+    _pdf_cache[entity_quote_id] = (content_hash, pdf_bytes)
+    _pdf_cache.move_to_end(entity_quote_id)
+    while len(_pdf_cache) > _PDF_CACHE_MAX:
+        _pdf_cache.popitem(last=False)
 
 
 def render_entity_quote_pdf(entity_quote_id: str) -> bytes:
@@ -2148,6 +2194,7 @@ def render_entity_quote_pdf(entity_quote_id: str) -> bytes:
     content_hash = _quote_content_hash(quote)
     cached = _pdf_cache.get(entity_quote_id)
     if cached and cached[0] == content_hash:
+        _pdf_cache.move_to_end(entity_quote_id)
         return cached[1]
 
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2172,7 +2219,8 @@ def render_entity_quote_pdf(entity_quote_id: str) -> bytes:
                 result = subprocess.run(convert_cmd, capture_output=True, text=True, timeout=60)
                 if result.returncode == 0 and pdf_path.exists():
                     pdf_bytes = pdf_path.read_bytes()
-                    _pdf_cache[entity_quote_id] = (content_hash, pdf_bytes)
+                    _cache_pdf(entity_quote_id, content_hash, pdf_bytes)
+                    _recycle_lo_listener_if_needed()
                     return pdf_bytes
                 last_error = result.stderr or result.stdout
 

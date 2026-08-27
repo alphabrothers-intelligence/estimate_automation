@@ -285,7 +285,12 @@ def normalize_description(text: Optional[str]) -> Optional[str]:
     "1. A / 2. B" -> "1. A\n2. B". 번호가 없는 설명("- 대행사 결제수단을 통해 …")이나 이미
     줄바꿈으로 나뉜 설명은 건드리지 않는다 — 슬래시가 내용의 일부인 경우(예: "Macro/Micro
     기반의 스크립트 작성")를 자르면 안 되므로, 뒤에 "숫자."가 오는 슬래시만 자른다.
+
+    역슬래시 n이 글자 그대로 들어있으면 진짜 줄바꿈으로 바꾼다 — 마이그레이션 050이 SQL
+    문자열에 '\\n'을 그대로 넣어 카탈로그에 저장됐고, 그게 발급 PDF에 "…교통비\\n2. 방문…"으로
+    찍혔다(2026-08-25 사용자 신고). 카탈로그는 054에서 고쳤지만 이미 생성된 견적서의
+    line_items에도 같은 문자열이 복사돼 있어 발급 경로에서 한 번 더 막는다.
     """
     if not text:
         return text
-    return _NUMBERED_SPLIT.sub("\n", text)
+    return _NUMBERED_SPLIT.sub("\n", text.replace("\\n", "\n"))

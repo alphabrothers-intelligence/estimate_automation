@@ -128,6 +128,46 @@ def test_description_form_keeps_vertical_list_not_parentheses():
     assert item["description"].startswith("1. ")
 
 
+def _overhead_items():
+    """간접비 4종 — 054에서 상품구성을 지웠다. 접히면 안 되는 그룹."""
+    return [
+        {"category": "경비 및 간접비", "name": name, "amount": amount, "unit_price": amount,
+         "work_days": 1, "quantity": 1, "description": None}
+        for name, amount in (
+            ("교통비 (수요처별 방문 기준)", 400_000), ("회의 및 기타경비", 300_000),
+            ("일반관리비", 500_000), ("이윤", 1_100_000),
+        )
+    ]
+
+
+def test_overhead_items_never_fold_into_one_row():
+    """상품구성이 없어도 간접비는 항목마다 한 줄 — 접으면 원가 항목이 사라진다(2026-08-25)."""
+    for blocks, columns in ((BLENDEDLAB_BLOCKS, BLENDEDLAB_COLUMNS), (ALPHA_BLOCKS, ALPHA_COLUMNS)):
+        groups = p._group_line_items(_overhead_items())
+        assignments = p._assign_groups_to_blocks(groups, blocks, columns)
+        rows = [item for _, group, _ in assignments for item in group["items"]]
+        assert [r["name"] for r in rows] == [i["name"] for i in _overhead_items()], rows
+        # 항목명만 찍고 괄호·상품구성은 붙이지 않는다.
+        assert all("(" not in r["name"].split("\n")[-1] or "수요처" in r["name"] for r in rows)
+        assert not any(r.get("description") for r in rows), rows
+
+
+def test_overhead_description_is_always_exactly_one_line():
+    """비교견적에서 품명을 다시 쓰든 안 쓰든 간접비 상세는 한 줄(2026-08-25 실무자 결정)."""
+    from app.services.generation_service import _one_line
+
+    assert _one_line("1. 왕복 교통비 정산\n2. 출장 부대비용 포함") == "왕복 교통비 정산"
+    assert _one_line("1. 왕복 교통비 정산\\n2. 출장 부대비용 포함") == "왕복 교통비 정산"  # 리터럴 \n
+    assert _one_line("직접비 합계의 3~5% 요율 적용") == "직접비 합계의 3~5% 요율 적용"
+    assert _one_line(None) is None
+
+
+def test_literal_backslash_n_becomes_a_real_line_break():
+    """050이 카탈로그에 넣은 리터럴 "\\n"이 PDF에 글자로 찍히던 문제(2026-08-25)."""
+    parts = p._description_parts("1. 왕복 교통비\\n2. 방문 인원 기준\\n3. 출장비 포함")
+    assert parts == ["왕복 교통비", "방문 인원 기준", "출장비 포함"], parts
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

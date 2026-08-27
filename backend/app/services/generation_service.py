@@ -9,6 +9,7 @@
 그 외 어떤 코드도 금액을 재계산하지 않는다.
 """
 
+import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
 
@@ -16,8 +17,9 @@ from fastapi import HTTPException
 
 from app.config import CLAUDE_MAX_TOKENS, CLAUDE_MODEL, get_anthropic, get_supabase
 from app.models.estimate import EstimateSetOut
-from app.services import module_selection_service, pdf_service, quote_prompts
+from app.services import catalog_service, module_selection_service, pdf_service, quote_prompts
 from app.services.catalog_service import get_catalog_for_generation, get_module_options
+from app.services import quote_pricing
 from app.services.quote_pricing import FormSpec, assert_storable, finalize, grand_total
 
 DEFAULT_COMPARISON_MARKUP = 0.10  # PRD 4.3 — 비교견적서 기본 마크업 +10%
@@ -235,6 +237,24 @@ def _merge_with_catalog(ai_items: List[dict], catalog_rows: List[dict], form: Fo
     return merged
 
 
+def _is_overhead(item: dict) -> bool:
+    return (item.get("category") or "") == quote_pricing.OVERHEAD_MODULE
+
+
+def _one_line(text: Optional[str]) -> Optional[str]:
+    """간접비 상세는 딱 한 줄만 남긴다 — 첫 줄에서 번호 표기를 떼고 쓴다.
+
+    원가계산 표준 항목이라 3~4줄짜리 설명이 붙을 자리가 아니지만, 아예 비면 허전하다는
+    실무자 판단으로 한 줄을 유지한다(2026-08-25). 카탈로그는 054에서 한 줄로 고정했고,
+    비교견적 리라이팅이 여러 줄로 돌려줘도 여기서 잘라 "다시 쓰든 안 쓰든 한 줄"이 된다.
+    """
+    for line in (catalog_service.normalize_description(text) or "").splitlines():
+        cleaned = re.sub(r"^\s*\d{1,2}[.)]\s*", "", line).strip()
+        if cleaned:
+            return cleaned
+    return None
+
+
 def _generate_comparison(
     quote: dict, primary_entity: str, primary_items: List[dict], primary_supply: int, vat_included: bool
 ) -> List[dict]:
@@ -284,12 +304,15 @@ def _generate_comparison(
     items = []
     for i, src in enumerate(primary_items):
         ai = by_index.get(i) or (ai_items[i] if i < len(ai_items) else {})
+        description = ai.get("description") or src.get("description")
         items.append(
             {
                 # 구분·항목명·상세는 AI가 다시 쓴 것을 쓴다. 이게 비교견적의 존재 이유다.
                 "category": ai.get("category") or src.get("category") or "",
                 "name": ai.get("name") or src["name"],
-                "description": ai.get("description") or src.get("description"),
+                # 간접비 상세는 한 줄로 고정한다(2026-08-25 실무자 결정). 프롬프트로도 시키지만
+                # 어겼을 때 그대로 발급되지 않게 여기서 자른다.
+                "description": _one_line(description) if _is_overhead(src) else description,
                 "work_days": ai.get("work_days") if ai.get("work_days") is not None else src.get("work_days"),
                 "quantity": ai.get("quantity") if ai.get("quantity") is not None else src.get("quantity"),
                 "unit_price": ai.get("unit_price") or src.get("unit_price") or 0,

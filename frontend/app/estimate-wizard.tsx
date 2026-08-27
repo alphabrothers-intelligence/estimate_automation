@@ -2504,6 +2504,23 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
     }
   }
 
+  // 비교견적 전체를 한 번에 같은 설정으로 맞춘다 — 건별 체크박스를 네 번 누르게 하지 말라는
+  // 요청(2026-08-25). 개별 예외는 아래 건별 체크박스로 계속 조정할 수 있다.
+  async function handleToggleAllRenameItems(quotes: EntityQuote[], renameItems: boolean) {
+    setError(null);
+    try {
+      const updated = await Promise.all(
+        quotes.filter((q) => q.rename_items !== renameItems).map((q) => updateRenameItems(q.id, renameItems))
+      );
+      const byId = new Map(updated.map((q) => [q.id, q]));
+      setResult((prev) =>
+        prev ? { ...prev, entity_quotes: prev.entity_quotes.map((q) => byId.get(q.id) ?? q) } : prev
+      );
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "설정을 저장하지 못했습니다.");
+    }
+  }
+
   // "비교견적 생성/다시 생성" — 확정된 본견적을 기준으로 AI가 항목을 다시 쓴다(10~20초).
   // 인상률을 고쳐뒀으면 먼저 저장한 뒤 그 비율로 생성한다.
   async function handleRegenerateComparisons() {
@@ -2765,8 +2782,10 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
           </div>
         ) : (
           <div className="space-y-4">
+            {/* 견적서가 늘면 오른쪽이 잘린다 — 스크롤바를 숨기지 않고 그대로 두어 가로로
+                끌어 볼 수 있게 한다(2026-08-25 사용자 지적: "블록이 짤려 나온다"). */}
             {result.entity_quotes.length > 1 && (
-              <div className="flex items-center gap-2 overflow-x-auto border-b border-slate-200 pb-3 [scrollbar-width:none]">
+              <div className="flex items-center gap-2 overflow-x-auto border-b border-slate-200 pb-3 [scrollbar-width:thin]">
                 <span className="shrink-0 text-xs font-semibold text-slate-400">견적서 {displayQuotes.length}개</span>
                 {displayQuotes.map((q) => {
                   const selected = (viewedQuote?.id ?? primaryQuote?.id) === q.id;
@@ -2888,7 +2907,36 @@ export default function EstimateWizard({ initialEstimateSetId }: { initialEstima
                           : "비교견적서 다시 생성"}
                     </button>
                   </div>
-                  <div className="mt-3 flex flex-wrap gap-2 border-t border-black/5 pt-3">
+                  {/* 전체 일괄 선택 — 비교견적 품명을 다 다시 쓸지, 본견적 그대로 가져갈지
+                      한 번에 정한다(2026-08-25 요청). 건별 예외는 아래 체크박스에서. */}
+                  <div className="mt-3 flex items-center gap-2 border-t border-black/5 pt-3">
+                    <span className="text-xs font-semibold text-slate-500">전체 품명</span>
+                    <div className="inline-flex overflow-hidden rounded-lg border border-black/10">
+                      {[
+                        { rename: true, label: "다시 쓰기", hint: "모든 비교견적의 품명·구분·상품구성을 다른 표현으로 다시 씁니다." },
+                        { rename: false, label: "본견적 그대로", hint: "모든 비교견적이 본견적 문구를 그대로 쓰고 금액만 다시 잡습니다 (AI 호출 없음)." },
+                      ].map((option) => {
+                        const active = comparisonQuotes.every((q) => q.rename_items === option.rename);
+                        return (
+                          <button
+                            key={option.label}
+                            type="button"
+                            title={option.hint}
+                            disabled={regenerating}
+                            onClick={() => handleToggleAllRenameItems(comparisonQuotes, option.rename)}
+                            aria-pressed={active}
+                            className={
+                              "px-3 py-1.5 text-xs font-semibold transition disabled:opacity-50 " +
+                              (active ? "bg-slate-900 text-white" : "bg-white text-slate-600 hover:bg-slate-50")
+                            }
+                          >
+                            {option.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  <div className="mt-3 flex flex-wrap gap-2 pt-1">
                     {comparisonQuotes.map((q) => {
                       const current = Math.round(((q.markup_ratio ?? 1.1) - 1) * 100);
                       return (
