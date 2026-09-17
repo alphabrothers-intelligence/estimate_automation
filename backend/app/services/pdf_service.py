@@ -16,6 +16,7 @@ import io
 import itertools
 import json
 import re
+import posixpath
 import subprocess
 import tempfile
 import threading
@@ -521,7 +522,55 @@ def _has_working_print_area(workbook_xml: str) -> bool:
     return bool(m and m.group(1).strip() and m.group(1).strip() != "NA()")
 
 
-def _fix_broken_print_area(workbook_xml: str, sheet_xml: str, sheet_name: str) -> str:
+# 1픽셀(96dpi) = 9525 EMU. 그림 앵커의 끝 오프셋이 이보다 작으면 열/행 경계에 딱 붙은 것으로
+# 본다 — .xls에서 변환된 원본은 반올림 찌꺼기로 360 EMU(0.01mm) 같은 값을 남긴다.
+_ONE_PIXEL_EMU = 9525
+
+
+def _drawing_bounds(zin: zipfile.ZipFile, sheet_path: str) -> tuple[int, int]:
+    """시트에 얹힌 그림(도장·로고)이 덮는 마지막 열·행을 1-based로 돌려준다. 그림이 없으면 (0, 0).
+
+    인쇄영역을 셀 내용만 보고 정하면 셀 바깥으로 튀어나온 도장이 잘린다. 블렌디드랩 마스터의
+    도장은 AF~AH에 걸쳐 있는데 셀 내용은 AF에서 끝나, 발급된 PDF에서 도장 오른쪽 절반이
+    통째로 날아갔다(2026-09-17 사용자 지적 → 로컬 변환으로 재현 확인).
+
+    ponytail: <xdr:to>가 있는 앵커(twoCellAnchor)만 읽는다 — 마스터 5종과 비교견적 양식 8종의
+    그림이 전부 이 형태다. 끝 셀 없이 크기만 가진 oneCellAnchor 양식이 들어오면 열 폭을 EMU로
+    환산해 끝 열을 직접 계산해야 한다.
+    """
+    m = re.search(r'<drawing[^>]*r:id="([^"]+)"', zin.read(sheet_path).decode("utf-8"))
+    if not m:
+        return 0, 0
+    rels_path = re.sub(r"([^/]+)$", r"_rels/\1.rels", sheet_path)
+    names = set(zin.namelist())
+    if rels_path not in names:
+        return 0, 0
+    target = re.search(
+        rf'Id="{re.escape(m.group(1))}"[^>]*Target="([^"]+)"', zin.read(rels_path).decode("utf-8")
+    )
+    if not target:
+        return 0, 0
+    drawing_path = posixpath.normpath(posixpath.join(posixpath.dirname(sheet_path), target.group(1)))
+    if drawing_path not in names:
+        return 0, 0
+
+    max_col = max_row = 0
+    for col, col_off, row, row_off in re.findall(
+        r"<xdr:to>\s*<xdr:col>(\d+)</xdr:col>\s*<xdr:colOff>(-?\d+)</xdr:colOff>"
+        r"\s*<xdr:row>(\d+)</xdr:row>\s*<xdr:rowOff>(-?\d+)</xdr:rowOff>",
+        zin.read(drawing_path).decode("utf-8"),
+    ):
+        # xdr 좌표는 0-based라 1-based로 바꾸면 +1이지만, 끝 오프셋이 0에 가까우면 그림의 오른쪽
+        # 변이 그 열의 왼쪽 경계에 닿아 있을 뿐이라 그 열은 필요 없다. 빈 열을 인쇄영역에 끌어
+        # 넣으면 fitToWidth가 그만큼 전체를 축소해 견적서가 작게 찍힌다.
+        max_col = max(max_col, int(col) + (1 if int(col_off) > _ONE_PIXEL_EMU else 0))
+        max_row = max(max_row, int(row) + (1 if int(row_off) > _ONE_PIXEL_EMU else 0))
+    return max_col, max_row
+
+
+def _fix_broken_print_area(
+    workbook_xml: str, sheet_xml: str, sheet_name: str, drawing_bounds: tuple[int, int] = (0, 0)
+) -> str:
     """정상 동작하는 인쇄영역이 있으면 손대지 않는다(대부분의 법인 원본 xlsx는 이미 제대로 된
     _xlnm.Print_Area를 갖고 있음). 블렌디드랩처럼 .xls에서 변환되면서 인쇄영역이
     "Excel_BuiltIn_Print_Area"라는 이름에 값이 NA()로 깨진 채로 남은 경우에만, 실제 내용 범위로
@@ -531,6 +580,9 @@ def _fix_broken_print_area(workbook_xml: str, sheet_xml: str, sheet_name: str) -
         return workbook_xml
 
     max_col, max_row = _compute_content_bounds(sheet_xml)
+    # 도장·로고는 셀이 아니라 시트 위에 떠 있어서 _compute_content_bounds가 못 본다.
+    max_col = max(max_col, drawing_bounds[0])
+    max_row = max(max_row, drawing_bounds[1])
     quoted_name = sheet_name.replace("'", "''")
     print_range = f"'{quoted_name}'!$A$1:${_colname(max_col)}${max_row}"
     new_defined_name = (
@@ -774,29 +826,70 @@ def _normalize_block_row_heights(
     return re.sub(r'<row r="(\d+)"[^>]*?(?:/>|>)', _apply_height, sheet_xml)
 
 
-def _normalize_block_cell_styles(sheet_xml: str, item_blocks: List[dict]) -> str:
-    """항목 블록 안의 "가운데" 행들(첫 행·마지막 행 제외)은 서식이 전부 같아야 하는데, 원본
-    마스터에 원인 불명으로 한 행만 다른 서식이 남아있는 경우가 있다(예: 블렌디드랩 마스터
-    "견적서 (2)" 시트 15행 AC~AF열만 다른 행과 달리 오른쪽 테두리가 있는 스타일이라, 발급 PDF에서
-    그 행만 오른쪽 끝에 없어야 할 구분선이 보임, 2026-08-13 사용자 발견). 첫/마지막 행은 표를
-    여닫는 의도적인 테두리가 있을 수 있어 제외하고, 가운데 행끼리 열별로 가장 흔한 스타일로 맞춘다.
+def _style_swap_keys(styles_xml: str) -> Dict[int, tuple]:
+    """스타일 인덱스 -> (테두리를 뺀 나머지 서식, 위/아래 테두리).
+
+    두 스타일의 이 값이 같다 = 글꼴·표시형식·정렬은 똑같고 좌우 테두리만 다르다는 뜻이라,
+    한쪽을 다른 쪽으로 바꿔도 셀 내용이 보이는 모습은 그대로고 세로선만 정리된다.
+    위/아래 테두리까지 같이 보는 건 표를 여닫는 가로선을 실수로 지우지 않기 위해서다."""
+    borders_block = re.search(r"<borders\b[^>]*>(.*?)</borders>", styles_xml, re.DOTALL)
+    borders = re.findall(
+        r"<border\b[^>]*?(?:/>|>.*?</border>)", borders_block.group(1) if borders_block else "", re.DOTALL
+    )
+    # 굵기뿐 아니라 색까지 통째로 본다 — 표 첫 줄만 진한 선을 쓰는 양식이 있어서(비교견적
+    # "안르" 시트 19행), 굵기만 비교하면 그 줄을 아랫줄의 연한 선으로 덮어쓴다.
+    edges = [
+        tuple(
+            m.group(0) if (m := re.search(rf"<{side}\b.*?(?:/>|</{side}>)", border, re.DOTALL)) else ""
+            for side in ("top", "bottom")
+        )
+        for border in borders
+    ]
+    keys: Dict[int, tuple] = {}
+    xfs_block = re.search(r"<cellXfs\b[^>]*>(.*?)</cellXfs>", styles_xml, re.DOTALL)
+    if not xfs_block:
+        return keys
+    for idx, xf in enumerate(re.findall(r"<xf\b[^>]*?(?:/>|>.*?</xf>)", xfs_block.group(1), re.DOTALL)):
+        border_id = int(m.group(1)) if (m := re.search(r'borderId="(\d+)"', xf)) else 0
+        keys[idx] = (
+            re.sub(r'\s*borderId="\d+"', "", xf),
+            edges[border_id] if border_id < len(edges) else ("", ""),
+        )
+    return keys
+
+
+def _normalize_block_cell_styles(sheet_xml: str, styles_xml: str, item_blocks: List[dict]) -> str:
+    """항목 블록의 행들은 서식이 전부 같아야 하는데, 원본 마스터에 원인 불명으로 한 행만 다른
+    서식이 남아있는 경우가 있다(블렌디드랩 마스터 "견적서 (2)" 시트 15행 AB~AF열만 오른쪽
+    테두리가 있는 스타일 — 이 양식은 표 오른쪽이 열려 있는 디자인이라 그 행만 끝에 없어야 할
+    세로선이 보인다, 2026-08-13 사용자 발견). 열별로 가장 흔한 서식으로 맞춘다.
+
+    바꿔치기는 "좌우 테두리만 다른 스타일" 사이에서만 한다. 예전엔 블록의 첫/마지막 행을 통째로
+    빼고 나머지를 무조건 다수결로 덮었는데, 두 가지가 어긋났다(2026-09-17 사용자 재지적):
+    항목이 늘어 행이 복제되면 정작 문제의 15행이 블록 마지막 행으로 밀려 제외됐고, 반대로
+    글꼴만 다른 행까지 남의 글꼴로 덮어썼다. 이제 첫/마지막 행도 보되 글꼴·표시형식·정렬과
+    위아래 테두리가 똑같은 상대로만 맞춘다.
     """
+    swap_keys = _style_swap_keys(styles_xml)
     for block in item_blocks:
         rows = block.get("rows") or []
-        interior_rows = rows[1:-1]
-        if len(interior_rows) < 2:
+        if len(rows) < 2:
             continue
         style_by_col_row: Dict[str, Dict[int, str]] = {}
-        for row in interior_rows:
+        for row in rows:
             for m in re.finditer(rf'<c r="([A-Z]+){row}" s="(\d+)"', sheet_xml):
                 style_by_col_row.setdefault(m.group(1), {})[row] = m.group(2)
         for col, by_row in style_by_col_row.items():
-            majority = Counter(by_row.values()).most_common(1)[0][0]
+            majority, count = Counter(by_row.values()).most_common(1)[0]
+            # 서로 다른 두 행뿐이면 어느 쪽이 옳은지 알 수 없다 — 동전 던지기로 원본을 고치느니 둔다.
+            if count < 2:
+                continue
             for row, style in by_row.items():
-                if style != majority:
-                    sheet_xml = re.sub(
-                        rf'(<c r="{col}{row}" s=")\d+(")', rf'\g<1>{majority}\g<2>', sheet_xml, count=1
-                    )
+                if style == majority or swap_keys.get(int(style)) != swap_keys.get(int(majority)):
+                    continue
+                sheet_xml = re.sub(
+                    rf'(<c r="{col}{row}" s=")\d+(")', rf'\g<1>{majority}\g<2>', sheet_xml, count=1
+                )
     return sheet_xml
 
 
@@ -1011,13 +1104,15 @@ def _patch_xlsx(
         patched_sheet_xml = _strip_all_formula_caches(patched_sheet_xml)
         patched_sheet_xml = _hide_rows(patched_sheet_xml, hidden_rows or set())
         patched_sheet_xml = _normalize_block_row_heights(patched_sheet_xml, styles_xml, item_blocks or [], updates)
-        patched_sheet_xml = _normalize_block_cell_styles(patched_sheet_xml, item_blocks or [])
+        patched_sheet_xml = _normalize_block_cell_styles(patched_sheet_xml, styles_xml, item_blocks or [])
         patched_sheet_xml = _force_fit_to_page(patched_sheet_xml)
 
         workbook_xml = zin.read("xl/workbook.xml").decode("utf-8")
         workbook_xml = _reorder_sheet_first(workbook_xml, sheet_name)
         workbook_xml, _ = _remove_other_sheets(workbook_xml)
-        workbook_xml = _fix_broken_print_area(workbook_xml, patched_sheet_xml, sheet_name)
+        workbook_xml = _fix_broken_print_area(
+            workbook_xml, patched_sheet_xml, sheet_name, _drawing_bounds(zin, sheet_path)
+        )
         patched_workbook_xml = _force_full_recalc(workbook_xml)
 
         content_types_xml = zin.read("[Content_Types].xml").decode("utf-8")
@@ -1656,6 +1751,29 @@ def _appended_blocks(template_block: dict, source_rows: List[int], after_row: in
     return new_blocks
 
 
+def _normalize_block_styles_in_xlsx(source_bytes: bytes, sheet_path: str, item_blocks: List[dict]) -> bytes:
+    """행을 복제하기 전에 항목 행 서식을 먼저 정리한 xlsx bytes를 돌려준다.
+
+    복제 원본(블록 끝에서 두 번째 행)이 하필 마스터에서 서식이 어긋난 행이면(블렌디드랩
+    "견적서 (2)" 15행) 그 서식이 여러 줄로 불어나 오히려 다수파가 되고, 발급 뒤에 다수결로
+    고치려 들면 정상인 행들이 거꾸로 끌려간다 — 5개 항목짜리 견적서에서 가운데 세 줄만 표
+    오른쪽이 막혀 나온 원인(2026-09-17 사용자 신고). 복제 전에 고치면 애초에 번지지 않는다.
+    """
+    with zipfile.ZipFile(io.BytesIO(source_bytes), "r") as zin:
+        sheet_xml = zin.read(sheet_path).decode("utf-8")
+        fixed = _normalize_block_cell_styles(
+            sheet_xml, zin.read("xl/styles.xml").decode("utf-8"), item_blocks
+        )
+        if fixed == sheet_xml:
+            return source_bytes
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = fixed.encode("utf-8") if item.filename == sheet_path else zin.read(item.filename)
+                zout.writestr(item, data)
+    return out.getvalue()
+
+
 def _grow_template(template: dict, source_bytes: bytes, groups: List[Dict[str, Any]]) -> Optional[tuple]:
     """부족한 만큼 시트에 행·블록을 실제로 끼워 넣은 (template, source_bytes, sheet_xml)을
     돌려준다. 늘릴 게 없으면 None — 호출부가 기존 동작(접기/422)으로 넘어간다."""
@@ -1675,6 +1793,7 @@ def _grow_template(template: dict, source_bytes: bytes, groups: List[Dict[str, A
     blocks = [b for b in cell_map.get("item_blocks", []) if b.get("role") != "labor_fte"]
     row_plan = _plan_row_growth(groups, blocks)
     if row_plan:
+        source_bytes = _normalize_block_styles_in_xlsx(source_bytes, sheet_path, blocks)
         source_bytes, new_cell_map, row_map = apply(source_bytes, cell_map, row_plan)
         # 새로 끼워 넣은 행은 원본에 없던 번호라 remap_cell_map이 모른다 — 복제 원본 바로 아래
         # 연속된 번호이므로 여기서 직접 채워 넣는다.

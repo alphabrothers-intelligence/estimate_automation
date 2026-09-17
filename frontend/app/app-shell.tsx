@@ -27,6 +27,12 @@ export default function AppShell({ children }: { children: ReactNode }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [generatedEstimateLayout, setGeneratedEstimateLayout] = useState(false);
 
+  // 비밀번호 화면에는 사이드바·메뉴를 붙이지 않는다 — 아직 들어오지도 않은 사람에게 보여줄
+  // 내비게이션이 아니다.
+  if (pathname === "/login") {
+    return <>{children}</>;
+  }
+
   return (
     <GeneratedEstimateLayoutContext.Provider value={setGeneratedEstimateLayout}>
     <div
