@@ -2230,8 +2230,11 @@ _lo_listener: Optional[subprocess.Popen] = None
 # 보지 않아 세션 패턴에 따라 20회가 되기 전에 한도를 넘을 수 있었다(2026-09-18 알림 재발로 확인).
 # 그래서 실제 RSS를 재서 임계치를 넘을 때 재기동하는 방식으로 바꾼다 — /proc는 리눅스(Render
 # 컨테이너)에서만 있으므로 로컬 macOS 개발 환경 등에서는 못 재고, 그럴 때만 횟수 기반으로 되돌아간다.
+# Render Free 플랜은 컨테이너 전체가 512MB다(2026-09-18 대시보드 확인). FastAPI/uvicorn
+# 기본 사용량과 변환 중 순간 스파이크까지 남겨둬야 해서, 상주 LibreOffice 혼자에게는
+# 150MB만 준다 — 이 이상 쌓이면 즉시 회수한다.
 _LO_RESTART_EVERY = 20
-_LO_MEMORY_LIMIT_MB = 300.0
+_LO_MEMORY_LIMIT_MB = 150.0
 _conversions_since_restart = 0
 
 
