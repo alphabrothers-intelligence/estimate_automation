@@ -42,7 +42,23 @@ def test_listener_restarts_every_n_conversions():
     assert calls == ["stop", "start", "stop", "start"], "카운터가 0부터 다시 센다"
 
 
+def test_listener_restarts_when_rss_exceeds_limit():
+    calls = []
+    pdf_service.stop_lo_listener = lambda: calls.append("stop")
+    pdf_service.start_lo_listener = lambda: calls.append("start")
+    pdf_service._conversions_since_restart = 0
+
+    pdf_service._lo_listener_rss_mb = lambda: pdf_service._LO_MEMORY_LIMIT_MB - 1
+    pdf_service._recycle_lo_listener_if_needed()
+    assert calls == [], "RSS가 임계치 밑이면 횟수와 무관하게 안 건드린다"
+
+    pdf_service._lo_listener_rss_mb = lambda: pdf_service._LO_MEMORY_LIMIT_MB + 1
+    pdf_service._recycle_lo_listener_if_needed()
+    assert calls == ["stop", "start"], "RSS가 임계치를 넘으면 1회만에 바로 재기동한다"
+
+
 if __name__ == "__main__":
     test_pdf_cache_is_bounded()
     test_listener_restarts_every_n_conversions()
+    test_listener_restarts_when_rss_exceeds_limit()
     print("ok")

@@ -2226,10 +2226,43 @@ _lo_listener: Optional[subprocess.Popen] = None
 # 상주 LibreOffice는 변환한 문서를 처리할수록 메모리를 계속 물고 늘어난다(문서 모델·폰트 캐시가
 # 프로세스 안에 쌓인다). 편집 화면이 미리보기를 매 수정마다 다시 그리므로 한 세션에서 수십 번
 # 변환이 도는데, 그대로 두면 Render 인스턴스가 메모리 한도를 넘겨 자동 재시작된다(2026-08-26
-# 메일 알림). N번마다 리스너를 죽였다 다시 띄워 쌓인 메모리를 OS에 돌려준다 — 재기동 직후
-# 한 번은 콜드 스타트라 몇 초 느리지만, 그 외에는 그대로 웜 상태를 쓴다.
+# 메일 알림). "20회마다 재기동"(2026-08-27 최초 대응, 커밋 844f6f5)은 횟수만 볼 뿐 실제 메모리를
+# 보지 않아 세션 패턴에 따라 20회가 되기 전에 한도를 넘을 수 있었다(2026-09-18 알림 재발로 확인).
+# 그래서 실제 RSS를 재서 임계치를 넘을 때 재기동하는 방식으로 바꾼다 — /proc는 리눅스(Render
+# 컨테이너)에서만 있으므로 로컬 macOS 개발 환경 등에서는 못 재고, 그럴 때만 횟수 기반으로 되돌아간다.
 _LO_RESTART_EVERY = 20
+_LO_MEMORY_LIMIT_MB = 300.0
 _conversions_since_restart = 0
+
+
+def _lo_listener_rss_mb() -> Optional[float]:
+    """상주 LibreOffice(래퍼 soffice + 실제 soffice.bin) RSS 합계(MB). 못 재면 None.
+
+    pid로 못 찾는 이유는 stop_lo_listener 주석 참고(래퍼가 실바이너리를 fork/exec하고 먼저
+    끝난다) — 그래서 pid가 아니라 커맨드라인(pkill과 동일한 매칭 기준)으로 찾는다.
+    """
+    try:
+        pgrep = subprocess.run(
+            ["pgrep", "-f", f"UserInstallation=file://{_PROFILE_DIR}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except FileNotFoundError:
+        return None
+    total_kb = 0
+    found = False
+    for pid in pgrep.stdout.split():
+        try:
+            status = Path(f"/proc/{pid}/status").read_text()
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+        for line in status.splitlines():
+            if line.startswith("VmRSS:"):
+                total_kb += int(line.split()[1])
+                found = True
+                break
+    return (total_kb / 1024) if found else None
 
 
 def start_lo_listener() -> None:
@@ -2265,14 +2298,20 @@ def start_lo_listener() -> None:
 
 
 def _recycle_lo_listener_if_needed() -> None:
-    """변환 _LO_RESTART_EVERY회마다 상주 LibreOffice를 재기동해 누적 메모리를 회수한다.
+    """상주 LibreOffice가 _LO_MEMORY_LIMIT_MB를 넘으면 재기동해 누적 메모리를 회수한다.
 
-    호출자는 _LIBREOFFICE_LOCK을 잡고 있어야 한다(다른 변환이 도는 중에 죽이면 안 된다).
+    RSS를 못 재는 환경(/proc 없음, 예: 로컬 macOS)에서는 _LO_RESTART_EVERY회 횟수 기준으로
+    대체한다. 호출자는 _LIBREOFFICE_LOCK을 잡고 있어야 한다(다른 변환이 도는 중에 죽이면 안 된다).
     """
     global _conversions_since_restart
-    _conversions_since_restart += 1
-    if _conversions_since_restart < _LO_RESTART_EVERY:
-        return
+    rss_mb = _lo_listener_rss_mb()
+    if rss_mb is not None:
+        if rss_mb < _LO_MEMORY_LIMIT_MB:
+            return
+    else:
+        _conversions_since_restart += 1
+        if _conversions_since_restart < _LO_RESTART_EVERY:
+            return
     _conversions_since_restart = 0
     stop_lo_listener()
     start_lo_listener()
