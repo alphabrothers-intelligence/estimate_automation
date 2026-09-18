@@ -17,10 +17,8 @@ ENV PYTHONUNBUFFERED=1 \
     HOME=/home/app
 
 # libreoffice-calc만 넣는다(전체 libreoffice는 Writer/Impress까지 끌고 와 이미지가 3배가 된다).
-# procps는 pdf_service가 리스너를 정리할 때 쓰는 pkill 때문에 필요하다.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libreoffice-calc \
-        procps \
         fontconfig \
         fonts-nanum \
         fonts-nanum-extra \

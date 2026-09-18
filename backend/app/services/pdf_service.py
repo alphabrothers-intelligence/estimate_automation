@@ -2221,116 +2221,18 @@ _LIBREOFFICE_LOCK = threading.Lock()
 # 경로 자체에 공백이 있어 file:// URI가 깨지므로, 공백 없는 시스템 임시 경로에 둔다.
 _PROFILE_DIR = Path(tempfile.gettempdir()) / "estimate_automation_lo_profile"
 
-_lo_listener: Optional[subprocess.Popen] = None
-
-# 상주 LibreOffice는 변환한 문서를 처리할수록 메모리를 계속 물고 늘어난다(문서 모델·폰트 캐시가
-# 프로세스 안에 쌓인다). 편집 화면이 미리보기를 매 수정마다 다시 그리므로 한 세션에서 수십 번
-# 변환이 도는데, 그대로 두면 Render 인스턴스가 메모리 한도를 넘겨 자동 재시작된다(2026-08-26
-# 메일 알림). "20회마다 재기동"(2026-08-27 최초 대응, 커밋 844f6f5)은 횟수만 볼 뿐 실제 메모리를
-# 보지 않아 세션 패턴에 따라 20회가 되기 전에 한도를 넘을 수 있었다(2026-09-18 알림 재발로 확인).
-# 그래서 실제 RSS를 재서 임계치를 넘을 때 재기동하는 방식으로 바꾼다 — /proc는 리눅스(Render
-# 컨테이너)에서만 있으므로 로컬 macOS 개발 환경 등에서는 못 재고, 그럴 때만 횟수 기반으로 되돌아간다.
-# Render Free 플랜은 컨테이너 전체가 512MB다(2026-09-18 대시보드 확인). FastAPI/uvicorn
-# 기본 사용량과 변환 중 순간 스파이크까지 남겨둬야 해서, 상주 LibreOffice 혼자에게는
-# 150MB만 준다 — 이 이상 쌓이면 즉시 회수한다.
-_LO_RESTART_EVERY = 20
-_LO_MEMORY_LIMIT_MB = 150.0
-_conversions_since_restart = 0
-
-
-def _lo_listener_rss_mb() -> Optional[float]:
-    """상주 LibreOffice(래퍼 soffice + 실제 soffice.bin) RSS 합계(MB). 못 재면 None.
-
-    pid로 못 찾는 이유는 stop_lo_listener 주석 참고(래퍼가 실바이너리를 fork/exec하고 먼저
-    끝난다) — 그래서 pid가 아니라 커맨드라인(pkill과 동일한 매칭 기준)으로 찾는다.
-    """
-    try:
-        pgrep = subprocess.run(
-            ["pgrep", "-f", f"UserInstallation=file://{_PROFILE_DIR}"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except FileNotFoundError:
-        return None
-    total_kb = 0
-    found = False
-    for pid in pgrep.stdout.split():
-        try:
-            status = Path(f"/proc/{pid}/status").read_text()
-        except (FileNotFoundError, ProcessLookupError, PermissionError):
-            continue
-        for line in status.splitlines():
-            if line.startswith("VmRSS:"):
-                total_kb += int(line.split()[1])
-                found = True
-                break
-    return (total_kb / 1024) if found else None
-
-
-def start_lo_listener() -> None:
-    """LibreOffice를 서버 기동 시 미리 백그라운드로 띄워둔다.
-
-    요청마다 soffice 프로세스를 새로 켜면 오피스 코어 콜드 부팅에 2~8초가 걸리는데, 같은
-    UserInstallation 프로필로 상주 인스턴스를 하나 켜두면 이후 --convert-to 요청이 LibreOffice의
-    "같은 프로필=단일 인스턴스" 동작으로 그 인스턴스에 붙어서 처리돼 1초 이내로 줄어드는 걸
-    확인했다(2026-08-10 로컬 벤치마크: 콜드 3.06s → 리스너 사용 시 0.76s).
-    # ponytail: 리스너가 중간에 죽어도 자동 재기동하지 않는다 — 아래 convert_cmd는 리스너 유무와
-    # 무관하게 항상 동작하므로(없으면 콜드 스타트로 그냥 느려질 뿐) 정확성엔 영향 없음. 서버
-    # 재시작 전까지 계속 느려지는 게 체감되면 그때 헬스체크+재기동을 추가한다.
-    """
-    global _lo_listener
-    if _lo_listener is not None and _lo_listener.poll() is None:
-        return
-    try:
-        _lo_listener = subprocess.Popen(
-            [
-                "soffice",
-                f"-env:UserInstallation=file://{_PROFILE_DIR}",
-                "--headless",
-                "--invisible",
-                "--nologo",
-                "--norestore",
-                "--accept=socket,host=127.0.0.1,port=2002;urp;",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except FileNotFoundError:
-        _lo_listener = None
-
-
-def _recycle_lo_listener_if_needed() -> None:
-    """상주 LibreOffice가 _LO_MEMORY_LIMIT_MB를 넘으면 재기동해 누적 메모리를 회수한다.
-
-    RSS를 못 재는 환경(/proc 없음, 예: 로컬 macOS)에서는 _LO_RESTART_EVERY회 횟수 기준으로
-    대체한다. 호출자는 _LIBREOFFICE_LOCK을 잡고 있어야 한다(다른 변환이 도는 중에 죽이면 안 된다).
-    """
-    global _conversions_since_restart
-    rss_mb = _lo_listener_rss_mb()
-    if rss_mb is not None:
-        if rss_mb < _LO_MEMORY_LIMIT_MB:
-            return
-    else:
-        _conversions_since_restart += 1
-        if _conversions_since_restart < _LO_RESTART_EVERY:
-            return
-    _conversions_since_restart = 0
-    stop_lo_listener()
-    start_lo_listener()
-
-
-def stop_lo_listener() -> None:
-    global _lo_listener
-    if _lo_listener is None:
-        return
-    # soffice 실행 파일은 실제로는 셸 래퍼라 자식으로 진짜 LibreOffice 바이너리(soffice.bin)를
-    # fork/exec하고 래퍼 자신은 곧바로 끝나버린다. 그래서 Popen이 돌려준 pid/pgid로는(래퍼가 이미
-    # 죽고 없어서) 진짜 바이너리를 못 찾는 경우가 있는 걸 확인했다(2026-08-10, os.killpg가
-    # ProcessLookupError). pid 대신 이 서비스 전용 프로필 경로로 명령행을 매칭해 죽이면 래퍼가
-    # 먼저 죽어 있어도 실제 바이너리를 확실히 잡는다.
-    subprocess.run(["pkill", "-f", f"UserInstallation=file://{_PROFILE_DIR}"], capture_output=True)
-    _lo_listener = None
+# 상주 LibreOffice(백그라운드로 켜두고 재사용하는 방식)는 변환할수록 메모리를 계속 물고
+# 늘어나(문서 모델·폰트 캐시가 프로세스 안에 쌓임) Render Free 플랜(컨테이너 전체 512MB,
+# 2026-09-18 대시보드 확인)의 한도를 넘겨 자동 재시작됐다(2026-08-26, 2026-09-18 두 차례
+# 메일 알림). "횟수/RSS 기준으로 주기적 재기동"(844f6f5, 이후 RSS 기반으로 재수정)도 결국
+# "언젠가 죽이고 다시 켠다"는 동일 구조라 타이밍을 놓치면 그사이 쌓인 메모리가 한도를 넘길
+# 수 있었다. 그래서 아예 상주시키지 않기로 한다(2026-09-18 사용자 결정) — 매 변환마다 soffice를
+# 새로 띄우고 끝나자마자 그 프로세스가 종료되며 메모리를 OS에 100% 반환하므로 "쌓이는" 경로
+# 자체가 없다. 대가는 매 변환이 콜드 스타트(2026-08-10 벤치마크 약 3초)라는 것 — 웜 상태(1초
+# 미만)보다 느리지만, 유료 플랜 없이 메모리 초과를 막는 방법은 이쪽뿐이다.
+# 아래 convert_cmd(render_entity_quote_pdf)는 리스너가 있든 없든 그대로 동작하므로(있으면
+# LibreOffice의 "같은 프로필=단일 인스턴스"로 거기 붙어 빠르고, 없으면 그냥 새로 뜬다) 이
+# 함수를 없애는 것 외에 변환 로직 자체는 손댈 게 없다.
 
 
 # entity_quote_id -> (content_hash, pdf_bytes). 견적 내용(항목·금액·용역명 등)이 바뀌지 않았으면
@@ -2381,7 +2283,6 @@ def render_entity_quote_pdf(entity_quote_id: str) -> bytes:
                 if result.returncode == 0 and pdf_path.exists():
                     pdf_bytes = pdf_path.read_bytes()
                     _cache_pdf(entity_quote_id, content_hash, pdf_bytes)
-                    _recycle_lo_listener_if_needed()
                     return pdf_bytes
                 last_error = result.stderr or result.stdout
 

@@ -1,23 +1,13 @@
 import logging
 import os
-from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.routers import catalog, estimates
-from app.services import pdf_service
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    pdf_service.start_lo_listener()
-    yield
-    pdf_service.stop_lo_listener()
-
-
-app = FastAPI(title="견적서 자동화 API", lifespan=lifespan)
+app = FastAPI(title="견적서 자동화 API")
 
 # 배포된 프론트엔드 주소. Vercel 도메인은 사람마다 다르고 프리뷰 배포마다 바뀌므로
 # 코드에 박지 않고 환경변수로 받는다. 쉼표로 여러 개 넣을 수 있다.
