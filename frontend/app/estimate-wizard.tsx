@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useGeneratedEstimateLayout } from "./app-shell";
 import {
   ApiError,
@@ -1837,6 +1838,17 @@ function QuotePreviewPane({ quote }: { quote: EntityQuote }) {
   const [blockedFor, setBlockedFor] = useState<{ key: string; message: string } | null>(null);
   const blocked = blockedFor?.key === previewKey ? blockedFor.message : null;
   const loading = loadedKey !== previewKey && !blocked;
+  // 사이드 패널의 미리보기는 글씨가 작아 확대해 보기 불편했다(2026-09-23 사용자 요청) —
+  // 한 페이지 전체를 화면 크기로 띄워 보는 모달.
+  const [expanded, setExpanded] = useState(false);
+  const pdfUrl = getEntityQuotePdfUrl(quote.id, { inline: true, version: previewKey });
+
+  useEffect(() => {
+    if (!expanded) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setExpanded(false);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [expanded]);
 
   useEffect(() => {
     let alive = true;
@@ -1859,7 +1871,22 @@ function QuotePreviewPane({ quote }: { quote: EntityQuote }) {
           <p className="text-sm font-bold text-slate-900">{quote.is_primary ? "본견적서" : "비교견적서"} 미리보기</p>
           <p className="mt-0.5 text-xs text-slate-400">실제 발급되는 양식입니다.</p>
         </div>
-        {loading && <p className="text-xs text-indigo-500">최신 수정 내용 반영 중…</p>}
+        <div className="flex items-center gap-2">
+          {loading && <p className="text-xs text-indigo-500">최신 수정 내용 반영 중…</p>}
+          {!blocked && (
+            <button
+              type="button"
+              onClick={() => setExpanded(true)}
+              title="크게 보기"
+              aria-label="견적서 미리보기 크게 보기"
+              className="grid h-8 w-8 place-items-center rounded-lg text-slate-500 hover:bg-slate-100 hover:text-slate-900"
+            >
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" />
+              </svg>
+            </button>
+          )}
+        </div>
       </div>
       <div className="relative aspect-[1/1.4142] max-h-[calc(100vh-8rem)] w-full overflow-hidden rounded-lg border border-gray-200">
         {loading && (
@@ -1881,7 +1908,7 @@ function QuotePreviewPane({ quote }: { quote: EntityQuote }) {
         ) : (
         <iframe
           key={previewKey}
-          src={`${getEntityQuotePdfUrl(quote.id, { inline: true, version: previewKey })}#toolbar=0&navpanes=0&view=FitH`}
+          src={`${pdfUrl}#toolbar=0&navpanes=0&view=FitH`}
           title={`${quote.entity_name} 견적서 미리보기`}
           className="h-full w-full"
           onLoad={() => {
@@ -1890,6 +1917,37 @@ function QuotePreviewPane({ quote }: { quote: EntityQuote }) {
         />
         )}
       </div>
+      {expanded &&
+        createPortal(
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 sm:p-8" onClick={() => setExpanded(false)}>
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label={`${quote.entity_name} 견적서 크게 보기`}
+              className="flex h-full w-full max-w-5xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3">
+                <p className="text-sm font-bold text-slate-900">
+                  {quote.entity_name} {quote.is_primary ? "본견적서" : "비교견적서"}
+                </p>
+                <button
+                  type="button"
+                  onClick={() => setExpanded(false)}
+                  aria-label="닫기"
+                  className="grid h-8 w-8 place-items-center rounded-lg text-slate-500 hover:bg-slate-100 hover:text-slate-900"
+                >
+                  <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                    <path d="M18 6 6 18M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+              {/* view=Fit: 페이지 전체가 한 화면에 들어오게. 더 키워 보려면 PDF 뷰어 툴바로 확대한다. */}
+              <iframe src={`${pdfUrl}#navpanes=0&view=Fit`} title={`${quote.entity_name} 견적서 크게 보기`} className="flex-1" />
+            </div>
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }
