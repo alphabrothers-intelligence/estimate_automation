@@ -45,6 +45,48 @@ def delete_estimate_set(estimate_set_id: str) -> None:
         raise HTTPException(status_code=404, detail="견적 세트를 찾을 수 없습니다.")
 
 
+def duplicate_estimate_set(estimate_set_id: str) -> EstimateSetOut:
+    """견적 세트를 법인별 견적서·수정 이력·채팅 이력까지 그대로 복제한다.
+
+    컬럼을 나열하지 않고 select("*")에서 식별자만 빼서 다시 넣는다 — 나중에 컬럼이 늘어도
+    복제본에서 빠지지 않게. PDF는 요청마다 새로 렌더하므로 Storage 파일은 복사할 게 없다.
+    """
+    supabase = get_supabase()
+    set_res = supabase.table("estimate_sets").select("*").eq("id", estimate_set_id).execute()
+    if not set_res.data:
+        raise HTTPException(status_code=404, detail="견적 세트를 찾을 수 없습니다.")
+
+    def strip(row: dict, *keys: str) -> dict:
+        return {k: v for k, v in row.items() if k not in ("id", "created_at", "updated_at", *keys)}
+
+    new_set = supabase.table("estimate_sets").insert(strip(set_res.data[0])).execute().data[0]
+
+    quotes = supabase.table("entity_quotes").select("*").eq("estimate_set_id", estimate_set_id).execute().data
+    for quote in quotes:
+        new_quote = (
+            supabase.table("entity_quotes")
+            .insert({**strip(quote, "current_version_id"), "estimate_set_id": new_set["id"]})
+            .execute()
+            .data[0]
+        )
+        versions = supabase.table("quote_versions").select("*").eq("entity_quote_id", quote["id"]).execute().data
+        if not versions:
+            continue
+        new_versions = (
+            supabase.table("quote_versions")
+            .insert([{**strip(v), "entity_quote_id": new_quote["id"]} for v in versions])
+            .execute()
+            .data
+        )
+        # 원본이 가리키던 현재 버전을 version_no로 찾아 복제본에서도 같은 버전을 가리키게 한다.
+        current_no = next((v["version_no"] for v in versions if v["id"] == quote["current_version_id"]), None)
+        current_id = next((v["id"] for v in new_versions if v["version_no"] == current_no), None)
+        if current_id:
+            supabase.table("entity_quotes").update({"current_version_id": current_id}).eq("id", new_quote["id"]).execute()
+
+    return get_estimate_set(new_set["id"])
+
+
 def create_estimate_set(payload: EstimateSetCreate) -> EstimateSetOut:
     supabase = get_supabase()
 

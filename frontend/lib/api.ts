@@ -191,6 +191,11 @@ export async function fetchEstimateSets(): Promise<EstimateSetSummary[]> {
   return handle<EstimateSetSummary[]>(res);
 }
 
+export async function duplicateEstimateSet(id: string): Promise<EstimateSet> {
+  const res = await fetch(`${API_BASE_URL}/api/estimate-sets/${id}/duplicate`, { method: "POST" });
+  return handle<EstimateSet>(res);
+}
+
 export async function deleteEstimateSet(id: string): Promise<void> {
   const res = await fetch(`${API_BASE_URL}/api/estimate-sets/${id}`, { method: "DELETE" });
   if (!res.ok) {

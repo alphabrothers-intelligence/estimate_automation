@@ -46,6 +46,11 @@ def delete_estimate_set(estimate_set_id: str):
     estimate_service.delete_estimate_set(estimate_set_id)
 
 
+@router.post("/{estimate_set_id}/duplicate", response_model=EstimateSetOut)
+def duplicate_estimate_set(estimate_set_id: str):
+    return estimate_service.duplicate_estimate_set(estimate_set_id)
+
+
 @router.get("/{estimate_set_id}/module-options", response_model=List[EntityModuleOptions])
 def get_module_options(estimate_set_id: str):
     return estimate_service.get_module_options_for_set(estimate_set_id)

@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
-import { ApiError, deleteEstimateSet, fetchEstimateSets, type EstimateSetSummary } from "@/lib/api";
+import { ApiError, deleteEstimateSet, duplicateEstimateSet, fetchEstimateSets, type EstimateSetSummary } from "@/lib/api";
 
 function formatDate(value: string) {
   return new Intl.DateTimeFormat("ko-KR", { year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(value));
@@ -16,6 +16,7 @@ export default function EstimatesPage() {
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [deleting, setDeleting] = useState(false);
+  const [duplicating, setDuplicating] = useState(false);
 
   useEffect(() => {
     fetchEstimateSets()
@@ -52,6 +53,23 @@ export default function EstimatesPage() {
     }
   }
 
+  async function handleDuplicateSelected() {
+    if (selected.size === 0) return;
+    setDuplicating(true);
+    try {
+      // 순서대로 복제해야 목록(생성일 역순)에서도 원본 순서가 유지된다.
+      for (const id of items.filter((i) => selected.has(i.id)).map((i) => i.id).reverse()) {
+        await duplicateEstimateSet(id);
+      }
+      setItems(await fetchEstimateSets());
+      setSelected(new Set());
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "견적서 복제에 실패했습니다.");
+    } finally {
+      setDuplicating(false);
+    }
+  }
+
   return (
     <main className="px-5 py-8 sm:px-8 lg:px-12 lg:py-10">
       <div className="mx-auto max-w-6xl">
@@ -62,6 +80,15 @@ export default function EstimatesPage() {
             <p className="mt-2 text-sm text-slate-500">사업 건별 본견적과 비교견적을 한곳에서 확인합니다.</p>
           </div>
           <div className="flex items-center gap-2">
+            {selected.size > 0 && (
+              <button
+                onClick={handleDuplicateSelected}
+                disabled={duplicating || deleting}
+                className="rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+              >
+                {duplicating ? "복제 중…" : `선택 복제 (${selected.size})`}
+              </button>
+            )}
             {selected.size > 0 && (
               <button
                 onClick={handleDeleteSelected}
