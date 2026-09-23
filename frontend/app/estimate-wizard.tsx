@@ -560,6 +560,99 @@ function formatWithCommas(raw: string): string {
   return (negative ? "-" : "") + intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 }
 
+// 상품구성/세부 항목을 줄 하나당 입력칸 하나로 편집한다. 값 자체는 그대로 "\n" 구분 문자열이라
+// (InlineEditCell의 draft와 같은 포맷) 저장 시 이어붙이기만 하면 되고 백엔드 파싱은 그대로 쓴다.
+function DescriptionListEditor({
+  draft,
+  setDraft,
+  onCommit,
+  onCancel,
+}: {
+  draft: string;
+  setDraft: (next: string) => void;
+  onCommit: () => void;
+  onCancel: () => void;
+}) {
+  const lines = draft === "" ? [""] : draft.split("\n");
+  const inputRefs = useRef<(HTMLInputElement | null)[]>([]);
+  const prevLength = useRef(lines.length);
+
+  useEffect(() => {
+    if (lines.length > prevLength.current) {
+      inputRefs.current[lines.length - 1]?.focus();
+    }
+    prevLength.current = lines.length;
+  }, [lines.length]);
+
+  function updateLine(i: number, next: string) {
+    const nextLines = [...lines];
+    nextLines[i] = next;
+    setDraft(nextLines.join("\n"));
+  }
+
+  function removeLine(i: number) {
+    setDraft(lines.filter((_, idx) => idx !== i).join("\n"));
+  }
+
+  function addLine() {
+    setDraft([...lines, ""].join("\n"));
+  }
+
+  return (
+    <div
+      onBlur={(e) => {
+        // 리스트 안(다른 줄 입력칸, 삭제/추가 버튼)으로 옮겨가는 포커스 이동은 저장하지 않는다 —
+        // 그렇지 않으면 줄 사이를 옮길 때마다 저장이 반복돼 버튼 위치가 계속 흔들린다.
+        if (!e.currentTarget.contains(e.relatedTarget as Node)) onCommit();
+      }}
+    >
+      <div className="flex flex-col gap-1">
+        {lines.map((line, i) => (
+          <div key={i} className="flex items-center gap-1">
+            <input
+              ref={(el) => {
+                inputRefs.current[i] = el;
+              }}
+              type="text"
+              autoFocus={i === 0}
+              value={line}
+              onChange={(e) => updateLine(i, e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  addLine();
+                }
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  onCancel();
+                }
+              }}
+              className="w-full rounded border border-indigo-400 px-1.5 py-0.5 text-[13px] leading-snug focus:outline-none"
+            />
+            <button
+              type="button"
+              onClick={() => removeLine(i)}
+              title="이 항목 삭제"
+              aria-label="이 항목 삭제"
+              className="shrink-0 rounded border border-slate-200 px-1 text-[11px] leading-4 text-slate-400 hover:border-red-300 hover:text-red-500"
+            >
+              ×
+            </button>
+          </div>
+        ))}
+      </div>
+      <button
+        type="button"
+        onClick={addLine}
+        className="mt-1 rounded border border-slate-200 px-1.5 py-px text-[11px] text-slate-500 hover:border-indigo-300 hover:text-indigo-600"
+      >
+        + 항목 추가
+      </button>
+      <p className="mt-0.5 text-[11px] text-gray-400">Enter로 항목 추가 · Esc 취소 · 칸 밖 클릭 시 저장</p>
+    </div>
+  );
+}
+
 function InlineEditCell({
   value,
   display,
@@ -631,32 +724,19 @@ function InlineEditCell({
     return (
       <div onClick={(e) => e.stopPropagation()}>
         {multiline ? (
-          // 상품구성은 "1. ~ 2. ~ 3. ~" 개조식 여러 줄이 기본이라 한 줄짜리 input으로는 아예
-          // 쓸 수가 없었다(2026-08-21 사용자 지적). Enter는 줄바꿈이고, 저장은 ⌘/Ctrl+Enter나
-          // 칸 밖 클릭으로 한다.
-          <>
-            <textarea
-              autoFocus
-              rows={Math.min(12, Math.max(3, draft.split("\n").length + 1))}
-              value={draft}
-              onChange={(e) => setDraft(e.target.value)}
-              onBlur={commit}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-                  e.preventDefault();
-                  commit();
-                }
-                if (e.key === "Escape") {
-                  committedRef.current = true;
-                  setDraft(value);
-                  e.currentTarget.blur();
-                  setEditing(false);
-                }
-              }}
-              className="w-full resize-y rounded border border-indigo-400 px-1.5 py-1 text-[13px] leading-snug focus:outline-none"
-            />
-            <p className="mt-0.5 text-[11px] text-gray-400">Enter 줄바꿈 · ⌘/Ctrl+Enter 저장 · Esc 취소</p>
-          </>
+          // 상품구성은 "1. ~ 2. ~ 3. ~" 개조식 여러 줄이 기본이다. 통짜 textarea로는 항목 하나
+          // 빼고 더하기가 번거로워(2026-09-23 실무자 지적), 줄 하나당 입력칸 하나로 쪼갠 리스트로
+          // 편집한다. 저장 형식은 그대로 줄바꿈 구분 문자열이라 발급 로직은 손댈 게 없다.
+          <DescriptionListEditor
+            draft={draft}
+            setDraft={setDraft}
+            onCommit={commit}
+            onCancel={() => {
+              committedRef.current = true;
+              setDraft(value);
+              setEditing(false);
+            }}
+          />
         ) : (
         <input
           type="text"
