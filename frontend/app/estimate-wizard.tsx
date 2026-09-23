@@ -521,6 +521,7 @@ type LineItemPatch = Partial<
   Pick<
     LineItem,
     | "category"
+    | "module"
     | "mid_category"
     | "name"
     | "amount"
@@ -909,6 +910,44 @@ function RowActions({ onAdd, onRemove }: { onAdd: () => void; onRemove: () => vo
   );
 }
 
+// 묶음 머리(대표 항목명) — 접기 토글과 이름 편집을 갈라놓는다. 칸 전체가 토글 버튼이면
+// 대표 항목명을 고칠 수 없었다(2026-09-23 사용자 요청). 이름을 바꾸면 묶음의 모든 항목
+// category가 함께 바뀐다.
+function GroupToggleName({
+  expanded,
+  onToggle,
+  category,
+  onRename,
+}: {
+  expanded: boolean;
+  onToggle: () => void;
+  category: string;
+  onRename: (next: string) => Promise<void>;
+}) {
+  return (
+    <div className="flex min-w-0 items-start gap-1.5">
+      <button
+        type="button"
+        onClick={onToggle}
+        title={expanded ? "이 묶음 접기" : "이 묶음 펼치기"}
+        aria-label={expanded ? "이 묶음 접기" : "이 묶음 펼치기"}
+        className="shrink-0"
+      >
+        <svg
+          viewBox="0 0 20 20"
+          fill="currentColor"
+          className={"mt-1 h-3.5 w-3.5 text-gray-500 transition-transform " + (expanded ? "rotate-90" : "")}
+        >
+          <path fillRule="evenodd" d="M6 4l8 6-8 6V4z" clipRule="evenodd" />
+        </svg>
+      </button>
+      <div className="min-w-0 flex-1 break-words">
+        <InlineEditCell value={category} display={category} onSave={onRename} />
+      </div>
+    </div>
+  );
+}
+
 function CategoryRows({
   group,
   order,
@@ -932,6 +971,10 @@ function CategoryRows({
 }) {
   const [expanded, setExpanded] = useState(true);
   const isFlat = group.items.length === 1 && group.items[0].name === group.category;
+  const groupIndexes = group.items.map((it) => it._index);
+  // 표시 이름만 바꾸고 원래 모듈명은 module에 남긴다 — 이미 한 번 바꾼 묶음이면 그 값을 유지.
+  const renamePatch = (v: string): LineItemPatch => ({ category: v, module: group.items[0].module ?? group.category });
+  const renameGroup = (v: string) => onPatchMany(groupIndexes, renamePatch(v));
   // 채팅 수정으로 방금 바뀐 항목에 왼쪽 강조선 + 옅은 배경을 준다 — "어디가 수정되고 있는지
   // 모르겠다"는 피드백(2026-08-10) 대응. 다음 수정이나 항목 재생성 전까지 유지된다.
   const isChanged = (item: { category: string; name: string }) =>
@@ -949,7 +992,7 @@ function CategoryRows({
           <InlineEditCell
             value={group.category}
             display={group.category}
-            onSave={(v) => onPatchMany(group.items.map((it) => it._index), { category: v })}
+            onSave={renameGroup}
           />
         </td>
         <td className="break-words px-3 py-2.5 text-sm text-gray-600">
@@ -978,7 +1021,7 @@ function CategoryRows({
           <InlineEditCell
             value={group.category}
             display={group.category}
-            onSave={(v) => onEditItem(item._index, { category: v, name: v })}
+            onSave={(v) => onEditItem(item._index, { ...renamePatch(v), name: v })}
           />
         </td>
         <ItemDetailCells item={item} order={order} onEditItem={(patch) => onEditItem(item._index, patch)} />
@@ -1008,7 +1051,6 @@ function CategoryRows({
   // 반복하면 발급본과 달라 보이고, 접기 토글이 가운데 상품명 칸에 있어 어느 묶음을 접는지도
   // 헷갈렸다(2026-08-21 사용자 지적). 토글을 맨 왼쪽 구분(대) 칸으로 옮기고 그 칸을 묶음
   // 전체에 rowSpan으로 병합한다. 구분(중)도 연속으로 같은 값이면 같은 방식으로 묶는다.
-  const groupIndexes = group.items.map((it) => it._index);
   const bodyRowCount = expanded ? group.items.length : 0;
   const midRunLength = (i: number) => {
     const value = group.items[i].mid_category ?? group.category;
@@ -1052,7 +1094,7 @@ function CategoryRows({
                   <InlineEditCell
                     value={group.category}
                     display={group.category}
-                    onSave={(v) => onPatchMany(groupIndexes, { category: v })}
+                    onSave={renameGroup}
                   />
                 </div>
               </td>
@@ -1129,20 +1171,12 @@ function CategoryRows({
             rowSpan={1 + bodyRowCount}
             className="border-r border-gray-200 bg-slate-50/70 px-2.5 py-2 align-top text-[13px] font-semibold leading-snug text-slate-700"
           >
-            <button
-              type="button"
-              onClick={() => setExpanded((v) => !v)}
-              className="flex min-w-0 items-start gap-1.5 break-words text-left"
-            >
-              <svg
-                viewBox="0 0 20 20"
-                fill="currentColor"
-                className={"mt-1 h-3.5 w-3.5 shrink-0 text-gray-500 transition-transform " + (expanded ? "rotate-90" : "")}
-              >
-                <path fillRule="evenodd" d="M6 4l8 6-8 6V4z" clipRule="evenodd" />
-              </svg>
-              {group.category}
-            </button>
+            <GroupToggleName
+              expanded={expanded}
+              onToggle={() => setExpanded((v) => !v)}
+              category={group.category}
+              onRename={renameGroup}
+            />
           </td>
         )}
         {showCategorySplit && <td className="border-r border-gray-200 bg-slate-50/70 px-2.5 py-2" />}
@@ -1150,20 +1184,12 @@ function CategoryRows({
           {showCategorySplit ? (
             <span className="text-sm text-gray-400">소계</span>
           ) : (
-            <button
-              type="button"
-              onClick={() => setExpanded((v) => !v)}
-              className="flex min-w-0 items-center gap-1.5 break-words text-left"
-            >
-              <svg
-                viewBox="0 0 20 20"
-                fill="currentColor"
-                className={"h-3.5 w-3.5 shrink-0 text-gray-500 transition-transform " + (expanded ? "rotate-90" : "")}
-              >
-                <path fillRule="evenodd" d="M6 4l8 6-8 6V4z" clipRule="evenodd" />
-              </svg>
-              {group.category}
-            </button>
+            <GroupToggleName
+              expanded={expanded}
+              onToggle={() => setExpanded((v) => !v)}
+              category={group.category}
+              onRename={renameGroup}
+            />
           )}
         </td>
         <td className="py-2 pr-3 text-right text-sm text-gray-400" colSpan={order.length} />

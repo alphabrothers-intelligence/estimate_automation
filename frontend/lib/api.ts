@@ -21,6 +21,9 @@ export type LineItem = {
   // 구분(중) — 구분(대)(category)와 상품명(name) 사이의 중간 분류. 이 칸이 있는 양식
   // (테스티파이 신양식·알파브라더스)에서만 표시된다(2026-08-19).
   mid_category?: string;
+  // 대표 항목명(category)을 바꾸기 전 원래 모듈명 — 화면엔 안 보이고, 간접비처럼 모듈명으로
+  // 알아보는 백엔드 계산 규칙이 쓴다(quote_pricing.module_of). 저장 시 그대로 되돌려 보낸다.
+  module?: string;
   // 썬데이워커 전용 — 투입 MM(작업일×수량÷20 근사치, PRD 7.4)과 항목별 세액(공급가액×10%).
   input_mm?: number;
   tax_amount?: number;

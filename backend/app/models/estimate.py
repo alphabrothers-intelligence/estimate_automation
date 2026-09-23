@@ -170,6 +170,9 @@ class LineItemIn(BaseModel):
     # 기술수준(특급/고급/중급/초급). 그 칸이 있는 양식에서만 쓰인다 — line_items가 jsonb라
     # 마이그레이션 없이 붙는다.
     grade: Optional[str] = None
+    # 대표 항목명(category)을 바꾸기 전 원래 모듈명(quote_pricing.module_of). 화면에 보이지
+    # 않고 프론트엔드가 그대로 되돌려 보낸다 — 여기 없으면 저장할 때마다 지워진다.
+    module: Optional[str] = None
 
 
 class LineItemsUpdate(BaseModel):

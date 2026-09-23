@@ -214,6 +214,9 @@ def _apply(items: List[dict], edit: dict, form: quote_pricing.FormSpec) -> Tuple
                     {k: v for k, v in change.items() if k != "i"}
                 )
             continue
+        if change.get("category") and not result[idx].get("module"):
+            # 구분(대) 이름을 바꿔도 원래 모듈명은 남긴다(quote_pricing.module_of).
+            result[idx]["module"] = result[idx].get("category")
         for key in fields:
             if change.get(key) is not None:
                 result[idx][key] = change[key]

@@ -69,6 +69,20 @@ BALANCER_ITEM = "이윤"
 OVERHEAD_MODULE = "경비 및 간접비"
 
 
+def module_of(item: dict) -> str:
+    """항목이 원래 속한 카탈로그 모듈명.
+
+    화면에서 대표 항목명(category)을 바꿀 수 있게 되면서(2026-09-23 사용자 요청), 바꾸기 전
+    이름을 module에 남겨 둔다 — 간접비처럼 모듈명으로 알아보는 계산 규칙이 표시 이름에
+    휘둘리지 않게. 한 번도 이름을 바꾸지 않은 항목은 module이 없어 category가 곧 모듈명이다.
+    """
+    return (item.get("module") or item.get("category") or "").strip()
+
+
+def is_overhead(item: dict) -> bool:
+    return module_of(item) == OVERHEAD_MODULE
+
+
 @dataclass(frozen=True)
 class FormSpec:
     """한 법인 양식(정확히는 한 시트)의 금액 계산 규칙."""
@@ -160,7 +174,7 @@ def _is_rate_based(item: dict) -> bool:
 
 def _snap_unit_for(item: dict, form: FormSpec) -> int:
     """이 항목의 단가를 어느 격자에 맞출지. 실비는 만원, 나머지는 양식의 단가 단위."""
-    if (item.get("category") or "").strip() == OVERHEAD_MODULE:
+    if is_overhead(item):
         return CLEAN_UNIT
     return form.unit_price_unit
 

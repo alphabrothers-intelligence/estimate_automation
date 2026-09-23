@@ -1423,9 +1423,7 @@ def _keeps_own_rows(group: Dict[str, Any]) -> bool:
       개발 중 간접비 상품구성을 잠깐 비웠더니 네 항목이 "경비 및 간접비" 소계 한 줄로 접혀
       교통비·이윤이 통째로 사라졌다(2026-08-25). 화면에서 설명을 지워도 같은 일이 생긴다.
     """
-    return group["category"] == quote_pricing.OVERHEAD_MODULE or any(
-        it.get("description") for it in group["items"]
-    )
+    return any(quote_pricing.is_overhead(it) or it.get("description") for it in group["items"])
 
 
 def _rollup_to_category_totals(

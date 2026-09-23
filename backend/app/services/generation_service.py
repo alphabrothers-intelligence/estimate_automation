@@ -238,7 +238,7 @@ def _merge_with_catalog(ai_items: List[dict], catalog_rows: List[dict], form: Fo
 
 
 def _is_overhead(item: dict) -> bool:
-    return (item.get("category") or "") == quote_pricing.OVERHEAD_MODULE
+    return quote_pricing.is_overhead(item)
 
 
 def _one_line(text: Optional[str]) -> Optional[str]:
@@ -321,6 +321,8 @@ def _generate_comparison(
                 # 본견적 대응 항목에서 그대로 물려받는다.
                 "task_type": src.get("task_type"),
                 "mid_category": src.get("mid_category"),
+                # 구분명은 AI가 다시 쓰므로, 계산 규칙이 알아볼 원래 모듈명을 따로 물려준다.
+                "module": quote_pricing.module_of(src),
             }
         )
     items, residual, log = finalize(items, target_supply, form)
